@@ -1,0 +1,137 @@
+# ArbDesk — MEXC × Polymarket
+
+一个本地优先、有人监督的 BTC 预测市场跨平台执行桌面应用。界面使用 React，桌面运行时使用 Electron，核心逻辑使用 TypeScript 与十进制定点数。
+
+> 当前版本是可运行的安全 MVP。扫描器只显示 MEXC 与 Polymarket 官方接口返回的真实盘口，不再生成模拟行情；任一数据源断开时显示空列表和错误原因。模拟模式只模拟成交过程。真实资金模式必须在完成账户、页面、盘口和失败恢复测试后手动启用。
+
+## 已实现
+
+- macOS / Windows 桌面应用结构，无需用户安装 Node 或数据库；
+- BTC 5 分钟、15 分钟机会看板；
+- Polymarket 当前滚动市场发现、真实 CLOB 卖盘和按市场查询的费率；
+- 精确金额、份额与预计利润计算；
+- `CONDITIONAL` 结算风险标识；
+- MEXC 内嵌登录窗口与持久 Cookie 容器；
+- 可选 Hubstudio 指纹浏览器环境，通过 Local API + CDP 监控和操作页面；
+- 从 MEXC 页面同源公开接口读取当前 BTC 5m/15m 事件、UP/DOWN symbolId 和盘口深度；
+- MEXC 金额框、UP、DOWN、提交按钮的可视化校准；
+- `MEXC 成交 → Polymarket 对冲` 强制状态机；
+- 部分成交只按实际成交量对冲；
+- 模拟交易、人工成交确认、审计日志和风险限制；
+- 同一开始/结束时间窗的 MEXC 与 Polymarket 报价才会配对；
+- Polymarket 签名类型、funder、签名私钥和 L2 API 凭据配置页；秘密凭据由 Electron `safeStorage` 使用系统钥匙串加密，渲染进程只看到状态和掩码；
+- 默认关闭真实资金与 MEXC 实验自动点击。
+
+## 当前安全边界
+
+1. MEXC 和 Polymarket 使用不同结算源，机会不是保证锁利。
+2. MEXC 网页自动化属于实验能力。验证码、登录过期或页面元素变化时不得继续。
+3. Polymarket 公共行情不需要登录或钱包地址；真实下单需要钱包签名、funder 地址和 API 凭据，当前未配置，所以人工监督模式不会伪造第二腿成交。
+4. 不保存 MEXC 密码，不绕过验证码或 2FA。
+5. 任何真实资金测试都应使用独立小额账户，并关闭提现权限。
+
+## 本地开发
+
+```bash
+npm install
+npm run dev
+```
+
+测试与生产构建：
+
+```bash
+npm test
+npm run build
+```
+
+生成 macOS 安装包：
+
+```bash
+npm run package:mac
+```
+
+生成 Windows 安装包需要在 Windows 或对应 CI 环境运行：
+
+```bash
+npm run package:win
+```
+
+## 使用流程
+
+1. 启动应用，默认处于“模拟模式”。
+2. 选择机会与对齐份额，先完整跑通模拟执行。
+3. 在设置中切换“人工监督”。
+4. 在设置中选择“内嵌浏览器”或“Hubstudio”。Hubstudio 用户需填写环境 ID，并由 ArbDesk 打开该环境。
+5. 打开 MEXC 监督窗口并正常登录。
+6. 依次校准金额输入框、UP 按钮、DOWN 按钮、确认下单按钮。两种浏览器模式分别保存校准结果。
+7. 准备 MEXC 第一腿后，以 MEXC 页面实际成交记录为准填写成交量和均价。
+8. 应用只按实际成交份额触发第二腿对冲。
+
+## MEXC 浏览器模式
+
+### 内嵌浏览器
+
+无需安装 Hubstudio。ArbDesk 使用 Electron 独立窗口和 `persist:mexc-arbdesk` Session 保存 MEXC Cookie，不读取或保存密码。
+
+### Hubstudio
+
+1. 在 Hubstudio 客户端启用 Local API；
+2. 在 ArbDesk 设置中填写目标环境 ID（`containerCode`）；
+3. 点击“保存并使用Hubstudio”，再点击“打开Hubstudio环境”；
+4. ArbDesk 调用 `http://127.0.0.1:6873/api/v1/browser/start`，取得 `debuggingPort` 后通过 Playwright CDP 连接；环境已经运行时也会尝试从其进程监听端口直接附加；
+5. 在 Hubstudio 窗口中登录并完成该模式独立的四项网页元素校准。
+
+当前本地工作副本已预填环境 ID `1643173278`。ArbDesk 不保存 Hubstudio `app_id` 或 `app_secret`，这些凭证由 Hubstudio Local API 自己管理。
+
+## 真实数据来源
+
+- MEXC：在 MEXC Prediction 页面上下文内读取事件列表与 `/depth` 深度；首档卖价和首档数量用于机会计算。
+- Polymarket：Gamma API 按 `btc-updown-5m-{startUnix}` / `btc-updown-15m-{startUnix}` 发现市场，CLOB API 获取每个 outcome token 的卖盘和费率。
+- Chainlink：目前只作为 Polymarket 结算规则来源，应用未单独接入 Chainlink 实时报价，因此状态会明确显示“未接入”。
+- Binance：可以以后增加为参考现货价，但不能替代 MEXC Prediction 盘口，因为二者不是同一可成交合约。
+
+## Polymarket 网络代理
+
+设置页可以填写 HTTP/HTTPS 代理，例如 `http://127.0.0.1:7890`，并点击“保存并测试公开行情”。代理用于 Gamma、CLOB 和后续官方 SDK 请求，不会修改 Hubstudio 环境自己的代理。留空表示直连。
+
+当前本地配置已使用 `http://127.0.0.1:7890` 完成真实联调：BTC 5m/15m 市场发现、CLOB 双边订单簿均可访问。费用优先读取市场对象的 `feeSchedule.rate`；CLOB 的 `base_fee` 不是可直接除以 10000 后代入现有费用曲线的费率。
+
+## 实验与实盘开关
+
+MEXC 自动点击在完成四项校准后，可以从设置页明确确认开启。开发环境的 Polymarket 真实资金总开关使用环境变量，防止误用普通开发启动命令：
+
+```bash
+ARB_ENABLE_LIVE_EXECUTION=true
+```
+
+`npm run dev:live` 会自动设置该变量。正式安装包内置发行版能力开关，但仍只能在“人工监督”模式中由用户依次开启 MEXC 自动点击、Polymarket 真实 FOK，并经过界面确认；凭据验证、金额、行情时效和结算信号等风控不会绕过。
+
+Polymarket 设置页允许用户自行选择签名类型（EOA、POLY_PROXY、GNOSIS_SAFE、POLY_1271）并填写 funder、订单签名私钥、API key、secret 和 passphrase。秘密值不会写入普通 `settings.json`，也不会回显。配置完成只表示本地材料齐全，不代表已验证余额、allowance 或下单权限；在官方 CLOB 网络连通并完成只读验证前，真实提交仍保持禁用。
+
+## 项目结构
+
+```text
+src/
+  main/
+    domain/              # 机会公式和执行状态机
+    services/            # MEXC 浏览器、Polymarket、审计存储
+    app-controller.ts    # 风控与执行协调
+    index.ts              # Electron 主进程和安全 IPC
+  preload/
+    index.ts              # 主界面受限桥接
+    mexc.ts               # 内嵌 MEXC 页面校准与受控 DOM 操作
+  renderer/
+    src/                  # React 交易控制台
+  shared/                 # 跨进程类型
+design-system/            # UI 设计系统
+```
+
+## 下一阶段
+
+- 将当前 Polymarket REST 轮询升级为订单簿 WebSocket 和用户成交流；
+- 使用真实 token ID 完成 FAK/FOK 对冲与订单状态核验；
+- 增加凭据只读验证、pUSD/POL 余额与 allowance 检查；
+- 在登录账户中验证 MEXC Prediction Markets 实际 DOM 和成交记录结构；
+- 增加 MEXC 成交状态自动读取与页面版本指纹；
+- 故障注入：部分成交、拒单、超时、页面变化、网络断线；
+- 使用小额纸面/沙盒数据校准滑点和停止交易窗口。

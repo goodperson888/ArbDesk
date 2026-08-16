@@ -1,0 +1,72 @@
+{
+  "name": "mexc-polymarket-arb",
+  "version": "0.1.1",
+  "description": "Human-in-the-loop MEXC and Polymarket arbitrage desktop console",
+  "main": "out/main/index.js",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "electron-vite dev",
+    "dev:live": "ARB_ENABLE_LIVE_EXECUTION=true electron-vite dev",
+    "build": "npm run typecheck && electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dist": "npm run test && npm run build && electron-builder --dir",
+    "package:mac": "npm run test && npm run build && electron-builder --mac zip",
+    "package:win": "npm run test && npm run build && electron-builder --win"
+  },
+  "build": {
+    "appId": "com.arbdesk.mexcpolymarket",
+    "productName": "ArbDesk",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.finance",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false
+    }
+  },
+  "dependencies": {
+    "@polymarket/clob-client-v2": "^1.1.0",
+    "axios": "^1.19.0",
+    "decimal.js": "^10.6.0",
+    "https-proxy-agent": "^7.0.6",
+    "lucide-react": "^1.31.0",
+    "playwright-core": "^1.62.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "undici": "^7.16.0",
+    "viem": "^2.55.16",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^43.4.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "typescript": "^7.0.2",
+    "vite": "^7.3.6",
+    "vitest": "^4.1.10"
+  }
+}
