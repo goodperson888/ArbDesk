@@ -29,7 +29,23 @@ jobs:
         run: npm test
 
       - name: Build NSIS installer
-        run: npm run package:win
+        shell: pwsh
+        run: |
+          npm run package:win 2>&1 | Tee-Object -FilePath package-win.log
+          $buildExit = $LASTEXITCODE
+          if ($buildExit -ne 0) {
+            $tail = (Get-Content package-win.log -Tail 80) -join '%0A'
+            Write-Output "::error title=Windows packaging failed::$tail"
+            exit $buildExit
+          }
+
+      - name: Upload packaging log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArbDesk-Windows-build-log
+          path: package-win.log
+          retention-days: 7
 
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
