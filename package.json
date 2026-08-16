@@ -15,7 +15,7 @@
     "test:watch": "vitest",
     "dist": "npm run test && npm run build && electron-builder --dir",
     "package:mac": "npm run test && npm run build && electron-builder --mac zip",
-    "package:win": "npm run test && npm run build && electron-builder --win"
+    "package:win": "npm run test && npm run build && electron-builder --win --publish never"
   },
   "build": {
     "appId": "com.arbdesk.mexcpolymarket",
