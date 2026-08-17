@@ -175,6 +175,36 @@ export class PolymarketMarketData {
     return this.latestWindows
   }
 
+  async confirmOutcomeQuote(tokenId: string, maximumAgeMs = 500): Promise<void> {
+    let matchedDirection: Direction | undefined
+    let current: PolymarketOutcomeQuote | undefined
+    for (const window of this.latestWindows) {
+      for (const [direction, outcome] of Object.entries(window.outcomes) as Array<[Direction, PolymarketOutcomeQuote | undefined]>) {
+        if (outcome?.tokenId !== tokenId) continue
+        matchedDirection = direction
+        current = outcome
+        break
+      }
+      if (current) break
+    }
+    if (!current || !matchedDirection) throw new Error('Polymarket所选盘口已失效')
+    if (Date.now() - current.receivedAt <= maximumAgeMs) return
+
+    const refreshed = await this.fetchOutcome(matchedDirection, tokenId, {
+      rate: Number(current.feeRate),
+      exponent: Number(current.feeExponent)
+    })
+    if (!refreshed) throw new Error('Polymarket所选盘口当前没有可买卖价')
+    this.latestWindows = this.latestWindows.map((window) => ({
+      ...window,
+      outcomes: Object.fromEntries(Object.entries(window.outcomes).map(([direction, outcome]) => [
+        direction,
+        outcome?.tokenId === tokenId ? refreshed : outcome
+      ])) as Partial<Record<Direction, PolymarketOutcomeQuote>>
+    }))
+    this.emitMarketData()
+  }
+
   configureProxy(proxyUrl: string): void {
     const normalized = proxyUrl.trim()
     if (normalized === this.proxyUrl) return

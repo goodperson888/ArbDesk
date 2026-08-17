@@ -151,7 +151,7 @@ function ExecutionConditionsHelp({ checks }: { checks: ExecutionCheck[] }): JSX.
           <span>{check.label}</span>
         </li>)}
       </ul>
-      <small>点击开仓后仍会强制刷新两边盘口；真实下单接口会继续校验账户余额。</small>
+      <small>点击开仓后会复核所选两边盘口；超过500毫秒未收到对应盘口时才补充请求，真实下单接口还会校验账户余额。</small>
     </div>
   </details>
 }
@@ -871,7 +871,7 @@ function App(): JSX.Element {
               </div>
 
               <div className="execute-action-row">
-                <button className="execute-button" onClick={() => void execute()} disabled={!canExecute} title="点击后先刷新两边盘口；确认MEXC实际成交后才会提交Polymarket对冲">
+                <button className="execute-button" onClick={() => void execute()} disabled={!canExecute} title="点击后先复核所选两边盘口；确认MEXC实际成交后才会提交Polymarket对冲">
                   {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <ArrowRight aria-hidden="true" />}
                   {snapshot.settings.mode === 'SIMULATION'
                     ? '模拟执行两腿'

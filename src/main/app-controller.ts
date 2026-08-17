@@ -263,8 +263,26 @@ export class AppController {
     if (this.activeSession && !['HEDGED', 'CANCELLED'].includes(this.activeSession.state)) {
       throw new Error('已有执行中的套利组，不能重复开仓')
     }
-    await this.refreshOpportunities()
-    const opportunity = this.opportunities.find((candidate) => candidate.id === request.opportunityId)
+    let opportunity = this.opportunities.find((candidate) => candidate.id === request.opportunityId)
+    if (!opportunity || opportunity.endTime <= Date.now()) {
+      await this.refreshOpportunities()
+      opportunity = this.opportunities.find((candidate) => candidate.id === request.opportunityId)
+    } else {
+      if (!opportunity.polymarketTokenId) throw new Error('Polymarket所选盘口缺少token，无法复核')
+      await Promise.all([
+        this.mexcBrowser.confirmMarketQuote?.(opportunity.mexcSymbolId),
+        this.polymarketData.confirmOutcomeQuote?.(opportunity.polymarketTokenId)
+      ])
+      const mexcWindows = this.mexcBrowser.getLatestWindows?.() ?? this.latestMexcWindows
+      const polymarketWindows = this.polymarketData.getLatestWindows?.() ?? this.latestPolymarketWindows
+      if (mexcWindows.length > 0 && polymarketWindows.length > 0) {
+        this.latestMexcWindows = mexcWindows
+        this.latestPolymarketWindows = polymarketWindows
+        this.opportunities = this.combineLiveQuotes(mexcWindows, polymarketWindows)
+        this.broadcast(this.getSnapshot())
+      }
+      opportunity = this.opportunities.find((candidate) => candidate.id === request.opportunityId)
+    }
     if (!opportunity) throw new Error('机会已失效，请刷新后重试')
     this.validateExecution(opportunity, request.quantity)
 

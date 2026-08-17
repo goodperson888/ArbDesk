@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { deriveMexcFeeRate } from './mexc-fee'
+import { deriveMexcFeeRate, updateMexcFeeCalibrationCache } from './mexc-fee'
 
 describe('MEXC prediction fee calibration', () => {
   const now = 1_786_944_000_000
@@ -30,6 +30,24 @@ describe('MEXC prediction fee calibration', () => {
       feeRate: '0',
       source: 'UNAVAILABLE',
       sampleCount: 0
+    })
+  })
+
+  it('keeps a verified cached rate when a transient response has no usable rows', () => {
+    const cached = {
+      feeRate: '0.015', source: 'HISTORY' as const, sampleCount: 3, receivedAt: now - 30_000
+    }
+
+    expect(updateMexcFeeCalibrationCache(cached, [], now, 60_000)).toBe(cached)
+  })
+
+  it('blocks with unavailable fees when an expired cache cannot be revalidated', () => {
+    const cached = {
+      feeRate: '0.015', source: 'HISTORY' as const, sampleCount: 3, receivedAt: now - 60_000
+    }
+
+    expect(updateMexcFeeCalibrationCache(cached, [], now, 60_000)).toEqual({
+      feeRate: '0', source: 'UNAVAILABLE', sampleCount: 0, receivedAt: now
     })
   })
 })

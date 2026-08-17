@@ -11,6 +11,10 @@ export interface MexcFeeCalibration {
   sampleCount: number
 }
 
+export interface CachedMexcFeeCalibration extends MexcFeeCalibration {
+  receivedAt: number
+}
+
 const MAX_SAMPLE_AGE_MS = 7 * 24 * 60 * 60 * 1_000
 
 function normalizeTimestamp(timestamp: number): number {
@@ -50,4 +54,16 @@ export function deriveMexcFeeRate(rows: MexcAssetLogRow[], now = Date.now()): Me
     source: 'HISTORY',
     sampleCount: samples.length
   }
+}
+
+export function updateMexcFeeCalibrationCache(
+  current: CachedMexcFeeCalibration | undefined,
+  rows: MexcAssetLogRow[],
+  receivedAt: number,
+  validForMs: number
+): CachedMexcFeeCalibration {
+  const next = { ...deriveMexcFeeRate(rows, receivedAt), receivedAt }
+  if (next.source === 'HISTORY') return next
+  if (current?.source === 'HISTORY' && receivedAt - current.receivedAt < validForMs) return current
+  return next
 }

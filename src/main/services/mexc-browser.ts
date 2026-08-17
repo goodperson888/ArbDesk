@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { BrowserWindow, ipcMain, session } from 'electron'
-import type { Browser, Locator, Page } from 'playwright-core'
+import type { Browser, CDPSession, Locator, Page } from 'playwright-core'
 import type {
   Direction,
   MexcAccountState,
@@ -12,12 +12,21 @@ import type {
   MexcOrderCapture
 } from '../../shared/types'
 import type { MarketDuration, OrderBookLevel } from '../../shared/types'
-import { deriveMexcFeeRate, type MexcAssetLogRow } from '../domain/mexc-fee'
+import {
+  updateMexcFeeCalibrationCache,
+  type CachedMexcFeeCalibration,
+  type MexcAssetLogRow
+} from '../domain/mexc-fee'
 import { parseLatestMexcSettlement, parseMexcFill, type MexcFillLogRow, type MexcFillMatch } from '../domain/mexc-fill'
+import { decodeMexcPredictionFrame } from '../domain/mexc-prediction-frame'
 
 const MEXC_URL = 'https://prediction.mexc.com/prediction-markets/all'
 const HUBSTUDIO_API = 'http://127.0.0.1:6873'
 const MEXC_USDT_COIN_ID = '128f589271cb4951b03e71e6323eb7be'
+const MEXC_EVENT_CACHE_MS = 10_000
+const MEXC_FEE_CACHE_MS = 60_000
+const MEXC_REST_FALLBACK_MS = 10_000
+const MEXC_PREFLIGHT_QUOTE_MS = 500
 
 interface MexcSelectors {
   amountInput?: string
@@ -88,6 +97,7 @@ interface MexcRawDepth {
   }
   timestamp?: number
   receivedAt?: number
+  version?: string
 }
 
 interface MexcRawIndexRange {
@@ -128,7 +138,12 @@ export class MexcBrowserManager {
   private hubstudioDebuggingPort?: number
   private hubstudioConnectedContainerCode?: string
   private hubstudioMonitor?: NodeJS.Timeout
-  private hubstudioQuoteMonitor?: NodeJS.Timeout
+  private hubstudioNetworkSession?: CDPSession
+  private hubstudioSocketUrls = new Map<string, string>()
+  private hubstudioPredictionConfirmedAt = 0
+  private hubstudioPredictionSubscriptionKey = ''
+  private lastHubstudioAccountRefreshAt = 0
+  private hubstudioAccountRefreshing = false
   private latestResult?: AutomationResult
   private calibrationResolver?: (result: { kind: MexcCalibrationKind; selector: string }) => void
   private selectorStore: SelectorStore = emptySelectors()
@@ -141,6 +156,9 @@ export class MexcBrowserManager {
   private latestAccountState?: MexcAccountState
   private latestOrderCapture?: MexcOrderCapture
   private interceptedDepth = new Map<string, MexcRawDepth>()
+  private interceptedEvents?: { receivedAt: number; events: MexcRawEvent[] }
+  private latestMexcIndex?: { price: string; receivedAt: number }
+  private cachedFeeCalibration?: CachedMexcFeeCalibration
   private latestWindows: MexcWindowQuote[] = []
   private marketDataListeners = new Set<() => void>()
   private instrumentedHubstudioPages = new WeakSet<Page>()
@@ -215,57 +233,94 @@ export class MexcBrowserManager {
       if (this.startupOpenAttempted) throw new Error('MEXC窗口已关闭；请在设置中手动点击打开，软件不会反复拉起')
       await this.open()
     }
-    const payload = await this.evaluateMexcPage(async () => {
-      const response = await fetch('/api/platform/predict/market/web/event/events', {
-        headers: { accept: 'application/json' }
+    const now = Date.now()
+    let events = this.interceptedEvents && now - this.interceptedEvents.receivedAt <= MEXC_EVENT_CACHE_MS
+      ? this.interceptedEvents.events
+      : undefined
+    if (!events) {
+      events = await this.evaluateMexcPage(async () => {
+        const response = await fetch('/api/platform/predict/market/web/event/events', {
+          headers: { accept: 'application/json' }
+        })
+        if (!response.ok) throw new Error(`MEXC events HTTP ${response.status}`)
+        const body = await response.json() as { data?: MexcRawEvent[] }
+        return body.data ?? []
       })
-      if (!response.ok) throw new Error(`MEXC events HTTP ${response.status}`)
-      const body = await response.json() as { data?: MexcRawEvent[] }
-      const now = Date.now()
-      const active = (body.data ?? [])
-        .filter((event) => event.s === 2 && Number(event.st) <= now && Number(event.et) > now)
-        .filter((event) => event.mn === 'BTC 5min' || event.mn === 'BTC 15min')
-      const selected = [300, 900]
-        .map((seconds) => active.find((event) => event.sp === seconds))
-        .filter((event): event is MexcRawEvent => Boolean(event))
-      const [markets, indexRange, feeRows] = await Promise.all([
-        Promise.all(selected.map(async (event) => {
-          const outcomes = await Promise.all((event.ers ?? []).map(async (outcome) => {
-            const symbolId = String(outcome.si ?? '')
-            const depthResponse = await fetch(`/api/platform/predict/market/web/depth?symbolId=${encodeURIComponent(symbolId)}`, {
+      this.interceptedEvents = { events, receivedAt: Date.now() }
+    }
+
+    const active = events
+      .filter((event) => event.s === 2 && Number(event.st) <= now && Number(event.et) > now)
+      .filter((event) => event.mn === 'BTC 5min' || event.mn === 'BTC 15min')
+    const selected = [300, 900]
+      .map((seconds) => active.find((event) => event.sp === seconds))
+      .filter((event): event is MexcRawEvent => Boolean(event))
+    const symbolIds = [...new Set(selected.flatMap((event) => event.ers ?? []).map((outcome) => String(outcome.si ?? '')).filter(Boolean))]
+    const effectiveDepthReceivedAt = (symbolId: string): number => Math.max(
+      Number(this.interceptedDepth.get(symbolId)?.receivedAt) || 0,
+      this.hubstudioPredictionSubscriptionKey.includes(symbolId) ? this.hubstudioPredictionConfirmedAt : 0
+    )
+    const missingDepthSymbolIds = symbolIds.filter((symbolId) =>
+      !this.interceptedDepth.get(symbolId)?.data?.asks?.length ||
+      now - effectiveDepthReceivedAt(symbolId) > MEXC_REST_FALLBACK_MS
+    )
+    const needIndex = !this.latestMexcIndex || now - this.latestMexcIndex.receivedAt > MEXC_REST_FALLBACK_MS
+    const needFee = !this.cachedFeeCalibration || now - this.cachedFeeCalibration.receivedAt > MEXC_FEE_CACHE_MS
+
+    if (missingDepthSymbolIds.length > 0 || needIndex || needFee) {
+      const fallback = await this.evaluateMexcPage(async (request: {
+        symbolIds: string[]
+        needIndex: boolean
+        needFee: boolean
+        now: number
+      }) => {
+        const [depths, indexRange, feeRows] = await Promise.all([
+          Promise.all(request.symbolIds.map(async (symbolId) => {
+            const response = await fetch(`/api/platform/predict/market/web/depth?symbolId=${encodeURIComponent(symbolId)}`, {
               headers: { accept: 'application/json' }
             })
-            if (!depthResponse.ok) throw new Error(`MEXC depth HTTP ${depthResponse.status}`)
-            const depth = await depthResponse.json() as MexcRawDepth
-            return { outcome, depth: { ...depth, receivedAt: Date.now() } }
-          }))
-          return { event, outcomes }
-        })),
-        fetch(`/api/platform/predict/market/web/event/index/price/range?indexName=BTC&start=${now - 30_000}&end=${now}`, {
-          headers: { accept: 'application/json' }
-        }).then(async (response) => response.ok ? await response.json() as MexcRawIndexRange : { data: [] }),
-        fetch('/api/platform/predict/asset/query/web/summaryLog?comboExclude=false&pageNum=1&pageSize=100', {
-          headers: { accept: 'application/json' }, credentials: 'include'
-        }).then(async (response) => {
-          if (!response.ok) return [] as MexcAssetLogRow[]
-          const body = await response.json() as { data?: { result?: MexcAssetLogRow[] } }
-          return body.data?.result ?? []
-        }).catch(() => [] as MexcAssetLogRow[])
-      ])
-      return { markets, indexRange, feeRows }
-    })
+            if (!response.ok) throw new Error(`MEXC depth HTTP ${response.status}`)
+            return { symbolId, depth: await response.json() as MexcRawDepth, receivedAt: Date.now() }
+          })),
+          request.needIndex
+            ? fetch(`/api/platform/predict/market/web/event/index/price/range?indexName=BTC&start=${request.now - 30_000}&end=${request.now}`, {
+                headers: { accept: 'application/json' }
+              }).then(async (response) => response.ok ? await response.json() as MexcRawIndexRange : { data: [] })
+            : Promise.resolve(undefined),
+          request.needFee
+            ? fetch('/api/platform/predict/asset/query/web/summaryLog?comboExclude=false&pageNum=1&pageSize=100', {
+                headers: { accept: 'application/json' }, credentials: 'include'
+              }).then(async (response) => {
+                if (!response.ok) return [] as MexcAssetLogRow[]
+                const body = await response.json() as { data?: { result?: MexcAssetLogRow[] } }
+                return body.data?.result ?? []
+              }).catch(() => [] as MexcAssetLogRow[])
+            : Promise.resolve(undefined)
+        ])
+        return { depths, indexRange, feeRows }
+      }, { symbolIds: missingDepthSymbolIds, needIndex, needFee, now })
 
-    const feeCalibration = deriveMexcFeeRate(payload.feeRows)
-    const latestIndex = (payload.indexRange.data ?? [])
-      .filter((point) => Number(point.p) > 0 && Number(point.ts) > 0)
-      .sort((left, right) => Number(right.ts) - Number(left.ts))[0]
-    const windows: MexcWindowQuote[] = payload.markets.map(({ event, outcomes }) => {
+      for (const { symbolId, depth, receivedAt } of fallback.depths) {
+        this.interceptedDepth.set(symbolId, { ...depth, receivedAt })
+      }
+      const latestIndex = (fallback.indexRange?.data ?? [])
+        .filter((point) => Number(point.p) > 0 && Number(point.ts) > 0)
+        .sort((left, right) => Number(right.ts) - Number(left.ts))[0]
+      if (latestIndex?.p) this.latestMexcIndex = { price: String(latestIndex.p), receivedAt: Date.now() }
+      if (fallback.feeRows) {
+        this.applyFeeCalibration(fallback.feeRows, Date.now())
+      }
+    }
+
+    const feeCalibration = this.cachedFeeCalibration ?? { feeRate: '0', source: 'UNAVAILABLE' as const, receivedAt: 0 }
+    const windows: MexcWindowQuote[] = selected.map((event) => {
       const parsed = new Map<Direction, MexcOutcomeQuote>()
-      for (const { outcome, depth } of outcomes) {
+      for (const outcome of event.ers ?? []) {
         const normalized = String(outcome.rn ?? '').toUpperCase()
         if (normalized !== 'UP' && normalized !== 'DOWN') continue
-        const intercepted = this.interceptedDepth.get(String(outcome.si ?? ''))
-        const effectiveDepth = Number(intercepted?.timestamp) > Number(depth.timestamp) ? intercepted! : depth
+        const symbolId = String(outcome.si ?? '')
+        const effectiveDepth = this.interceptedDepth.get(symbolId)
+        if (!effectiveDepth) continue
         const levels = (effectiveDepth.data?.asks ?? [])
           .map((level) => ({ price: String(level.p ?? ''), size: String(level.q ?? '') }))
           .filter((level) => Number(level.price) > 0 && Number(level.size) > 0)
@@ -274,11 +329,11 @@ export class MexcBrowserManager {
         if (!best) continue
         parsed.set(normalized, {
           direction: normalized,
-          symbolId: String(outcome.si),
+          symbolId,
           bestAsk: best.price,
           askSize: best.size,
           levels,
-          receivedAt: Number(effectiveDepth.receivedAt) || Date.now()
+          receivedAt: Math.max(Number(effectiveDepth.receivedAt) || 0, effectiveDepthReceivedAt(symbolId))
         })
       }
       const up = parsed.get('UP')
@@ -290,15 +345,74 @@ export class MexcBrowserManager {
         startTime: Number(event.st),
         endTime: Number(event.et),
         baselinePrice: String(event.bsp ?? ''),
-        indexPrice: latestIndex?.p ? String(latestIndex.p) : undefined,
-        indexReceivedAt: latestIndex?.p ? Date.now() : undefined,
+        indexPrice: this.latestMexcIndex?.price,
+        indexReceivedAt: this.latestMexcIndex?.receivedAt,
         feeRate: feeCalibration.feeRate,
         feeRateSource: feeCalibration.source,
         outcomes: { UP: up, DOWN: down }
       }
     })
     this.latestWindows = windows
+    if (this.mode === 'HUBSTUDIO') void this.syncHubstudioPredictionSubscriptions().catch(() => undefined)
     return windows
+  }
+
+  async confirmMarketQuote(symbolId: string, maximumAgeMs = MEXC_PREFLIGHT_QUOTE_MS): Promise<void> {
+    const now = Date.now()
+    const currentDepth = this.interceptedDepth.get(symbolId)
+    // Opening checks must use a symbol-specific quote timestamp. General socket
+    // activity can keep an unchanged market fresh in the scanner, but it must
+    // not suppress the final selected-book verification.
+    const depthReceivedAt = Number(currentDepth?.receivedAt) || 0
+    const needDepth = !currentDepth?.data?.asks?.length || now - depthReceivedAt > maximumAgeMs
+    const needIndex = !this.latestMexcIndex || now - this.latestMexcIndex.receivedAt > maximumAgeMs
+    const needFee = !this.cachedFeeCalibration || now - this.cachedFeeCalibration.receivedAt > MEXC_FEE_CACHE_MS
+    if (!needDepth && !needIndex && !needFee) return
+
+    const result = await this.evaluateMexcPage(async (request: {
+      symbolId: string
+      needDepth: boolean
+      needIndex: boolean
+      needFee: boolean
+      now: number
+    }) => {
+      const [depth, indexRange, feeRows] = await Promise.all([
+        request.needDepth
+          ? fetch(`/api/platform/predict/market/web/depth?symbolId=${encodeURIComponent(request.symbolId)}`, {
+              headers: { accept: 'application/json' }
+            }).then(async (response) => {
+              if (!response.ok) throw new Error(`MEXC depth HTTP ${response.status}`)
+              return await response.json() as MexcRawDepth
+            })
+          : Promise.resolve(undefined),
+        request.needIndex
+          ? fetch(`/api/platform/predict/market/web/event/index/price/range?indexName=BTC&start=${request.now - 30_000}&end=${request.now}`, {
+              headers: { accept: 'application/json' }
+            }).then(async (response) => response.ok ? await response.json() as MexcRawIndexRange : { data: [] })
+          : Promise.resolve(undefined),
+        request.needFee
+          ? fetch('/api/platform/predict/asset/query/web/summaryLog?comboExclude=false&pageNum=1&pageSize=100', {
+              headers: { accept: 'application/json' }, credentials: 'include'
+            }).then(async (response) => {
+              if (!response.ok) return [] as MexcAssetLogRow[]
+              const body = await response.json() as { data?: { result?: MexcAssetLogRow[] } }
+              return body.data?.result ?? []
+            }).catch(() => [] as MexcAssetLogRow[])
+          : Promise.resolve(undefined)
+      ])
+      return { depth, indexRange, feeRows, receivedAt: Date.now() }
+    }, { symbolId, needDepth, needIndex, needFee, now })
+
+    if (result.depth) {
+      const normalized = { ...result.depth, receivedAt: result.receivedAt }
+      this.interceptedDepth.set(symbolId, normalized)
+      this.applyInterceptedDepth(symbolId, normalized)
+    }
+    const latestIndex = (result.indexRange?.data ?? [])
+      .filter((point) => Number(point.p) > 0 && Number(point.ts) > 0)
+      .sort((left, right) => Number(right.ts) - Number(left.ts))[0]
+    if (latestIndex?.p) this.applyMexcIndex(String(latestIndex.p), result.receivedAt)
+    if (result.feeRows) this.applyFeeCalibration(result.feeRows, result.receivedAt)
   }
 
   getStatus(): MexcBrowserStatus {
@@ -347,7 +461,7 @@ export class MexcBrowserManager {
         const [positions, orders, history, balances] = await Promise.all([
           getJson('/api/platform/predict/asset/query/web/positions?mode=MIX'),
           getJson('/api/platform/predict/order/query/web/current/orders?orderTypes=1&states=0,1,3&pageNum=1&pageSize=100'),
-          getJson('/api/platform/predict/asset/query/web/summaryLog?comboExclude=false&pageNum=1&pageSize=20'),
+          getJson('/api/platform/predict/asset/query/web/summaryLog?comboExclude=false&pageNum=1&pageSize=100'),
           getJson('/api/platform/predict/asset/query/web/balances?coinIds=128f589271cb4951b03e71e6323eb7be')
         ])
         return { positions, orders, history, balances }
@@ -362,6 +476,7 @@ export class MexcBrowserManager {
         ? payload.history.data as Record<string, unknown>
         : {}
       const historyRows = Array.isArray(historyData.result) ? historyData.result as Record<string, unknown>[] : []
+      this.applyFeeCalibration(historyRows as MexcAssetLogRow[], Date.now())
       const balanceRows = Array.isArray(payload.balances.data) ? payload.balances.data as Record<string, unknown>[] : []
       const usdtBalance = balanceRows.find((row) => row.coinId === MEXC_USDT_COIN_ID)
       const totalHistory = Number(historyData.total)
@@ -535,29 +650,38 @@ export class MexcBrowserManager {
     if (!page.url().includes('prediction.mexc.com')) await page.goto(MEXC_URL)
     this.hubstudioPage = page
     this.instrumentHubstudioPage(page)
+    await this.startHubstudioWebSocketMonitoring(page)
     page.on('close', () => {
       if (this.hubstudioPage !== page) return
       this.hubstudioPage = undefined
       this.hubstudioAuthenticated = false
     })
-    page.on('domcontentloaded', () => void this.refreshHubstudioAuthentication())
+    page.on('domcontentloaded', () => {
+      void this.refreshHubstudioAuthentication()
+      void this.syncHubstudioPredictionSubscriptions().catch(() => undefined)
+    })
     await page.bringToFront()
     this.startHubstudioMonitoring()
-    this.startHubstudioQuoteMonitoring()
     await this.refreshHubstudioAuthentication()
     await this.refreshAccountState()
+    this.lastHubstudioAccountRefreshAt = Date.now()
     return page
   }
 
-  private async evaluateMexcPage<T>(fn: () => Promise<T>): Promise<T> {
+  private async evaluateMexcPage<T>(fn: () => Promise<T>): Promise<T>
+  private async evaluateMexcPage<T, Argument>(fn: (argument: Argument) => Promise<T>, argument: Argument): Promise<T>
+  private async evaluateMexcPage<T, Argument>(
+    fn: (() => Promise<T>) | ((argument: Argument) => Promise<T>),
+    argument?: Argument
+  ): Promise<T> {
     if (this.mode === 'HUBSTUDIO') {
       const page = this.hubstudioPage
       if (!page || page.isClosed()) throw new Error('Hubstudio MEXC页面不可用')
-      return await page.evaluate(fn)
+      return await page.evaluate(fn as never, argument as never) as T
     }
     const window = this.embeddedWindow
     if (!window || window.isDestroyed()) throw new Error('内嵌MEXC页面不可用')
-    return await window.webContents.executeJavaScript(`(${fn.toString()})()`)
+    return await window.webContents.executeJavaScript(`(${fn.toString()})(${JSON.stringify(argument)})`)
   }
 
   private instrumentHubstudioPage(page: Page): void {
@@ -591,13 +715,16 @@ export class MexcBrowserManager {
     })
     page.on('response', (response) => {
       const responseUrl = response.url()
+      if (/\/api\/platform\/predict\/market\/web\/event\/events(?:\?|$)/.test(responseUrl)) {
+        void response.json().then((body: { data?: MexcRawEvent[] }) => {
+          this.interceptedEvents = { events: body.data ?? [], receivedAt: Date.now() }
+        }).catch(() => undefined)
+      }
       if (/\/api\/platform\/predict\/market\/web\/depth/.test(responseUrl)) {
         void response.json().then((body: MexcRawDepth) => {
           const symbolId = new URL(responseUrl).searchParams.get('symbolId') ?? ''
           if (!symbolId) return
           const normalizedBody = { ...body, timestamp: Number(body.timestamp) || Date.now(), receivedAt: Date.now() }
-          const previous = this.interceptedDepth.get(symbolId)
-          if (Number(previous?.timestamp) > Number(normalizedBody.timestamp)) return
           this.interceptedDepth.set(symbolId, normalizedBody)
           this.applyInterceptedDepth(symbolId, normalizedBody)
         }).catch(() => undefined)
@@ -608,13 +735,14 @@ export class MexcBrowserManager {
             .filter((point) => Number(point.p) > 0 && Number(point.ts) > 0)
             .sort((left, right) => Number(right.ts) - Number(left.ts))[0]
           if (!latest?.p) return
-          const receivedAt = Date.now()
-          this.latestWindows = this.latestWindows.map((window) => ({
-            ...window,
-            indexPrice: String(latest.p),
-            indexReceivedAt: receivedAt
-          }))
-          for (const listener of this.marketDataListeners) listener()
+          this.applyMexcIndex(String(latest.p), Date.now())
+        }).catch(() => undefined)
+      }
+      if (/\/api\/platform\/predict\/asset\/query\/web\/summaryLog/.test(responseUrl)) {
+        const query = new URL(responseUrl).searchParams
+        if (Number(query.get('pageNum') ?? '1') !== 1 || Number(query.get('pageSize') ?? '0') < 100) return
+        void response.json().then((body: { data?: { result?: MexcAssetLogRow[] } }) => {
+          this.applyFeeCalibration(body.data?.result ?? [], Date.now())
         }).catch(() => undefined)
       }
       if (!isOrderEndpoint(responseUrl)) return
@@ -636,6 +764,170 @@ export class MexcBrowserManager {
         }
       })
     })
+  }
+
+  private async startHubstudioWebSocketMonitoring(page: Page): Promise<void> {
+    if (this.hubstudioNetworkSession) await this.hubstudioNetworkSession.detach().catch(() => undefined)
+    this.hubstudioSocketUrls.clear()
+    const networkSession = await page.context().newCDPSession(page)
+    this.hubstudioNetworkSession = networkSession
+    await networkSession.send('Network.enable')
+    networkSession.on('Network.webSocketCreated', (event: { requestId: string; url: string }) => {
+      this.hubstudioSocketUrls.set(event.requestId, event.url)
+    })
+    networkSession.on('Network.webSocketClosed', (event: { requestId: string }) => {
+      this.hubstudioSocketUrls.delete(event.requestId)
+    })
+    networkSession.on('Network.webSocketFrameReceived', (event: {
+      requestId: string
+      response: { opcode: number; payloadData: string }
+    }) => {
+      const socketUrl = this.hubstudioSocketUrls.get(event.requestId)
+      const knownPredictionSocket = socketUrl?.includes('prediction.mexc.com/predict/ws') ?? false
+      if (socketUrl && !knownPredictionSocket) return
+      if (knownPredictionSocket) this.confirmMexcPredictionFreshness(Date.now())
+      if (event.response.opcode !== 2) return
+      const decoded = decodeMexcPredictionFrame(Buffer.from(event.response.payloadData, 'base64'))
+      if (!decoded) return
+      const receivedAt = Date.now()
+      this.confirmMexcPredictionFreshness(receivedAt)
+      if (decoded.depth) {
+        const previous = this.interceptedDepth.get(decoded.depth.symbolId)
+        const previousVersion = previous?.version
+        const nextVersion = decoded.depth.version
+        if (previousVersion && nextVersion && /^\d+$/.test(previousVersion) && /^\d+$/.test(nextVersion)) {
+          if (BigInt(previousVersion) > BigInt(nextVersion)) return
+        }
+        const depth: MexcRawDepth = {
+          data: { asks: decoded.depth.asks.map((level) => ({ p: level.price, q: level.size })) },
+          timestamp: receivedAt,
+          receivedAt,
+          version: nextVersion
+        }
+        this.interceptedDepth.set(decoded.depth.symbolId, depth)
+        this.applyInterceptedDepth(decoded.depth.symbolId, depth)
+      }
+      if (decoded.index) this.applyMexcIndex(decoded.index.price, receivedAt)
+    })
+  }
+
+  private async syncHubstudioPredictionSubscriptions(): Promise<void> {
+    const page = this.hubstudioPage
+    if (!page || page.isClosed() || this.latestWindows.length === 0) return
+    const channels = [
+      ...new Set(this.latestWindows.flatMap((window) => [
+        `predict@public.depth.scale.pb@${window.outcomes.UP.symbolId}@0.01@30`,
+        `predict@public.depth.scale.pb@${window.outcomes.DOWN.symbolId}@0.01@30`,
+        `predict@public.index.realtime.period.pb@BTC@${window.durationMinutes * 60}`
+      ]))
+    ].sort()
+    const key = channels.join('|')
+    const active = await page.evaluate((expectedKey: string) => {
+      type FeedState = { key: string; isActive: () => boolean; renew: () => void }
+      const root = window as typeof window & { __arbDeskPredictionFeed?: FeedState }
+      const matches = root.__arbDeskPredictionFeed?.key === expectedKey && root.__arbDeskPredictionFeed.isActive()
+      if (matches) root.__arbDeskPredictionFeed?.renew()
+      return matches
+    }, key).catch(() => false)
+    if (active) {
+      this.hubstudioPredictionSubscriptionKey = key
+      return
+    }
+
+    await page.evaluate(({ subscriptionKey, subscriptionChannels }) => {
+      type FeedState = { key: string; stop: () => void; isActive: () => boolean; renew: () => void }
+      const root = window as typeof window & { __arbDeskPredictionFeed?: FeedState }
+      root.__arbDeskPredictionFeed?.stop()
+      let socket: WebSocket | undefined
+      let heartbeat = 0
+      let reconnect = 0
+      let leaseMonitor = 0
+      let lastLeaseAt = Date.now()
+      let stopped = false
+      const clearTimers = (): void => {
+        if (heartbeat) window.clearInterval(heartbeat)
+        if (reconnect) window.clearTimeout(reconnect)
+        if (leaseMonitor) window.clearInterval(leaseMonitor)
+        heartbeat = 0
+        reconnect = 0
+        leaseMonitor = 0
+      }
+      const connect = (): void => {
+        if (stopped) return
+        if (!leaseMonitor) {
+          leaseMonitor = window.setInterval(() => {
+            if (Date.now() - lastLeaseAt > 15_000) root.__arbDeskPredictionFeed?.stop()
+          }, 5_000)
+        }
+        socket = new WebSocket('wss://prediction.mexc.com/predict/ws?platform=web')
+        socket.binaryType = 'arraybuffer'
+        socket.onopen = () => {
+          socket?.send(JSON.stringify({ method: 'SUBSCRIPTION', params: subscriptionChannels, id: Date.now() }))
+          heartbeat = window.setInterval(() => {
+            if (socket?.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ method: 'PING', id: Date.now() }))
+            }
+          }, 3_000)
+        }
+        socket.onclose = () => {
+          clearTimers()
+          if (!stopped) reconnect = window.setTimeout(connect, 1_500)
+        }
+      }
+      root.__arbDeskPredictionFeed = {
+        key: subscriptionKey,
+        isActive: () => Boolean(socket && socket.readyState <= WebSocket.OPEN),
+        renew: () => { lastLeaseAt = Date.now() },
+        stop: () => {
+          stopped = true
+          clearTimers()
+          if (socket?.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ method: 'UNSUBSCRIPTION', params: subscriptionChannels, id: Date.now() }))
+          }
+          socket?.close()
+        }
+      }
+      connect()
+    }, { subscriptionKey: key, subscriptionChannels: channels })
+    this.hubstudioPredictionSubscriptionKey = key
+  }
+
+  private applyMexcIndex(price: string, receivedAt: number): void {
+    if (!(Number(price) > 0)) return
+    this.latestMexcIndex = { price, receivedAt }
+    this.latestWindows = this.latestWindows.map((window) => ({
+      ...window,
+      indexPrice: price,
+      indexReceivedAt: receivedAt
+    }))
+    for (const listener of this.marketDataListeners) listener()
+  }
+
+  private confirmMexcPredictionFreshness(receivedAt: number): void {
+    this.hubstudioPredictionConfirmedAt = receivedAt
+    let changed = false
+    this.latestWindows = this.latestWindows.map((window) => ({
+      ...window,
+      outcomes: Object.fromEntries(Object.entries(window.outcomes).map(([direction, outcome]) => {
+        if (!this.hubstudioPredictionSubscriptionKey.includes(outcome.symbolId)) return [direction, outcome]
+        changed = true
+        return [direction, { ...outcome, receivedAt }]
+      })) as Record<Direction, MexcOutcomeQuote>
+    }))
+    if (changed) for (const listener of this.marketDataListeners) listener()
+  }
+
+  private applyFeeCalibration(rows: MexcAssetLogRow[], receivedAt: number): void {
+    const previous = this.cachedFeeCalibration
+    const calibration = updateMexcFeeCalibrationCache(previous, rows, receivedAt, MEXC_FEE_CACHE_MS)
+    if (calibration === previous) return
+    this.cachedFeeCalibration = calibration
+    this.latestWindows = this.latestWindows.map((window) => ({
+      ...window,
+      feeRate: calibration.feeRate,
+      feeRateSource: calibration.source
+    }))
+    for (const listener of this.marketDataListeners) listener()
   }
 
   private applyInterceptedDepth(symbolId: string, depth: MexcRawDepth): void {
@@ -1221,31 +1513,38 @@ export class MexcBrowserManager {
     if (!match) return
     const durationMinutes = Number(match[1]) as 5 | 15
     const currentEventId = match[2]
-    const target = await page.evaluate(async (duration: 5 | 15) => {
-      const response = await fetch('/api/platform/predict/market/web/event/events', {
-        headers: { accept: 'application/json' }
+    const now = Date.now()
+    let events = this.interceptedEvents && now - this.interceptedEvents.receivedAt <= MEXC_EVENT_CACHE_MS
+      ? this.interceptedEvents.events
+      : undefined
+    if (!events) {
+      events = await page.evaluate(async () => {
+        const response = await fetch('/api/platform/predict/market/web/event/events', {
+          headers: { accept: 'application/json' }
+        })
+        if (!response.ok) throw new Error(`MEXC events HTTP ${response.status}`)
+        const body = await response.json() as { data?: MexcRawEvent[] }
+        return body.data ?? []
       })
-      if (!response.ok) throw new Error(`MEXC events HTTP ${response.status}`)
-      const body = await response.json() as { data?: MexcRawEvent[] }
-      const now = Date.now()
-      const event = (body.data ?? []).find((candidate) =>
-        candidate.s === 2 &&
-        candidate.mn === `BTC ${duration}min` &&
-        Number(candidate.sp) === duration * 60 &&
-        Number(candidate.st) <= now &&
-        Number(candidate.et) > now
-      )
-      if (!event?.id || !event.en) return undefined
-      const slug = event.en
-        .toLowerCase()
-        .replaceAll(',', '')
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-|-$/g, '')
-      return {
-        eventId: String(event.id),
-        url: `${location.origin}/prediction-markets/up-down/${slug}/${event.id}`
-      }
-    }, durationMinutes)
+      this.interceptedEvents = { events, receivedAt: Date.now() }
+    }
+    const event = events.find((candidate) =>
+      candidate.s === 2 &&
+      candidate.mn === `BTC ${durationMinutes}min` &&
+      Number(candidate.sp) === durationMinutes * 60 &&
+      Number(candidate.st) <= now &&
+      Number(candidate.et) > now
+    )
+    if (!event?.id || !event.en) return
+    const slug = event.en
+      .toLowerCase()
+      .replaceAll(',', '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+    const target = {
+      eventId: String(event.id),
+      url: `${new URL(page.url()).origin}/prediction-markets/up-down/${slug}/${event.id}`
+    }
     if (!target || target.eventId === currentEventId) return
     await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 30_000 })
   }
@@ -1254,50 +1553,37 @@ export class MexcBrowserManager {
     if (this.hubstudioMonitor) clearInterval(this.hubstudioMonitor)
     this.hubstudioMonitor = setInterval(() => {
       if (!this.hubstudioPage || this.hubstudioPage.isClosed()) return
-      void this.followHubstudioLiveMarket()
-        .then(() => this.refreshAccountState())
+      void this.followHubstudioLiveMarket().catch(() => undefined)
+      if (Date.now() - this.lastHubstudioAccountRefreshAt < 15_000 || this.hubstudioAccountRefreshing) return
+      this.hubstudioAccountRefreshing = true
+      void this.refreshAccountState()
+        .finally(() => {
+          this.lastHubstudioAccountRefreshAt = Date.now()
+          this.hubstudioAccountRefreshing = false
+        })
         .catch(() => undefined)
     }, 5_000)
   }
 
-  private startHubstudioQuoteMonitoring(): void {
-    if (this.hubstudioQuoteMonitor) clearInterval(this.hubstudioQuoteMonitor)
-    const refresh = async (): Promise<void> => {
-      const page = this.hubstudioPage
-      if (!page || page.isClosed()) return
-      const symbolIds = [...new Set(this.latestWindows.flatMap((window) => [
-        window.outcomes.UP.symbolId,
-        window.outcomes.DOWN.symbolId
-      ]).filter(Boolean))]
-      if (symbolIds.length === 0) return
-      await page.evaluate(async (ids: string[]) => {
-        const now = Date.now()
-        await Promise.all([
-          ...ids.map(async (symbolId) => {
-            const response = await fetch(`/api/platform/predict/market/web/depth?symbolId=${encodeURIComponent(symbolId)}`, {
-              headers: { accept: 'application/json' }
-            })
-            if (response.ok) await response.arrayBuffer()
-          }),
-          (async () => {
-            const response = await fetch(`/api/platform/predict/market/web/event/index/price/range?indexName=BTC&start=${now - 30_000}&end=${now}`, {
-              headers: { accept: 'application/json' }
-            })
-            if (response.ok) await response.arrayBuffer()
-          })()
-        ])
-      }, symbolIds)
-    }
-    void refresh().catch(() => undefined)
-    this.hubstudioQuoteMonitor = setInterval(() => void refresh().catch(() => undefined), 2_000)
-    this.hubstudioQuoteMonitor.unref()
-  }
-
   private clearHubstudioConnection(): void {
     if (this.hubstudioMonitor) clearInterval(this.hubstudioMonitor)
-    if (this.hubstudioQuoteMonitor) clearInterval(this.hubstudioQuoteMonitor)
     this.hubstudioMonitor = undefined
-    this.hubstudioQuoteMonitor = undefined
+    const page = this.hubstudioPage
+    if (page && !page.isClosed()) {
+      void page.evaluate(() => {
+        type FeedState = { stop: () => void }
+        const root = window as typeof window & { __arbDeskPredictionFeed?: FeedState }
+        root.__arbDeskPredictionFeed?.stop()
+        delete root.__arbDeskPredictionFeed
+      }).catch(() => undefined)
+    }
+    if (this.hubstudioNetworkSession) void this.hubstudioNetworkSession.detach().catch(() => undefined)
+    this.hubstudioNetworkSession = undefined
+    this.hubstudioSocketUrls.clear()
+    this.hubstudioPredictionConfirmedAt = 0
+    this.hubstudioPredictionSubscriptionKey = ''
+    this.lastHubstudioAccountRefreshAt = 0
+    this.hubstudioAccountRefreshing = false
     this.hubstudioPage = undefined
     this.hubstudioBrowser = undefined
     this.hubstudioDebuggingPort = undefined

@@ -23,6 +23,7 @@ describe('PolymarketMarketData', () => {
   })
 
   it('discovers the exact rolling window and uses real CLOB asks and fee rate', async () => {
+    let upPrice = '0.50'
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
       const url = String(input)
       if (url.includes('gamma-api')) {
@@ -35,7 +36,7 @@ describe('PolymarketMarketData', () => {
       }
       if (url.includes('/clob-markets/condition-1')) return Response.json({ fd: { r: 0.07, e: 1, to: true } })
       if (url.includes('/book?token_id=token-up')) {
-        return Response.json({ timestamp: String(Date.now()), asks: [{ price: '0.55', size: '12' }, { price: '0.50', size: '8' }] })
+        return Response.json({ timestamp: String(Date.now()), asks: [{ price: '0.55', size: '12' }, { price: upPrice, size: '8' }] })
       }
       if (url.includes('/book?token_id=token-down')) {
         return Response.json({ timestamp: String(Date.now()), asks: [{ price: '0.48', size: '6' }] })
@@ -52,6 +53,10 @@ describe('PolymarketMarketData', () => {
     expect(windows[0].outcomes.UP!.feeRate).toBe('0.07')
     expect(windows[0].outcomes.UP!.feeExponent).toBe('1')
     expect(service.getStatus().connected).toBe(true)
+
+    upPrice = '0.47'
+    await service.confirmOutcomeQuote('token-up', -1)
+    expect(service.getLatestWindows()[0].outcomes.UP?.bestAsk).toBe('0.47')
   })
 
   it('reports disconnected instead of generating fallback quotes', async () => {

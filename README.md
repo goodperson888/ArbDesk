@@ -92,7 +92,7 @@ npm run package:win
 
 ## 真实数据来源
 
-- MEXC：在 MEXC Prediction 页面上下文内读取事件列表与 `/depth` 深度；首档卖价和首档数量用于机会计算。
+- MEXC：事件轮次先从页面已有响应读取，UP/DOWN 深度和 5m/15m BTC 指数通过 Prediction WebSocket 持续订阅；仅在首次快照、跨盘、推送静默或开仓前所选盘口超过 500 毫秒未更新时使用 REST 补充校验。首档卖价和首档数量用于机会计算。
 - Polymarket：Gamma API 按 `btc-updown-5m-{startUnix}` / `btc-updown-15m-{startUnix}` 发现市场，CLOB API 获取每个 outcome token 的卖盘和费率。
 - Chainlink：目前只作为 Polymarket 结算规则来源，应用未单独接入 Chainlink 实时报价，因此状态会明确显示“未接入”。
 - Binance：可以以后增加为参考现货价，但不能替代 MEXC Prediction 盘口，因为二者不是同一可成交合约。
@@ -103,7 +103,7 @@ npm run package:win
 
 当前本地配置已使用 `http://127.0.0.1:7890` 完成真实联调：BTC 5m/15m 市场发现、CLOB 双边订单簿均可访问。Polymarket 费用读取 V2 CLOB 市场详情的 `fd.r`（曲线费率）与 `fd.e`（曲线指数）；参数缺失或请求失败时不会生成机会。`/fee-rate` 的 `base_fee` 不再被误作 V2 曲线参数。
 
-MEXC 费用只采用账户最近 7 天最新一笔买入流水：存在配对手续费流水时按实际比例计算，不存在手续费流水时视为该笔零费。没有近期买入样本时不会猜测 1.5%，而是将费用标为“待校验”并禁止执行。
+MEXC 费用只采用账户最近 7 天最新一笔买入流水：存在配对手续费流水时按实际比例计算，不存在手续费流水时视为该笔零费。校准读取第一页 100 条流水并缓存 60 秒；短分页或临时空响应不会覆盖仍有效的历史费率，缓存到期且重新校验失败时会标为“待校验”并禁止执行，不会猜测 1.5%。
 
 ## 实验与实盘开关
 

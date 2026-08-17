@@ -23,6 +23,8 @@ describe('AppController simulation', () => {
     temporaryDirectories.push(directory)
     // Use the next complete window so this test cannot enter the stop-before-expiry guard near a 5m boundary.
     const startTime = Math.ceil(Date.now() / 300_000) * 300_000
+    const confirmMexcQuote = vi.fn(async () => undefined)
+    const confirmPolymarketQuote = vi.fn(async () => undefined)
     const mexcBrowser = {
       configure: () => undefined,
       getCalibration: () => ({ amountInput: false, upButton: false, downButton: false, submitButton: false }),
@@ -35,6 +37,7 @@ describe('AppController simulation', () => {
         calibrated: { amountInput: false, upButton: false, downButton: false, submitButton: false },
         message: 'test'
       }),
+      confirmMarketQuote: confirmMexcQuote,
       fetchActiveBtcWindows: async () => [{
         eventId: 'mexc-test',
         durationMinutes: 5,
@@ -50,6 +53,7 @@ describe('AppController simulation', () => {
     const polymarketData = {
       configureProxy: () => undefined,
       getStatus: () => ({ connected: true, message: 'test' }),
+      confirmOutcomeQuote: confirmPolymarketQuote,
       fetchWindows: async () => [{
         durationMinutes: 5,
         startTime,
@@ -71,6 +75,8 @@ describe('AppController simulation', () => {
     await controller.updateSettings({ minConditionalReturnPct: '0' })
     const session = await controller.execute({ opportunityId: opportunity.id, quantity: '5' })
 
+    expect(confirmMexcQuote).toHaveBeenCalledWith('up')
+    expect(confirmPolymarketQuote).toHaveBeenCalledWith('poly-down')
     expect(session.state).toBe('HEDGED')
     expect(session.mexcFill?.quantity).toBe('5.00')
     expect(session.polymarketFill?.quantity).toBe('5.00')
