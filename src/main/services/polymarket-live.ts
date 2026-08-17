@@ -24,7 +24,7 @@ import type {
   PolymarketSignatureType,
   UpdatePolymarketCredentialsRequest
 } from '../../shared/types'
-import type { HedgeOrder, PolymarketBroker } from './polymarket'
+import type { ClosePositionOrder, HedgeOrder, PolymarketBroker } from './polymarket'
 import type { PolymarketCredentialStore, PolymarketCredentials } from './polymarket-credential-store'
 
 const CLOB_API = 'https://clob.polymarket.com'
@@ -203,7 +203,14 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     if (spendAmount.lt(MIN_MARKETABLE_BUY_AMOUNT)) {
       throw new Error(`Polymarket可立即成交的BUY至少需要1抵押资产；当前${quantity.toString()}份按最高价${maximumPrice.toString()}仅为${spendAmount.toFixed(2)}。第一腿成交量不足，未提交第二腿`)
     }
-    this.assertBuyingPower(balance, spendAmount, book)
+    const estimatedFee = this.estimateFeeOnSpend(
+      spendAmount,
+      maximumPrice,
+      book,
+      new Decimal(order.feeRate ?? 0),
+      new Decimal(order.feeExponent ?? 1)
+    )
+    this.assertBuyingPower(balance, spendAmount.add(estimatedFee), book)
 
     const signedOrder = await client.createMarketOrder({
       tokenID: order.tokenId,
@@ -232,6 +239,59 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       direction: order.direction,
       quantity: filledQuantity.toDecimalPlaces(6).toString(),
       averagePrice: spent.div(filledQuantity).toDecimalPlaces(6).toString(),
+      orderId: response.orderID,
+      filledAt: Date.now()
+    }
+  }
+
+  async closePosition(order: ClosePositionOrder): Promise<Fill> {
+    if (!order.tokenId) throw new Error('Polymarket 平仓缺少 tokenId')
+    const quantity = new Decimal(order.quantity)
+    const maximumSlippage = new Decimal(order.maximumSlippage)
+    if (!quantity.isFinite() || quantity.lte(0)) throw new Error('Polymarket 平仓数量无效')
+    if (!maximumSlippage.isFinite() || maximumSlippage.lt(0) || maximumSlippage.gte(1)) {
+      throw new Error('Polymarket 平仓滑点设置无效')
+    }
+
+    const credentials = await this.credentialStore.getCredentials()
+    const signer = this.createSigner(credentials.signerPrivateKey)
+    const client = this.createAuthenticatedClient(credentials, signer)
+    const [book, balance] = await Promise.all([
+      client.getOrderBook(order.tokenId),
+      client.getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: order.tokenId })
+    ])
+    const minimumSize = new Decimal(book.min_order_size || 1)
+    if (quantity.lt(minimumSize)) throw new Error(`Polymarket当前最小卖出量为${minimumSize.toString()}份`)
+    const bidPrices = book.bids
+      .map((level) => new Decimal(level.price || 0))
+      .filter((price) => price.gt(0) && price.lt(1))
+    if (bidPrices.length === 0) throw new Error('Polymarket当前没有可成交买盘，未提交SELL')
+    const bestBid = Decimal.max(...bidPrices)
+    const minimumPrice = Decimal.max(new Decimal('0.01'), bestBid.minus(maximumSlippage))
+    this.assertConditionalBalance(balance, quantity, book)
+
+    const signedOrder = await client.createMarketOrder({
+      tokenID: order.tokenId,
+      price: minimumPrice.toNumber(),
+      amount: quantity.toNumber(),
+      side: Side.SELL,
+      orderType: OrderType.FOK
+    }, {
+      tickSize: book.tick_size as TickSize,
+      negRisk: book.neg_risk
+    })
+    const response = await client.postOrder(signedOrder, OrderType.FOK)
+    if (!response.success) throw new Error(`Polymarket SELL FOK失败：${response.errorMsg || response.status || '未知原因'}`)
+    const filledQuantity = new Decimal(response.makingAmount || 0)
+    const proceeds = new Decimal(response.takingAmount || 0)
+    if (filledQuantity.lt(quantity)) {
+      throw new Error(`Polymarket SELL FOK返回数量不足：需要${quantity.toString()}，返回${filledQuantity.toString()}`)
+    }
+    if (!response.orderID) throw new Error('Polymarket卖出成功但未返回orderID')
+    return {
+      venue: 'POLYMARKET', direction: order.direction,
+      quantity: filledQuantity.toDecimalPlaces(6).toString(),
+      averagePrice: proceeds.div(filledQuantity).toDecimalPlaces(6).toString(),
       orderId: response.orderID,
       filledAt: Date.now()
     }
@@ -315,5 +375,47 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     )
     const ready = possibleExchanges.some((address) => allowances[address.toLowerCase()]?.gte(requiredRaw))
     if (!ready) throw new Error('Polymarket抵押资产授权不足；未提交订单')
+  }
+
+  private assertConditionalBalance(balance: BalanceAllowanceResponse, required: Decimal, book: OrderBookSummary): void {
+    const requiredRaw = required.mul(TOKEN_SCALE).ceil()
+    const availableRaw = new Decimal(balance.balance || 0)
+    if (availableRaw.lt(requiredRaw)) {
+      throw new Error(`Polymarket持仓不足：需要${required.toString()}份，可用${formatCollateral(balance.balance)}份`)
+    }
+    const contracts = getContractConfig(Chain.POLYGON)
+    const possibleExchanges = book.neg_risk
+      ? [contracts.negRiskExchange, contracts.negRiskExchangeV2, contracts.exchangeV3]
+      : [contracts.exchange, contracts.exchangeV2, contracts.exchangeV3]
+    const allowances = Object.fromEntries(
+      Object.entries(balance.allowances ?? {}).map(([address, value]) => [address.toLowerCase(), new Decimal(value || 0)])
+    )
+    if (!possibleExchanges.some((address) => allowances[address.toLowerCase()]?.gte(requiredRaw))) {
+      throw new Error('Polymarket条件代币卖出授权不足；未提交SELL')
+    }
+  }
+
+  private estimateFeeOnSpend(
+    spendAmount: Decimal,
+    maximumPrice: Decimal,
+    book: OrderBookSummary,
+    feeRate: Decimal,
+    feeExponent: Decimal
+  ): Decimal {
+    if (feeRate.lte(0) || spendAmount.lte(0)) return new Decimal(0)
+    const prices = book.asks
+      .map((level) => new Decimal(level.price || 0))
+      .filter((price) => price.gt(0) && price.lte(maximumPrice))
+    prices.push(maximumPrice)
+    // For e > 1, the fee-per-collateral curve can peak inside the quoted range.
+    // Include that stationary point so the balance check remains conservative.
+    if (feeExponent.gt(1)) {
+      const criticalPrice = feeExponent.minus(1).div(feeExponent.mul(2).minus(1))
+      if (criticalPrice.gt(0) && criticalPrice.lte(maximumPrice)) prices.push(criticalPrice)
+    }
+    const maximumEffectiveRate = Decimal.max(...prices.map((price) => (
+      price.mul(new Decimal(1).minus(price)).pow(feeExponent).mul(feeRate).div(price)
+    )))
+    return spendAmount.mul(maximumEffectiveRate)
   }
 }

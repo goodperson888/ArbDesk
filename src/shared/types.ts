@@ -8,6 +8,12 @@ export type MexcBrowserMode = 'EMBEDDED' | 'HUBSTUDIO'
 export type MexcElementMode = 'AUTO' | 'MANUAL'
 export type PolymarketSignatureType = 0 | 1 | 2 | 3
 
+export interface SettlementDistanceRule {
+  id: string
+  remainingSeconds: number
+  minimumBps: string
+}
+
 export type ExecutionState =
   | 'IDLE'
   | 'MEXC_OPENING'
@@ -17,8 +23,16 @@ export type ExecutionState =
   | 'MEXC_FILLED'
   | 'POLY_HEDGING'
   | 'HEDGED'
+  | 'MEXC_CLOSING'
+  | 'MEXC_CLOSE_SUBMITTED'
+  | 'POLY_CLOSING'
+  | 'CLOSED'
+  | 'UNHEDGED'
   | 'RECOVERY_REQUIRED'
   | 'CANCELLED'
+
+export type CloseTarget = 'MEXC' | 'POLYMARKET' | 'BOTH'
+export type ArbitrageOrderStatus = 'OPENING' | 'OPEN' | 'UNHEDGED' | 'CLOSED' | 'RECOVERY_REQUIRED' | 'CANCELLED'
 
 export interface OrderBookLevel {
   price: string
@@ -49,8 +63,10 @@ export interface Opportunity {
   mexcPrice: string
   polymarketPrice: string
   mexcFeeRate: string
-  mexcFeeRateSource: 'HISTORY' | 'CONSERVATIVE_FALLBACK'
+  mexcFeeRateSource: 'HISTORY' | 'UNAVAILABLE'
   polymarketFeeRate: string
+  polymarketFeeExponent: string
+  polymarketEffectiveFeeRate: string
   mexcFeePerShare: string
   polymarketFeePerShare: string
   riskBufferPerShare: string
@@ -60,14 +76,20 @@ export interface Opportunity {
   maxQuantity: string
   capitalRequired: string
   expectedProfit: string
+  conditionalReturnPct: string
+  worstCaseReturnPct: string
   bothLosePnlPerShare: string
   bothWinPnlPerShare: string
+  feeVerificationBlocked: boolean
+  feeVerificationReason?: string
   settlementRiskBlocked: boolean
   settlementRiskReason?: string
   mexcSignal?: Direction
   polymarketSignal?: Direction
   mexcDistanceBps?: string
   polymarketDistanceBps?: string
+  settlementDistanceBps: string
+  requiredSettlementDistanceBps: string
   matchClass: MatchClass
   stale: boolean
   riskFlags: string[]
@@ -80,6 +102,46 @@ export interface Fill {
   averagePrice: string
   orderId: string
   filledAt: number
+}
+
+export interface OrderLegRecord {
+  venue: Venue
+  direction: Direction
+  eventId?: string
+  symbolId?: string
+  tokenId?: string
+  entryFill?: Fill
+  closeFills: Fill[]
+  openQuantity: string
+}
+
+export interface CloseOperation {
+  id: string
+  target: CloseTarget
+  state: 'MEXC_CLOSING' | 'MEXC_CLOSE_SUBMITTED' | 'POLY_CLOSING' | 'CLOSED' | 'RECOVERY_REQUIRED'
+  startedAt: number
+  updatedAt: number
+  error?: string
+}
+
+export interface ArbitrageOrderRecord {
+  id: string
+  opportunityId: string
+  symbol: 'BTC/USD'
+  durationMinutes: MarketDuration
+  startTime: number
+  endTime: number
+  mode: ExecutionMode
+  status: ArbitrageOrderStatus
+  executionState: ExecutionState
+  requestedQuantity: string
+  expectedCapital: string
+  expectedProfit: string
+  createdAt: number
+  updatedAt: number
+  mexc: OrderLegRecord
+  polymarket: OrderLegRecord
+  closeOperation?: CloseOperation
 }
 
 export interface ExecutionEvent {
@@ -111,6 +173,10 @@ export interface RiskSettings {
   maxQuoteAgeMs: number
   maxHedgeSlippage: string
   stopBeforeExpirySeconds: number
+  settlementDistanceRules: SettlementDistanceRule[]
+  opportunitySoundEnabled: boolean
+  opportunitySoundVolume: number
+  opportunitySoundCooldownSeconds: number
   mexcBrowserMode: MexcBrowserMode
   mexcElementMode: MexcElementMode
   hubstudioContainerCode: string
@@ -134,6 +200,7 @@ export interface AppSnapshot {
   }
   settings: RiskSettings
   opportunities: Opportunity[]
+  orderHistory: ArbitrageOrderRecord[]
   activeSession?: ExecutionSession
   recentEvents: ExecutionEvent[]
 }
@@ -141,6 +208,11 @@ export interface AppSnapshot {
 export interface ExecuteRequest {
   opportunityId: string
   quantity: string
+}
+
+export interface CloseOrderRequest {
+  orderId: string
+  target: CloseTarget
 }
 
 export interface UpdateSettingsRequest extends Partial<RiskSettings> {}
@@ -245,6 +317,7 @@ export interface ArbAppApi {
   execute(request: ExecuteRequest): Promise<ExecutionSession>
   confirmMexcFill(fill: Pick<Fill, 'quantity' | 'averagePrice' | 'orderId'>): Promise<ExecutionSession>
   cancelExecution(): Promise<ExecutionSession | undefined>
+  closeOrder(request: CloseOrderRequest): Promise<ArbitrageOrderRecord>
   updateSettings(request: UpdateSettingsRequest): Promise<RiskSettings>
   openMexc(): Promise<MexcBrowserStatus>
   getMexcStatus(): Promise<MexcBrowserStatus>

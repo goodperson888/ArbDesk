@@ -27,16 +27,20 @@ describe('PolymarketMarketData', () => {
       const url = String(input)
       if (url.includes('gamma-api')) {
         return Response.json({
-          markets: [{ active: true, closed: false, outcomes: '["Up","Down"]', clobTokenIds: '["token-up","token-down"]', feeSchedule: { rate: 0.05 } }]
+          markets: [{
+            conditionId: 'condition-1', active: true, closed: false,
+            outcomes: '["Up","Down"]', clobTokenIds: '["token-up","token-down"]'
+          }]
         })
       }
+      if (url.includes('/clob-markets/condition-1')) return Response.json({ fd: { r: 0.07, e: 1, to: true } })
       if (url.includes('/book?token_id=token-up')) {
         return Response.json({ timestamp: String(Date.now()), asks: [{ price: '0.55', size: '12' }, { price: '0.50', size: '8' }] })
       }
       if (url.includes('/book?token_id=token-down')) {
         return Response.json({ timestamp: String(Date.now()), asks: [{ price: '0.48', size: '6' }] })
       }
-      return Response.json({ base_fee: 700 })
+      return Response.json({})
     }))
 
     const service = new PolymarketMarketData({ enableStreaming: false })
@@ -46,6 +50,7 @@ describe('PolymarketMarketData', () => {
     expect(windows[0].outcomes.UP!.bestAsk).toBe('0.50')
     expect(windows[0].outcomes.DOWN!.askSize).toBe('6')
     expect(windows[0].outcomes.UP!.feeRate).toBe('0.07')
+    expect(windows[0].outcomes.UP!.feeExponent).toBe('1')
     expect(service.getStatus().connected).toBe(true)
   })
 
@@ -57,6 +62,22 @@ describe('PolymarketMarketData', () => {
     expect(service.getStatus().connected).toBe(false)
   })
 
+  it('rejects a market whose V2 fee parameters cannot be verified', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.includes('gamma-api')) {
+        return Response.json({
+          markets: [{ active: true, closed: false, outcomes: '["Up","Down"]', clobTokenIds: '["up","down"]' }]
+        })
+      }
+      return Response.json({})
+    }))
+    const service = new PolymarketMarketData({ enableStreaming: false })
+
+    await expect(service.fetchWindows([{ durationMinutes: 5, startTime: 0, endTime: 300_000 }]))
+      .rejects.toThrow('无法验证手续费')
+  })
+
   it('applies CLOB book and incremental ask changes without a REST refresh', () => {
     const windows: PolymarketWindowQuote[] = [{
       durationMinutes: 5,
@@ -65,7 +86,8 @@ describe('PolymarketMarketData', () => {
       outcomes: {
         UP: {
           direction: 'UP', tokenId: 'token-up', bestAsk: '0.50', askSize: '4',
-          levels: [{ price: '0.50', size: '4' }], receivedAt: 1, feeRate: '0.07', minOrderSize: '5'
+          levels: [{ price: '0.50', size: '4' }], receivedAt: 1,
+          feeRate: '0.07', feeExponent: '1', minOrderSize: '5'
         }
       }
     }]

@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import Decimal from 'decimal.js'
 import type {
+  ArbitrageOrderRecord,
   AppSnapshot,
+  CloseOrderRequest,
   Direction,
   ExecuteRequest,
   ExecutionEvent,
@@ -12,8 +14,10 @@ import type {
   RiskSettings,
   UpdateSettingsRequest
 } from '../shared/types'
+import { defaultSettlementDistanceRules } from '../shared/defaults'
 import { assertTransition } from './domain/execution-machine'
 import { calculateOpportunity } from './domain/opportunity'
+import { normalizeSettlementDistanceRules } from './domain/settlement-distance'
 import { EventStore } from './services/event-store'
 import type { MexcBrowserManager } from './services/mexc-browser'
 import { SimulatedPolymarketBroker, type PolymarketBroker } from './services/polymarket'
@@ -28,6 +32,10 @@ const DEFAULT_SETTINGS: RiskSettings = {
   maxQuoteAgeMs: 6_000,
   maxHedgeSlippage: '0.0300',
   stopBeforeExpirySeconds: 20,
+  settlementDistanceRules: defaultSettlementDistanceRules(),
+  opportunitySoundEnabled: true,
+  opportunitySoundVolume: 0.65,
+  opportunitySoundCooldownSeconds: 30,
   mexcBrowserMode: 'HUBSTUDIO',
   mexcElementMode: 'AUTO',
   hubstudioContainerCode: process.env.HUBSTUDIO_CONTAINER_CODE ?? '1643173278',
@@ -49,6 +57,7 @@ export class AppController {
   private activeSession?: ExecutionSession
   private activeOpportunity?: Opportunity
   private recentEvents: ExecutionEvent[] = []
+  private orderHistory: ArbitrageOrderRecord[] = []
   private broadcast: (snapshot: AppSnapshot) => void = () => undefined
   private readonly simulatedBroker: PolymarketBroker = new SimulatedPolymarketBroker()
   private mexcDataMessage = '尚未读取 MEXC 盘口'
@@ -57,6 +66,7 @@ export class AppController {
   private latestMexcWindows: MexcWindowQuote[] = []
   private latestPolymarketWindows: PolymarketWindowQuote[] = []
   private streamRefreshTimer?: NodeJS.Timeout
+  private closingOrderId?: string
 
   constructor(
     private readonly store: EventStore,
@@ -72,6 +82,15 @@ export class AppController {
   async initialize(): Promise<void> {
     await this.store.initialize()
     this.settings = await this.store.loadSettings(DEFAULT_SETTINGS)
+    try {
+      this.settings = {
+        ...this.settings,
+        settlementDistanceRules: normalizeSettlementDistanceRules(this.settings.settlementDistanceRules)
+      }
+    } catch {
+      this.settings = { ...this.settings, settlementDistanceRules: defaultSettlementDistanceRules() }
+      await this.store.saveSettings(this.settings)
+    }
     if (this.settings.maxQuoteAgeMs < 6_000) {
       this.settings = { ...this.settings, maxQuoteAgeMs: 6_000 }
       await this.store.saveSettings(this.settings)
@@ -92,6 +111,22 @@ export class AppController {
     this.polymarketData.configureProxy(this.settings.polymarketProxyUrl)
     this.liveBroker?.configureProxy(this.settings.polymarketProxyUrl)
     this.recentEvents = await this.store.loadRecentEvents(80)
+    this.orderHistory = (await this.store.loadOrderHistory()).map((order) => {
+      const interrupted = order.status === 'OPENING' ||
+        ['MEXC_CLOSING', 'MEXC_CLOSE_SUBMITTED', 'POLY_CLOSING'].includes(order.executionState)
+      if (!interrupted) return order
+      const message = '应用上次在订单执行过程中退出；请先核对两边实际持仓'
+      return {
+        ...order,
+        status: 'RECOVERY_REQUIRED' as const,
+        executionState: 'RECOVERY_REQUIRED' as const,
+        closeOperation: order.closeOperation
+          ? { ...order.closeOperation, state: 'RECOVERY_REQUIRED' as const, updatedAt: Date.now(), error: message }
+          : undefined,
+        updatedAt: Date.now()
+      }
+    })
+    await this.store.saveOrderHistory(this.orderHistory)
     this.opportunities = []
   }
 
@@ -118,6 +153,7 @@ export class AppController {
       },
       settings: this.settings,
       opportunities: this.opportunities,
+      orderHistory: this.orderHistory,
       activeSession: this.activeSession,
       recentEvents: this.recentEvents
     }
@@ -150,6 +186,18 @@ export class AppController {
 
   async updateSettings(request: UpdateSettingsRequest): Promise<RiskSettings> {
     const next = { ...this.settings, ...request }
+    next.settlementDistanceRules = normalizeSettlementDistanceRules(next.settlementDistanceRules)
+    const minimumEdge = new Decimal(next.minNetEdgePerShare)
+    if (!minimumEdge.isFinite() || minimumEdge.lt(0) || minimumEdge.gte(1)) {
+      throw new Error('最低净边际须为0至1之间的美元/份数值')
+    }
+    next.minNetEdgePerShare = minimumEdge.toDecimalPlaces(4).toFixed(4)
+    if (!Number.isFinite(next.opportunitySoundVolume) || next.opportunitySoundVolume < 0 || next.opportunitySoundVolume > 1) {
+      throw new Error('提示音音量须在0至1之间')
+    }
+    if (!Number.isInteger(next.opportunitySoundCooldownSeconds) || next.opportunitySoundCooldownSeconds < 5 || next.opportunitySoundCooldownSeconds > 3_600) {
+      throw new Error('提示音冷却时间须为5至3600秒的整数')
+    }
     next.hubstudioContainerCode = next.hubstudioContainerCode.trim()
     next.polymarketProxyUrl = next.polymarketProxyUrl.trim()
     if (next.polymarketProxyUrl) {
@@ -197,6 +245,7 @@ export class AppController {
   }
 
   async execute(request: ExecuteRequest): Promise<ExecutionSession> {
+    if (this.closingOrderId) throw new Error('平仓流程正在执行，不能同时开新仓')
     if (this.activeSession && !['HEDGED', 'CANCELLED'].includes(this.activeSession.state)) {
       throw new Error('已有执行中的套利组，不能重复开仓')
     }
@@ -214,6 +263,32 @@ export class AppController {
       updatedAt: Date.now()
     }
     this.activeOpportunity = opportunity
+    const orderRecord: ArbitrageOrderRecord = {
+      id: this.activeSession.id,
+      opportunityId: opportunity.id,
+      symbol: opportunity.symbol,
+      durationMinutes: opportunity.durationMinutes,
+      startTime: opportunity.startTime,
+      endTime: opportunity.endTime,
+      mode: this.settings.mode,
+      status: 'OPENING',
+      executionState: 'IDLE',
+      requestedQuantity: this.activeSession.requestedQuantity,
+      expectedCapital: new Decimal(opportunity.allInCostPerShare).mul(this.activeSession.requestedQuantity).toFixed(2),
+      expectedProfit: new Decimal(opportunity.netEdgePerShare).mul(this.activeSession.requestedQuantity).toFixed(2),
+      createdAt: this.activeSession.startedAt,
+      updatedAt: this.activeSession.updatedAt,
+      mexc: {
+        venue: 'MEXC', direction: opportunity.mexcDirection, eventId: opportunity.mexcEventId,
+        symbolId: opportunity.mexcSymbolId, closeFills: [], openQuantity: '0'
+      },
+      polymarket: {
+        venue: 'POLYMARKET', direction: opportunity.polymarketDirection, tokenId: opportunity.polymarketTokenId,
+        closeFills: [], openQuantity: '0'
+      }
+    }
+    this.orderHistory = [orderRecord, ...this.orderHistory].slice(0, 500)
+    await this.store.saveOrderHistory(this.orderHistory)
     if (this.settings.allowUnprofitableTestTrade) {
       this.settings = { ...this.settings, allowUnprofitableTestTrade: false }
       await this.store.saveSettings(this.settings)
@@ -338,6 +413,175 @@ export class AppController {
     return this.activeSession
   }
 
+  async closeOrder(request: CloseOrderRequest): Promise<ArbitrageOrderRecord> {
+    if (this.closingOrderId) throw new Error('已有平仓流程正在执行，请等待完成或进入恢复状态')
+    if (!['MEXC', 'POLYMARKET', 'BOTH'].includes(request.target)) throw new Error('平仓目标无效')
+    if (this.activeSession && !['HEDGED', 'CANCELLED'].includes(this.activeSession.state)) {
+      throw new Error('当前仍有开仓或对冲流程，不能同时执行平仓')
+    }
+    const order = this.orderHistory.find((candidate) => candidate.id === request.orderId)
+    if (!order) throw new Error('未找到对应套利订单')
+    if (order.status === 'CLOSED' || order.status === 'CANCELLED') throw new Error('该订单已经没有可平持仓')
+    if (Date.now() >= order.endTime) throw new Error('该市场已经到期，不能提交中途平仓')
+    const closeMexc = request.target === 'MEXC' || request.target === 'BOTH'
+    const closePolymarket = request.target === 'POLYMARKET' || request.target === 'BOTH'
+    if (closeMexc && new Decimal(order.mexc.openQuantity).lte(0)) throw new Error('该订单没有可平的MEXC持仓')
+    if (closePolymarket && new Decimal(order.polymarket.openQuantity).lte(0)) throw new Error('该订单没有可平的Polymarket持仓')
+    if (closeMexc && order.mode !== 'SIMULATION') {
+      if (!this.settings.mexcAutomationEnabled) throw new Error('请先启用MEXC实验自动点击，再执行自动卖出')
+      if (this.settings.mexcBrowserMode !== 'HUBSTUDIO') throw new Error('MEXC自动卖出当前要求Hubstudio模式')
+      if (this.settings.mexcElementMode !== 'AUTO') throw new Error('MEXC自动卖出当前要求系统自动识别模式')
+    }
+    if (closePolymarket && order.mode !== 'SIMULATION' && !this.settings.polymarketLiveEnabled) {
+      throw new Error('请先启用Polymarket真实FOK，再执行SELL平仓')
+    }
+
+    this.closingOrderId = order.id
+    const operationId = randomUUID()
+    let working: ArbitrageOrderRecord = {
+      ...order,
+      closeOperation: {
+        id: operationId, target: request.target, state: closeMexc ? 'MEXC_CLOSING' : 'POLY_CLOSING',
+        startedAt: Date.now(), updatedAt: Date.now()
+      },
+      executionState: closeMexc ? 'MEXC_CLOSING' : 'POLY_CLOSING',
+      updatedAt: Date.now()
+    }
+    await this.replaceOrderRecord(working)
+    let mexcClosedThisOperation: Decimal | undefined
+    try {
+      if (closeMexc) {
+        await this.appendOrderEvent(order.id, 'MEXC_CLOSING', `正在自动卖出MEXC ${order.mexc.openQuantity}份 ${order.mexc.direction}`)
+        let fill: Fill
+        if (order.mode === 'SIMULATION') {
+          fill = {
+            venue: 'MEXC', direction: order.mexc.direction, quantity: order.mexc.openQuantity,
+            averagePrice: order.mexc.entryFill?.averagePrice ?? '0.5', orderId: `sim-mexc-close-${randomUUID()}`, filledAt: Date.now()
+          }
+        } else {
+          const result = await this.mexcBrowser.closePosition({
+            eventId: order.mexc.eventId ?? '', symbolId: order.mexc.symbolId ?? '', direction: order.mexc.direction,
+            quantity: order.mexc.openQuantity, durationMinutes: order.durationMinutes, startTime: order.startTime,
+            allowSubmit: true
+          })
+          if (!result.ok || !result.orderAccepted || !result.submittedAt) throw new Error(result.message)
+          working = {
+            ...working,
+            executionState: 'MEXC_CLOSE_SUBMITTED',
+            closeOperation: { ...working.closeOperation!, state: 'MEXC_CLOSE_SUBMITTED', updatedAt: Date.now() },
+            updatedAt: Date.now()
+          }
+          await this.replaceOrderRecord(working)
+          await this.appendOrderEvent(order.id, 'MEXC_CLOSE_SUBMITTED', result.message)
+          const captured = await this.mexcBrowser.waitForFill({
+            eventId: order.mexc.eventId ?? '', symbolId: order.mexc.symbolId,
+            direction: order.mexc.direction, submittedAfter: result.submittedAt - 1_500
+          })
+          if (!captured) throw new Error('MEXC卖出已提交，但90秒内没有读取到实际成交；请在MEXC核对后进入恢复处理')
+          fill = captured
+        }
+        const closedQuantity = Decimal.min(order.mexc.openQuantity, fill.quantity)
+        mexcClosedThisOperation = closedQuantity
+        working = {
+          ...working,
+          mexc: {
+            ...working.mexc,
+            closeFills: [...working.mexc.closeFills, { ...fill, quantity: closedQuantity.toString() }],
+            openQuantity: Decimal.max(new Decimal(working.mexc.openQuantity).minus(closedQuantity), 0).toString()
+          },
+          updatedAt: Date.now()
+        }
+        await this.replaceOrderRecord(working)
+      }
+
+      if (closePolymarket) {
+        working = {
+          ...working,
+          executionState: 'POLY_CLOSING',
+          closeOperation: { ...working.closeOperation!, state: 'POLY_CLOSING', updatedAt: Date.now() },
+          updatedAt: Date.now()
+        }
+        await this.replaceOrderRecord(working)
+        const polymarketCloseQuantity = request.target === 'BOTH' && mexcClosedThisOperation
+          ? Decimal.min(working.polymarket.openQuantity, mexcClosedThisOperation)
+          : new Decimal(working.polymarket.openQuantity)
+        if (polymarketCloseQuantity.lte(0)) throw new Error('MEXC本次没有可用于对齐的实际平仓成交量，已停止Polymarket SELL')
+        await this.appendOrderEvent(order.id, 'POLY_CLOSING', `正在SELL FOK平仓Polymarket ${polymarketCloseQuantity.toString()}份 ${working.polymarket.direction}`)
+        const broker = order.mode === 'SIMULATION' ? this.simulatedBroker : this.liveBroker
+        if (!broker) throw new Error('Polymarket真实平仓代理不可用')
+        const fill = await broker.closePosition({
+          tokenId: working.polymarket.tokenId,
+          direction: working.polymarket.direction,
+          quantity: polymarketCloseQuantity.toString(),
+          maximumSlippage: this.settings.maxHedgeSlippage
+        })
+        const closedQuantity = Decimal.min(polymarketCloseQuantity, fill.quantity)
+        working = {
+          ...working,
+          polymarket: {
+            ...working.polymarket,
+            closeFills: [...working.polymarket.closeFills, { ...fill, quantity: closedQuantity.toString() }],
+            openQuantity: Decimal.max(new Decimal(working.polymarket.openQuantity).minus(closedQuantity), 0).toString()
+          },
+          updatedAt: Date.now()
+        }
+      }
+
+      const mexcOpen = new Decimal(working.mexc.openQuantity).gt(0)
+      const polymarketOpen = new Decimal(working.polymarket.openQuantity).gt(0)
+      const quantitiesAligned = new Decimal(working.mexc.openQuantity).eq(working.polymarket.openQuantity)
+      const status = !mexcOpen && !polymarketOpen
+        ? 'CLOSED' as const
+        : mexcOpen && polymarketOpen && quantitiesAligned
+          ? 'OPEN' as const
+          : 'UNHEDGED' as const
+      working = {
+        ...working,
+        status,
+        executionState: status === 'CLOSED' ? 'CLOSED' : status === 'UNHEDGED' ? 'UNHEDGED' : 'HEDGED',
+        closeOperation: { ...working.closeOperation!, state: 'CLOSED', updatedAt: Date.now() },
+        updatedAt: Date.now()
+      }
+      await this.replaceOrderRecord(working)
+      await this.appendOrderEvent(order.id, status === 'CLOSED' ? 'CLOSED' : status === 'UNHEDGED' ? 'UNHEDGED' : 'HEDGED', status === 'CLOSED'
+        ? '中途平仓完成，两边持仓均已归零'
+        : `单腿平仓完成；剩余MEXC ${working.mexc.openQuantity}份 / Polymarket ${working.polymarket.openQuantity}份`)
+      if (this.activeSession?.id === order.id) {
+        this.activeSession = undefined
+        this.activeOpportunity = undefined
+      }
+      return working
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      working = {
+        ...working,
+        status: 'RECOVERY_REQUIRED',
+        executionState: 'RECOVERY_REQUIRED',
+        closeOperation: { ...working.closeOperation!, state: 'RECOVERY_REQUIRED', updatedAt: Date.now(), error: message },
+        updatedAt: Date.now()
+      }
+      await this.replaceOrderRecord(working)
+      await this.appendOrderEvent(order.id, 'RECOVERY_REQUIRED', `平仓未完整完成：${message}`)
+      throw new Error(message)
+    } finally {
+      this.closingOrderId = undefined
+      this.broadcast(this.getSnapshot())
+    }
+  }
+
+  private async replaceOrderRecord(updated: ArbitrageOrderRecord): Promise<void> {
+    this.orderHistory = this.orderHistory.map((order) => order.id === updated.id ? updated : order)
+    await this.store.saveOrderHistory(this.orderHistory)
+    this.broadcast(this.getSnapshot())
+  }
+
+  private async appendOrderEvent(sessionId: string, state: ExecutionState, message: string): Promise<void> {
+    const event: ExecutionEvent = { id: randomUUID(), sessionId, state, timestamp: Date.now(), message }
+    this.recentEvents = [event, ...this.recentEvents].slice(0, 80)
+    await this.store.appendEvent(event)
+    this.broadcast(this.getSnapshot())
+  }
+
   private validateExecution(opportunity: Opportunity, quantityInput: string): void {
     const quantity = new Decimal(quantityInput)
     if (!quantity.isFinite() || quantity.lte(0)) throw new Error('数量必须大于0')
@@ -356,6 +600,9 @@ export class AppController {
     }
     if (quantity.gt(opportunity.maxQuantity)) throw new Error('数量超过当前盘口可执行上限')
     if (opportunity.stale) throw new Error('行情已过期，请刷新')
+    if (opportunity.feeVerificationBlocked) {
+      throw new Error(`手续费校验未通过：${opportunity.feeVerificationReason ?? '缺少可验证费率'}`)
+    }
     if (opportunity.settlementRiskBlocked && !this.settings.allowUnprofitableTestTrade) {
       throw new Error(`结算源风控拦截：${opportunity.settlementRiskReason ?? '实时信号不满足条件'}`)
     }
@@ -400,7 +647,9 @@ export class AppController {
         tokenId: opportunity.polymarketTokenId,
         direction: opportunity.polymarketDirection,
         quantity: mexcFill.quantity,
-        maximumPrice
+        maximumPrice,
+        feeRate: opportunity.polymarketFeeRate,
+        feeExponent: opportunity.polymarketFeeExponent
       })
       if (!this.activeSession) throw new Error('执行会话意外丢失')
       this.activeSession.polymarketFill = fill
@@ -422,6 +671,7 @@ export class AppController {
     assertTransition(this.activeSession.state, next)
     this.activeSession.state = next
     this.activeSession.updatedAt = Date.now()
+    await this.syncActiveOrderRecord()
     const event: ExecutionEvent = {
       id: randomUUID(),
       sessionId: this.activeSession.id,
@@ -435,13 +685,48 @@ export class AppController {
     this.broadcast(this.getSnapshot())
   }
 
+  private async syncActiveOrderRecord(): Promise<void> {
+    const session = this.activeSession
+    if (!session) return
+    const index = this.orderHistory.findIndex((order) => order.id === session.id)
+    if (index < 0) return
+    const current = this.orderHistory[index]
+    const mexc = session.mexcFill && !current.mexc.entryFill
+      ? { ...current.mexc, entryFill: session.mexcFill, openQuantity: session.mexcFill.quantity }
+      : current.mexc
+    const polymarket = session.polymarketFill && !current.polymarket.entryFill
+      ? { ...current.polymarket, entryFill: session.polymarketFill, openQuantity: session.polymarketFill.quantity }
+      : current.polymarket
+    const status = session.state === 'HEDGED'
+      ? 'OPEN' as const
+      : session.state === 'CANCELLED'
+        ? 'CANCELLED' as const
+        : session.state === 'RECOVERY_REQUIRED'
+          ? 'RECOVERY_REQUIRED' as const
+          : 'OPENING' as const
+    const updated: ArbitrageOrderRecord = {
+      ...current,
+      status,
+      executionState: session.state,
+      updatedAt: session.updatedAt,
+      mexc,
+      polymarket
+    }
+    this.orderHistory = this.orderHistory.map((order, orderIndex) => orderIndex === index ? updated : order)
+    await this.store.saveOrderHistory(this.orderHistory)
+  }
+
   private async loadLiveOpportunities(): Promise<AppSnapshot> {
     let mexcWindows: MexcWindowQuote[]
     try {
       mexcWindows = await this.mexcBrowser.fetchActiveBtcWindows()
       this.latestMexcWindows = mexcWindows
+      const monitoredDurations = [...new Set(mexcWindows.map((window) => window.durationMinutes))]
+        .sort((left, right) => left - right)
+        .map((duration) => `${duration}m`)
+        .join('/')
       this.mexcDataMessage = mexcWindows.length
-        ? `已读取 ${mexcWindows.map((window) => `${window.durationMinutes}m`).join('/')} 实时盘口`
+        ? `MEXC ${monitoredDurations} 并行监控（与当前详情页周期无关）`
         : 'MEXC 当前没有可交易的 BTC 5m/15m 盘口'
     } catch (error) {
       this.mexcDataMessage = `MEXC 读取失败：${error instanceof Error ? error.message : String(error)}`
@@ -545,6 +830,7 @@ export class AppController {
           polymarketTokenId: polymarketQuote.tokenId,
           polymarketMinOrderSize: polymarketQuote.minOrderSize,
           polymarketFeeRate: polymarketQuote.feeRate,
+          polymarketFeeExponent: polymarketQuote.feeExponent,
           maxQuantity: quantity.toString(),
           riskBufferPerShare: mexc.durationMinutes === 5 ? '0.008' : '0.012',
           matchClass: 'CONDITIONAL',
@@ -554,15 +840,21 @@ export class AppController {
           polymarketSignal: polymarketSignal.direction,
           mexcDistanceBps: mexcSignal.distanceBps,
           polymarketDistanceBps: polymarketSignal.distanceBps,
+          evaluationTime: now,
           settlementSignalMissingReason: [
             mexcSignal.missingReason ? `MEXC ${mexcSignal.missingReason}` : undefined,
             polymarketSignal.missingReason ? `Polymarket ${polymarketSignal.missingReason}` : undefined
           ].filter(Boolean).join('；') || undefined,
-          minimumSettlementDistanceBps: '2'
+          settlementDistanceRules: this.settings.settlementDistanceRules
         }))
       }
     }
-    return opportunities.sort((left, right) => Number(right.netEdgePerShare) - Number(left.netEdgePerShare))
+    return opportunities.sort((left, right) => {
+      if (left.feeVerificationBlocked !== right.feeVerificationBlocked) {
+        return Number(left.feeVerificationBlocked) - Number(right.feeVerificationBlocked)
+      }
+      return Number(right.netEdgePerShare) - Number(left.netEdgePerShare)
+    })
   }
 
   private normalizeQuoteTimestamp(timestamp: number): number {

@@ -2,35 +2,52 @@ export interface MexcAssetLogRow {
   tn?: string
   ta?: number
   bt?: number
+  tt?: number
 }
 
 export interface MexcFeeCalibration {
   feeRate: string
-  source: 'HISTORY' | 'CONSERVATIVE_FALLBACK'
+  source: 'HISTORY' | 'UNAVAILABLE'
   sampleCount: number
 }
 
-export function deriveMexcFeeRate(rows: MexcAssetLogRow[], fallback = '0.015'): MexcFeeCalibration {
-  const grouped = new Map<string, Array<{ amount: number; businessType: number }>>()
+const MAX_SAMPLE_AGE_MS = 7 * 24 * 60 * 60 * 1_000
+
+function normalizeTimestamp(timestamp: number): number {
+  return timestamp > 0 && timestamp < 10_000_000_000 ? timestamp * 1_000 : timestamp
+}
+
+export function deriveMexcFeeRate(rows: MexcAssetLogRow[], now = Date.now()): MexcFeeCalibration {
+  const grouped = new Map<string, Array<{ amount: number; businessType: number; timestamp: number }>>()
   for (const row of rows) {
-    if (!row.tn || !Number.isFinite(Number(row.ta)) || !Number.isFinite(Number(row.bt))) continue
+    const timestamp = normalizeTimestamp(Number(row.tt))
+    if (
+      !row.tn ||
+      !Number.isFinite(Number(row.ta)) ||
+      !Number.isFinite(Number(row.bt)) ||
+      !Number.isFinite(timestamp) ||
+      timestamp <= 0
+    ) continue
     const group = grouped.get(row.tn) ?? []
-    group.push({ amount: Number(row.ta), businessType: Number(row.bt) })
+    group.push({ amount: Number(row.ta), businessType: Number(row.bt), timestamp })
     grouped.set(row.tn, group)
   }
-  const ratios: number[] = []
+  const samples: Array<{ ratio: number; timestamp: number }> = []
   for (const group of grouped.values()) {
     const fee = group.find((row) => row.businessType === 104)
-    const trade = group.find((row) => row.businessType === 107 || row.businessType === 108)
-    if (!fee || !trade || trade.amount === 0) continue
-    const ratio = Math.abs(fee.amount / trade.amount)
-    if (ratio > 0 && ratio < 0.1) ratios.push(ratio)
+    // The arbitrage executor always buys its MEXC leg, so sell rows (108) must not
+    // influence the rate. A recent completed buy without a paired fee row is a
+    // genuine zero-fee sample rather than a reason to inject a guessed fallback.
+    const trade = group.find((row) => row.businessType === 107)
+    if (!trade || trade.amount === 0 || now - trade.timestamp > MAX_SAMPLE_AGE_MS || trade.timestamp > now + 60_000) continue
+    const ratio = fee ? Math.abs(fee.amount / trade.amount) : 0
+    if (ratio >= 0 && ratio < 0.1) samples.push({ ratio, timestamp: trade.timestamp })
   }
-  if (!ratios.length) return { feeRate: fallback, source: 'CONSERVATIVE_FALLBACK', sampleCount: 0 }
-  ratios.sort((left, right) => left - right)
+  if (!samples.length) return { feeRate: '0', source: 'UNAVAILABLE', sampleCount: 0 }
+  samples.sort((left, right) => right.timestamp - left.timestamp)
   return {
-    feeRate: String(ratios[Math.floor(ratios.length / 2)]),
+    feeRate: String(samples[0].ratio),
     source: 'HISTORY',
-    sampleCount: ratios.length
+    sampleCount: samples.length
   }
 }

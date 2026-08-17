@@ -1,14 +1,16 @@
 import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import type { ExecutionEvent, RiskSettings } from '../../shared/types'
+import type { ArbitrageOrderRecord, ExecutionEvent, RiskSettings } from '../../shared/types'
 
 export class EventStore {
   private readonly eventsPath: string
   private readonly settingsPath: string
+  private readonly ordersPath: string
 
   constructor(dataDirectory: string) {
     this.eventsPath = join(dataDirectory, 'audit.ndjson')
     this.settingsPath = join(dataDirectory, 'settings.json')
+    this.ordersPath = join(dataDirectory, 'orders.json')
   }
 
   async initialize(): Promise<void> {
@@ -47,5 +49,21 @@ export class EventStore {
     const temporaryPath = `${this.settingsPath}.tmp`
     await writeFile(temporaryPath, JSON.stringify(settings, null, 2), 'utf8')
     await rename(temporaryPath, this.settingsPath)
+  }
+
+  async loadOrderHistory(): Promise<ArbitrageOrderRecord[]> {
+    try {
+      const content = await readFile(this.ordersPath, 'utf8')
+      const parsed = JSON.parse(content) as unknown
+      return Array.isArray(parsed) ? parsed as ArbitrageOrderRecord[] : []
+    } catch {
+      return []
+    }
+  }
+
+  async saveOrderHistory(orders: ArbitrageOrderRecord[]): Promise<void> {
+    const temporaryPath = `${this.ordersPath}.tmp`
+    await writeFile(temporaryPath, JSON.stringify(orders, null, 2), 'utf8')
+    await rename(temporaryPath, this.ordersPath)
   }
 }

@@ -26,7 +26,7 @@ export interface MexcFillMatch {
 
 export function parseMexcFill(rows: MexcFillLogRow[], match: MexcFillMatch): Fill | undefined {
   for (const row of rows) {
-    if (Number(row.bt) !== 107 || !row.tn || Number(row.tt) < match.submittedAfter) continue
+    if ([104, 106, 1061].includes(Number(row.bt)) || !row.tn || Number(row.tt) < match.submittedAfter) continue
     let payload: MexcFillPayload
     try {
       payload = JSON.parse(row.sif ?? '{}') as MexcFillPayload

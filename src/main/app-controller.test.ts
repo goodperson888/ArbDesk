@@ -73,6 +73,16 @@ describe('AppController simulation', () => {
     expect(session.polymarketFill?.quantity).toBe('5.00')
     const events = controller.getSnapshot().recentEvents.map((event) => event.state).reverse()
     expect(events).toEqual(['MEXC_OPENING', 'MEXC_SUBMITTING', 'MEXC_FILLED', 'POLY_HEDGING', 'HEDGED'])
+    const openOrder = controller.getSnapshot().orderHistory[0]
+    expect(openOrder).toMatchObject({ status: 'OPEN' })
+    expect(openOrder.mexc.openQuantity).toBe('5.00')
+    expect(openOrder.polymarket.openQuantity).toBe('5.00')
+
+    const closedOrder = await controller.closeOrder({ orderId: openOrder.id, target: 'BOTH' })
+    expect(closedOrder.status).toBe('CLOSED')
+    expect(closedOrder.mexc.openQuantity).toBe('0')
+    expect(closedOrder.polymarket.openQuantity).toBe('0')
+    expect((await new EventStore(directory).loadOrderHistory())[0].status).toBe('CLOSED')
   })
 
   it('persists and applies the selected MEXC browser mode', async () => {
@@ -104,6 +114,52 @@ describe('AppController simulation', () => {
     expect(settings.mexcBrowserMode).toBe('HUBSTUDIO')
     expect(settings.hubstudioContainerCode).toBe('223012801')
     expect(configurations.at(-1)).toEqual({ mode: 'HUBSTUDIO', hubstudioContainerCode: '223012801', elementMode: 'AUTO' })
+  })
+
+  it('matches 5m and 15m quotes only within the same duration and round', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'arbdesk-duration-match-test-'))
+    temporaryDirectories.push(directory)
+    const startTime = Math.ceil(Date.now() / 900_000) * 900_000
+    const makeMexcWindow = (durationMinutes: 5 | 15) => ({
+      eventId: `mexc-${durationMinutes}m`, durationMinutes, startTime,
+      endTime: startTime + durationMinutes * 60_000,
+      baselinePrice: '60000', indexPrice: '60030', indexReceivedAt: Date.now(),
+      feeRate: '0.015', feeRateSource: 'HISTORY' as const,
+      outcomes: {
+        UP: { direction: 'UP' as const, symbolId: `${durationMinutes}-up`, bestAsk: '0.40', askSize: '100', levels: [], receivedAt: Date.now() },
+        DOWN: { direction: 'DOWN' as const, symbolId: `${durationMinutes}-down`, bestAsk: '0.60', askSize: '100', levels: [], receivedAt: Date.now() }
+      }
+    })
+    const mexcBrowser = {
+      configure: () => undefined,
+      getCalibration: () => ({ amountInput: false, upButton: false, downButton: false, submitButton: false }),
+      getStatus: () => ({
+        mode: 'HUBSTUDIO', open: true, authenticated: true, automationAvailable: true, monitoring: true,
+        calibrated: { amountInput: false, upButton: false, downButton: false, submitButton: false }, message: 'test'
+      }),
+      fetchActiveBtcWindows: async () => [makeMexcWindow(5), makeMexcWindow(15)]
+    } as unknown as MexcBrowserManager
+    const makePolyWindow = (durationMinutes: 5 | 15, roundStart: number) => ({
+      durationMinutes, startTime: roundStart, endTime: roundStart + durationMinutes * 60_000,
+      baselinePrice: '60000', indexPrice: '60030', indexReceivedAt: Date.now(),
+      outcomes: {
+        UP: { direction: 'UP' as const, tokenId: `${durationMinutes}-poly-up`, bestAsk: '0.55', askSize: '100', levels: [], receivedAt: Date.now(), feeRate: '0.07', minOrderSize: '5' },
+        DOWN: { direction: 'DOWN' as const, tokenId: `${durationMinutes}-poly-down`, bestAsk: '0.50', askSize: '100', levels: [], receivedAt: Date.now(), feeRate: '0.07', minOrderSize: '5' }
+      }
+    })
+    const polymarketData = {
+      configureProxy: () => undefined,
+      getStatus: () => ({ connected: true, message: 'test' }),
+      fetchWindows: async () => [makePolyWindow(5, startTime), makePolyWindow(15, startTime + 300_000)]
+    } as unknown as PolymarketMarketData
+    const controller = new AppController(new EventStore(directory), mexcBrowser, polymarketData)
+    await controller.initialize()
+
+    const snapshot = await controller.refreshOpportunities()
+
+    expect(snapshot.opportunities).toHaveLength(2)
+    expect(snapshot.opportunities.every((opportunity) => opportunity.durationMinutes === 5)).toBe(true)
+    expect(snapshot.connectionDetails.mexc).toContain('5m/15m 并行监控')
   })
 
   it('allows supervised automatic clicking without manual selectors', async () => {

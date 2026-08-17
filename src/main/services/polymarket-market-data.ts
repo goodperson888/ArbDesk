@@ -6,13 +6,12 @@ const POLYMARKET_WEB = 'https://polymarket.com'
 const CLOB_MARKET_STREAM = 'wss://ws-subscriptions-clob.polymarket.com/ws/market'
 
 interface GammaMarket {
+  conditionId?: string
   active?: boolean
   closed?: boolean
   acceptingOrders?: boolean
   outcomes?: string | string[]
   clobTokenIds?: string | string[]
-  feesEnabled?: boolean
-  feeSchedule?: { rate?: number }
 }
 
 interface GammaEvent {
@@ -25,8 +24,12 @@ interface ClobBook {
   asks?: Array<{ price: string; size: string }>
 }
 
-interface FeeRateResponse {
-  base_fee?: number
+interface ClobMarketDetails {
+  fd?: {
+    r?: number
+    e?: number
+    to?: boolean
+  }
 }
 
 interface CryptoPriceResponse {
@@ -48,6 +51,7 @@ export interface PolymarketOutcomeQuote {
   levels: OrderBookLevel[]
   receivedAt: number
   feeRate: string
+  feeExponent: string
   minOrderSize: string
 }
 
@@ -325,10 +329,20 @@ export class PolymarketMarketData {
     const downToken = tokenByDirection.get('DOWN')
     if (!upToken || !downToken) throw new Error(`${slug} 没有 UP/DOWN token`)
 
-    const feeRate = market.feeSchedule?.rate ?? (market.feesEnabled === false ? 0 : 0.07)
+    if (!market.conditionId) throw new Error(`${slug} 缺少 Polymarket conditionId，无法验证手续费`)
+    const feeDetails = await this.fetchJson<ClobMarketDetails>(
+      `${CLOB_API}/clob-markets/${encodeURIComponent(market.conditionId)}`
+    )
+    const fee = {
+      rate: Number(feeDetails.fd?.r ?? 0),
+      exponent: Number(feeDetails.fd?.e ?? 0)
+    }
+    if (!Number.isFinite(fee.rate) || fee.rate < 0 || !Number.isFinite(fee.exponent) || fee.exponent < 0) {
+      throw new Error(`${slug} 返回了无效的 Polymarket V2 手续费参数`)
+    }
     const [up, down, reference] = await Promise.all([
-      this.fetchOutcome('UP', upToken, feeRate),
-      this.fetchOutcome('DOWN', downToken, feeRate),
+      this.fetchOutcome('UP', upToken, fee),
+      this.fetchOutcome('DOWN', downToken, fee),
       this.fetchReference(window).catch(() => undefined)
     ])
     return {
@@ -345,13 +359,12 @@ export class PolymarketMarketData {
     }
   }
 
-  private async fetchOutcome(direction: Direction, tokenId: string, feeRate: number): Promise<PolymarketOutcomeQuote | undefined> {
-    const [book, liveFeeRate] = await Promise.all([
-      this.fetchJson<ClobBook>(`${CLOB_API}/book?token_id=${encodeURIComponent(tokenId)}`),
-      this.fetchJson<FeeRateResponse>(`${CLOB_API}/fee-rate?token_id=${encodeURIComponent(tokenId)}`)
-        .then((response) => Number(response.base_fee) / 10_000)
-        .catch(() => feeRate)
-    ])
+  private async fetchOutcome(
+    direction: Direction,
+    tokenId: string,
+    fee: { rate: number; exponent: number }
+  ): Promise<PolymarketOutcomeQuote | undefined> {
+    const book = await this.fetchJson<ClobBook>(`${CLOB_API}/book?token_id=${encodeURIComponent(tokenId)}`)
     const levels = (book.asks ?? [])
       .map((level) => ({ price: String(level.price), size: String(level.size) }))
       .filter((level) => Number(level.price) > 0 && Number(level.size) > 0)
@@ -366,7 +379,8 @@ export class PolymarketMarketData {
       askSize: best.size,
       levels,
       receivedAt: Number.isFinite(apiTimestamp) && apiTimestamp > 0 ? apiTimestamp : Date.now(),
-      feeRate: Number.isFinite(liveFeeRate) && liveFeeRate >= 0 ? String(liveFeeRate) : '0.07',
+      feeRate: Number.isFinite(fee.rate) && fee.rate >= 0 ? String(fee.rate) : '0.07',
+      feeExponent: Number.isFinite(fee.exponent) && fee.exponent >= 0 ? String(fee.exponent) : '1',
       minOrderSize: String(book.min_order_size || '1')
     }
   }

@@ -85,6 +85,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('app:execute', (_event, request) => controller.execute(request))
   ipcMain.handle('app:confirm-mexc-fill', (_event, fill) => controller.confirmMexcFill(fill))
   ipcMain.handle('app:cancel-execution', () => controller.cancelExecution())
+  ipcMain.handle('app:close-order', (_event, request) => controller.closeOrder(request))
   ipcMain.handle('app:update-settings', (_event, request) => controller.updateSettings(request))
   ipcMain.handle('mexc:open', () => mexcBrowser.open())
   ipcMain.handle('mexc:status', () => mexcBrowser.getStatus())

@@ -8,6 +8,7 @@ const api: ArbAppApi = {
   execute: (request) => ipcRenderer.invoke('app:execute', request),
   confirmMexcFill: (fill) => ipcRenderer.invoke('app:confirm-mexc-fill', fill),
   cancelExecution: () => ipcRenderer.invoke('app:cancel-execution'),
+  closeOrder: (request) => ipcRenderer.invoke('app:close-order', request),
   updateSettings: (request) => ipcRenderer.invoke('app:update-settings', request),
   openMexc: () => ipcRenderer.invoke('mexc:open'),
   getMexcStatus: () => ipcRenderer.invoke('mexc:status'),

@@ -9,6 +9,11 @@ const allowedTransitions: Record<ExecutionState, ExecutionState[]> = {
   MEXC_FILLED: ['POLY_HEDGING', 'RECOVERY_REQUIRED'],
   POLY_HEDGING: ['HEDGED', 'RECOVERY_REQUIRED'],
   HEDGED: [],
+  MEXC_CLOSING: [],
+  MEXC_CLOSE_SUBMITTED: [],
+  POLY_CLOSING: [],
+  CLOSED: [],
+  UNHEDGED: [],
   RECOVERY_REQUIRED: ['POLY_HEDGING', 'CANCELLED'],
   CANCELLED: []
 }

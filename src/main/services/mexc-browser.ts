@@ -34,6 +34,16 @@ interface PrepareOrderRequest {
   startTime?: number
 }
 
+export interface CloseMexcPositionRequest {
+  eventId: string
+  symbolId: string
+  direction: Direction
+  quantity: string
+  durationMinutes: MarketDuration
+  startTime: number
+  allowSubmit: boolean
+}
+
 interface AutomationResult {
   ok: boolean
   message: string
@@ -102,7 +112,7 @@ export interface MexcWindowQuote {
   indexPrice?: string
   indexReceivedAt?: number
   feeRate: string
-  feeRateSource: 'HISTORY' | 'CONSERVATIVE_FALLBACK'
+  feeRateSource: 'HISTORY' | 'UNAVAILABLE'
   outcomes: Record<Direction, MexcOutcomeQuote>
 }
 
@@ -188,6 +198,14 @@ export class MexcBrowserManager {
     return this.mode === 'HUBSTUDIO'
       ? this.prepareHubstudioOrder(request)
       : this.prepareEmbeddedOrder(request)
+  }
+
+  async closePosition(request: CloseMexcPositionRequest): Promise<AutomationResult> {
+    await this.open()
+    if (this.mode !== 'HUBSTUDIO') {
+      return { ok: false, message: 'MEXC自动卖出当前仅支持Hubstudio模式；未操作网页', matched: {} }
+    }
+    return await this.closeHubstudioPosition(request)
   }
 
   async fetchActiveBtcWindows(): Promise<MexcWindowQuote[]> {
@@ -864,6 +882,104 @@ export class MexcBrowserManager {
         message: `Hubstudio网页操作失败：${error instanceof Error ? error.message : String(error)}`,
         matched
       }
+    }
+  }
+
+  private async closeHubstudioPosition(request: CloseMexcPositionRequest): Promise<AutomationResult> {
+    const page = this.hubstudioPage
+    if (!page || page.isClosed()) return { ok: false, message: 'Hubstudio MEXC页面不可用', matched: {} }
+    const quantity = Number(request.quantity)
+    if (!Number.isFinite(quantity) || quantity <= 0) return { ok: false, message: 'MEXC平仓份额必须大于0', matched: {} }
+    if (this.elementMode !== 'AUTO') {
+      return { ok: false, message: 'MEXC自动卖出需要切换到“系统自动识别”模式；未操作网页', matched: {} }
+    }
+    try {
+      await this.ensureHubstudioLiveMarket(page, request.durationMinutes, request.startTime)
+      const directionPattern = request.direction === 'UP'
+        ? /^(?:涨(?:\s|\d|$)|up(?:\s|\d|$))/i
+        : /^(?:跌(?:\s|\d|$)|down(?:\s|\d|$))/i
+      const directionButton = await this.resolveHubstudioLocator(page, undefined, [
+        page.getByRole('button', { name: directionPattern }).first()
+      ])
+      const sellModeButton = await this.resolveHubstudioLocator(page, undefined, [
+        page.getByRole('button', { name: /^(?:卖出|sell)$/i }).first(),
+        page.getByRole('tab', { name: /^(?:卖出|sell)$/i }).first()
+      ])
+      const matched = {
+        directionButton: Boolean(directionButton), sellModeButton: Boolean(sellModeButton),
+        amountInput: false, submitButton: false, submitEnabled: false
+      }
+      if (!directionButton || !sellModeButton) {
+        return { ok: false, message: '系统未识别MEXC持仓方向或卖出入口；未执行卖出', matched }
+      }
+      await directionButton.click()
+      await page.waitForTimeout(180)
+      await sellModeButton.click()
+      await page.waitForTimeout(250)
+
+      const amountInput = await this.resolveHubstudioLocator(page, undefined, [
+        page.locator('[data-tutorial-id="detail-tutorial-amount"] input:visible').first(),
+        page.locator('input[placeholder="0"]:visible').first()
+      ])
+      const submitPattern = request.direction === 'UP'
+        ? /^(?:卖出|sell)\s*(?:涨|up)(?:\s|$)/i
+        : /^(?:卖出|sell)\s*(?:跌|down)(?:\s|$)/i
+      let submitButton = await this.resolveHubstudioLocator(page, undefined, [
+        page.getByRole('button', { name: submitPattern }).first()
+      ])
+      matched.amountInput = Boolean(amountInput)
+      matched.submitButton = Boolean(submitButton)
+      if (!amountInput || !submitButton) {
+        return { ok: false, message: '已进入MEXC卖出区，但未识别份额输入框或卖出按钮；未提交', matched }
+      }
+      await amountInput.fill(request.quantity)
+      for (const delay of [150, 300, 500, 700]) {
+        await page.waitForTimeout(delay)
+        submitButton = await this.resolveHubstudioLocator(page, undefined, [
+          page.getByRole('button', { name: submitPattern }).first()
+        ])
+        if (!submitButton) continue
+        matched.submitEnabled = await submitButton.isEnabled().catch(() => false)
+        if (matched.submitEnabled) break
+      }
+      matched.submitButton = Boolean(submitButton)
+      if (!submitButton || !matched.submitEnabled) {
+        return { ok: false, message: `已填入${request.quantity}份，但MEXC卖出按钮不可用；未点击`, matched }
+      }
+      await Promise.all([this.highlightHubstudio(directionButton), this.highlightHubstudio(amountInput), this.highlightHubstudio(submitButton)])
+      if (!request.allowSubmit) return { ok: true, orderAccepted: false, message: 'MEXC卖出信息已填写并高亮，等待确认', matched }
+
+      const submittedAt = Date.now()
+      const responsePromise = page.waitForResponse(
+        (response) => /\/api\/platform\/predict\/orderCenter\/web\/order\/place\/(?:market|limit)/.test(response.url()),
+        { timeout: 8_000 }
+      ).catch(() => undefined)
+      await submitButton.click()
+      const response = await responsePromise
+      if (!response) {
+        return {
+          ok: false, orderAccepted: false, submittedAt, submissionUncertain: true,
+          message: '已点击MEXC卖出，但未捕获下单接口响应；已停止后续Polymarket平仓', matched
+        }
+      }
+      let body: unknown
+      try { body = await response.json() } catch { body = undefined }
+      const record = body && typeof body === 'object' ? body as Record<string, unknown> : undefined
+      const code = Number(record?.code)
+      const orderAccepted = response.ok() && (code === 0 || code === 200 || record?.success === true)
+      if (!orderAccepted) {
+        return {
+          ok: false, orderAccepted: false, submittedAt,
+          message: `MEXC卖出接口未确认成功：${String(record?.msg ?? record?.message ?? `HTTP ${response.status()}`)}`,
+          matched
+        }
+      }
+      return {
+        ok: true, orderAccepted: true, submittedAt,
+        message: 'MEXC卖出接口已确认接收，正在等待实际成交回读', matched
+      }
+    } catch (error) {
+      return { ok: false, message: `MEXC自动卖出失败：${error instanceof Error ? error.message : String(error)}`, matched: {} }
     }
   }
 

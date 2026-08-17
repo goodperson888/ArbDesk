@@ -43,6 +43,17 @@ describe('MEXC fill parser', () => {
     })).toBeUndefined()
   })
 
+  it('accepts a sell fill business type while excluding fee rows', () => {
+    const fill = parseMexcFill([{ ...rows[0], bt: 108 }], {
+      eventId: '3000378544483', symbolId: 'f398d8cb551a49a682929b59c0434399',
+      direction: 'UP', submittedAfter: 1786808170000
+    })
+    expect(fill?.quantity).toBe('5.05')
+    expect(parseMexcFill([{ ...rows[0], bt: 104 }], {
+      eventId: '3000378544483', direction: 'UP', submittedAfter: 1786808170000
+    })).toBeUndefined()
+  })
+
   it('distinguishes winning and losing settlement rows', () => {
     expect(parseLatestMexcSettlement([{
       bt: 106, ta: 5.05, ei: 3000378544483, rft: 'Up', tt: 1786808401000,

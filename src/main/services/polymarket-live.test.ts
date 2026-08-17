@@ -260,6 +260,27 @@ describe('PolymarketLiveBroker', () => {
     expect(Number(fill.quantity)).toBeGreaterThanOrEqual(5.26)
   })
 
+  it('includes the V2 curve fee in the collateral balance check', async () => {
+    const createMarketOrder = vi.fn()
+    const client = {
+      getOrderBook: vi.fn(async () => orderBook()),
+      getBalanceAllowance: vi.fn(async () => ({
+        balance: '5750000',
+        allowances: {
+          '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000'
+        }
+      })),
+      createMarketOrder
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    await expect(broker.hedge({
+      tokenId: 'token', direction: 'DOWN', quantity: '10', maximumPrice: '0.57',
+      feeRate: '0.07', feeExponent: '1'
+    })).rejects.toThrow('余额不足')
+    expect(createMarketOrder).not.toHaveBeenCalled()
+  })
+
   it('rejects a hedge below the live Polymarket minimum before posting', async () => {
     const postOrder = vi.fn()
     const client = {
@@ -272,6 +293,39 @@ describe('PolymarketLiveBroker', () => {
     await expect(broker.hedge({ tokenId: 'token', direction: 'DOWN', quantity: '3.4', maximumPrice: '0.70' }))
       .rejects.toThrow('最小下单量为5份')
     expect(postOrder).not.toHaveBeenCalled()
+  })
+
+  it('sells the exact outcome-token quantity with FOK and slippage protection', async () => {
+    const createMarketOrder = vi.fn(async () => ({ version: 2 }))
+    const client = {
+      getOrderBook: vi.fn(async () => ({
+        ...orderBook(),
+        bids: [{ price: '0.48', size: '100' }]
+      })),
+      getBalanceAllowance: vi.fn(async ({ asset_type, token_id }) => {
+        expect(asset_type).toBe(AssetType.CONDITIONAL)
+        expect(token_id).toBe('token')
+        return {
+          balance: '10000000',
+          allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
+        }
+      }),
+      createMarketOrder,
+      postOrder: vi.fn(async () => ({
+        success: true, errorMsg: '', orderID: 'poly-sell-1', status: 'matched',
+        makingAmount: '5', takingAmount: '2.35'
+      }))
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    const fill = await broker.closePosition({
+      tokenId: 'token', direction: 'UP', quantity: '5', maximumSlippage: '0.03'
+    })
+
+    expect(createMarketOrder).toHaveBeenCalledWith(expect.objectContaining({
+      amount: 5, price: 0.45, side: expect.anything(), orderType: OrderType.FOK
+    }), expect.anything())
+    expect(fill).toMatchObject({ quantity: '5', averagePrice: '0.47', orderId: 'poly-sell-1' })
   })
 
   it('rejects a marketable BUY below the one-dollar maker minimum before signing', async () => {

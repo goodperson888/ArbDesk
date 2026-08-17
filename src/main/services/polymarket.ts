@@ -6,10 +6,20 @@ export interface HedgeOrder {
   direction: Direction
   quantity: string
   maximumPrice: string
+  feeRate?: string
+  feeExponent?: string
+}
+
+export interface ClosePositionOrder {
+  tokenId?: string
+  direction: Direction
+  quantity: string
+  maximumSlippage: string
 }
 
 export interface PolymarketBroker {
   hedge(order: HedgeOrder): Promise<Fill>
+  closePosition(order: ClosePositionOrder): Promise<Fill>
 }
 
 export class SimulatedPolymarketBroker implements PolymarketBroker {
@@ -22,6 +32,15 @@ export class SimulatedPolymarketBroker implements PolymarketBroker {
       averagePrice: order.maximumPrice,
       orderId: `sim-poly-${randomUUID()}`,
       filledAt: Date.now()
+    }
+  }
+
+
+  async closePosition(order: ClosePositionOrder): Promise<Fill> {
+    await new Promise((resolve) => setTimeout(resolve, 180))
+    return {
+      venue: 'POLYMARKET', direction: order.direction, quantity: order.quantity,
+      averagePrice: '0.5000', orderId: `sim-poly-close-${randomUUID()}`, filledAt: Date.now()
     }
   }
 }

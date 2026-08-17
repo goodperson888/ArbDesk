@@ -1,31 +1,36 @@
-import { useEffect, useMemo, useState, type JSX } from 'react'
+import { useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from 'react'
 import {
   Activity,
   AlertTriangle,
   ArrowDown,
+  ArrowLeft,
   ArrowRight,
   ArrowUp,
   Bot,
   Check,
   ChevronRight,
-  CircleDollarSign,
-  Clock3,
   ExternalLink,
-  Gauge,
+  History,
+  Info,
   KeyRound,
   LoaderCircle,
   LockKeyhole,
   Network,
+  Plus,
   RefreshCw,
+  RotateCcw,
+  ScrollText,
   Settings2,
   ShieldAlert,
   SlidersHorizontal,
-  TerminalSquare,
-  Unplug,
+  Trash2,
+  Volume2,
   X
 } from 'lucide-react'
 import type {
+  ArbitrageOrderRecord,
   AppSnapshot,
+  CloseTarget,
   Direction,
   ExecutionState,
   MexcBrowserMode,
@@ -34,8 +39,18 @@ import type {
   Opportunity,
   PolymarketCredentialSummary,
   PolymarketIdentityValidation,
-  PolymarketSignatureType
+  PolymarketSignatureType,
+  SettlementDistanceRule
 } from '../../shared/types'
+import { defaultSettlementDistanceRules } from '../../shared/defaults'
+
+interface SettlementRuleDraft {
+  id: string
+  remainingSeconds: string
+  minimumBps: string
+}
+
+type SettingsView = 'MAIN' | 'RISK' | 'LIVE' | 'ACCOUNT'
 
 const STATE_LABELS: Record<ExecutionState, string> = {
   IDLE: '已创建',
@@ -46,6 +61,11 @@ const STATE_LABELS: Record<ExecutionState, string> = {
   MEXC_FILLED: 'MEXC已成交',
   POLY_HEDGING: 'Polymarket对冲中',
   HEDGED: '两腿已对齐',
+  MEXC_CLOSING: 'MEXC平仓中',
+  MEXC_CLOSE_SUBMITTED: '等待MEXC平仓成交',
+  POLY_CLOSING: 'Polymarket平仓中',
+  CLOSED: '两腿已平仓',
+  UNHEDGED: '单腿敞口',
   RECOVERY_REQUIRED: '需要恢复',
   CANCELLED: '已取消'
 }
@@ -78,6 +98,44 @@ function StatusDot({ status }: { status: string }): JSX.Element {
   return <span className={`status-dot ${connected ? 'connected' : 'offline'}`} />
 }
 
+function opportunityReady(opportunity: Opportunity, snapshot: AppSnapshot, now: number): boolean {
+  const polymarketMaximumPrice = Math.min(0.99, Number(opportunity.polymarketPrice) + Number(snapshot.settings.maxHedgeSlippage))
+  const minimumQuantity = polymarketMaximumPrice > 0 && Number(opportunity.mexcPrice) > 0
+    ? Math.ceil(Math.max(
+      Number(opportunity.polymarketMinOrderSize),
+      1 / Number(opportunity.mexcPrice),
+      1 / polymarketMaximumPrice
+    ) * 100) / 100
+    : Number.POSITIVE_INFINITY
+  return !opportunity.stale &&
+    !opportunity.feeVerificationBlocked &&
+    !opportunity.settlementRiskBlocked &&
+    Number(opportunity.netEdgePerShare) >= Number(snapshot.settings.minNetEdgePerShare) &&
+    Number(opportunity.maxQuantity) >= minimumQuantity &&
+    Number(opportunity.allInCostPerShare) * minimumQuantity <= Number(snapshot.settings.maxCapitalPerTrade) &&
+    (opportunity.endTime - now) / 1_000 > snapshot.settings.stopBeforeExpirySeconds
+}
+
+function playOpportunityChime(volume: number): void {
+  const AudioContextClass = window.AudioContext
+  if (!AudioContextClass) return
+  const context = new AudioContextClass()
+  const gain = context.createGain()
+  gain.gain.setValueAtTime(0, context.currentTime)
+  gain.gain.linearRampToValueAtTime(Math.max(0, Math.min(1, volume)) * 0.16, context.currentTime + 0.02)
+  gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.52)
+  gain.connect(context.destination)
+  ;[880, 1174].forEach((frequency, index) => {
+    const oscillator = context.createOscillator()
+    oscillator.type = 'sine'
+    oscillator.frequency.value = frequency
+    oscillator.connect(gain)
+    oscillator.start(context.currentTime + index * 0.1)
+    oscillator.stop(context.currentTime + 0.52)
+  })
+  window.setTimeout(() => void context.close(), 650)
+}
+
 function App(): JSX.Element {
   const [snapshot, setSnapshot] = useState<AppSnapshot>()
   const [selectedId, setSelectedId] = useState<string>()
@@ -86,6 +144,7 @@ function App(): JSX.Element {
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<string>()
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsView, setSettingsView] = useState<SettingsView>('MAIN')
   const [mexcStatus, setMexcStatus] = useState<MexcBrowserStatus>()
   const [fillQuantity, setFillQuantity] = useState('')
   const [fillPrice, setFillPrice] = useState('')
@@ -97,6 +156,17 @@ function App(): JSX.Element {
   const [polyFunderAddress, setPolyFunderAddress] = useState('')
   const [polyPrivateKey, setPolyPrivateKey] = useState('')
   const [polyValidation, setPolyValidation] = useState<PolymarketIdentityValidation>()
+  const [settlementRuleDrafts, setSettlementRuleDrafts] = useState<SettlementRuleDraft[]>([])
+  const [settlementRuleError, setSettlementRuleError] = useState<string>()
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [logsOpen, setLogsOpen] = useState(false)
+  const [closeIntent, setCloseIntent] = useState<{ order: ArbitrageOrderRecord; target: CloseTarget }>()
+  const [minNetEdgeDraft, setMinNetEdgeDraft] = useState('0.0100')
+  const [soundEnabledDraft, setSoundEnabledDraft] = useState(true)
+  const [soundVolumeDraft, setSoundVolumeDraft] = useState(0.65)
+  const [soundCooldownDraft, setSoundCooldownDraft] = useState('30')
+  const previousCanExecuteRef = useRef(false)
+  const soundCooldownRef = useRef(new Map<string, number>())
 
   useEffect(() => {
     void window.arbApp.getSnapshot().then((value) => {
@@ -121,6 +191,16 @@ function App(): JSX.Element {
     if (!settingsOpen) return
     setHubstudioCode(snapshot?.settings.hubstudioContainerCode ?? '')
     setPolymarketProxyUrl(snapshot?.settings.polymarketProxyUrl ?? '')
+    setMinNetEdgeDraft(snapshot?.settings.minNetEdgePerShare ?? '0.0100')
+    setSoundEnabledDraft(snapshot?.settings.opportunitySoundEnabled ?? true)
+    setSoundVolumeDraft(snapshot?.settings.opportunitySoundVolume ?? 0.65)
+    setSoundCooldownDraft(String(snapshot?.settings.opportunitySoundCooldownSeconds ?? 30))
+    setSettlementRuleDrafts((snapshot?.settings.settlementDistanceRules ?? defaultSettlementDistanceRules()).map((rule) => ({
+      id: rule.id,
+      remainingSeconds: String(rule.remainingSeconds),
+      minimumBps: rule.minimumBps
+    })))
+    setSettlementRuleError(undefined)
     const refreshStatus = (): void => void window.arbApp.getMexcStatus().then(setMexcStatus)
     refreshStatus()
     void window.arbApp.getPolymarketCredentialSummary().then((summary) => {
@@ -136,6 +216,7 @@ function App(): JSX.Element {
     () => snapshot?.opportunities.find((opportunity) => opportunity.id === selectedId) ?? snapshot?.opportunities[0],
     [selectedId, snapshot]
   )
+  const readyOpportunityCount = snapshot?.opportunities.filter((opportunity) => opportunityReady(opportunity, snapshot, now)).length ?? 0
   const requestedCapital = selected ? Number(selected.allInCostPerShare) * Number(quantity || 0) : 0
   const requestedProfit = selected ? Number(selected.netEdgePerShare) * Number(quantity || 0) : 0
   const requestedBothLose = selected ? Number(selected.bothLosePnlPerShare) * Number(quantity || 0) : 0
@@ -171,10 +252,12 @@ function App(): JSX.Element {
       Number(quantity) >= minimumAlignedQuantity &&
       Number(quantity) <= Number(selected.maxQuantity) &&
       requestedCapital <= Number(snapshot?.settings.maxCapitalPerTrade ?? 0) &&
+      !selected.feeVerificationBlocked &&
       (!snapshot?.settings.allowUnprofitableTestTrade || (minimumTestCapital <= 12 && requestedCapital <= dynamicTestCapitalLimit)) &&
       (Number(selected.netEdgePerShare) >= Number(snapshot?.settings.minNetEdgePerShare ?? 0) || testOverrideReady) &&
       (!selected.settlementRiskBlocked || testOverrideReady) &&
       !selected.stale &&
+      (selected.endTime - now) / 1_000 > Number(snapshot?.settings.stopBeforeExpirySeconds ?? 0) &&
       !busy
   )
   const executeBlockReason = !selected
@@ -189,7 +272,11 @@ function App(): JSX.Element {
           ? '预计本金超过单笔上限'
           : selected.stale
             ? '行情已过期，等待自动刷新'
-            : selected.settlementRiskBlocked && !testOverrideReady
+            : (selected.endTime - now) / 1_000 <= Number(snapshot?.settings.stopBeforeExpirySeconds ?? 0)
+              ? `距离到期不足${snapshot?.settings.stopBeforeExpirySeconds ?? 0}秒，禁止新开仓`
+            : selected.feeVerificationBlocked
+              ? selected.feeVerificationReason ?? '手续费尚未校验'
+              : selected.settlementRiskBlocked && !testOverrideReady
               ? selected.settlementRiskReason ?? '结算信号风控拦截'
               : Number(selected.netEdgePerShare) < Number(snapshot?.settings.minNetEdgePerShare ?? 0) && !snapshot?.settings.allowUnprofitableTestTrade
                 ? '净收益低于门槛；可在设置中放开一次小额亏损联调'
@@ -200,6 +287,16 @@ function App(): JSX.Element {
                   : snapshot?.settings.allowUnprofitableTestTrade && requestedCapital > dynamicTestCapitalLimit
                     ? `小额验证最多使用${dynamicTestCapitalLimit.toFixed(2)} USDT，可点击“最大”自动调整`
                     : undefined
+
+  useEffect(() => {
+    const becameExecutable = canExecute && !previousCanExecuteRef.current
+    previousCanExecuteRef.current = canExecute
+    if (!snapshot || !selected || !canExecute || !snapshot.settings.opportunitySoundEnabled) return
+    const lastAlerted = soundCooldownRef.current.get(selected.id) ?? 0
+    if (!becameExecutable && now - lastAlerted < snapshot.settings.opportunitySoundCooldownSeconds * 1_000) return
+    playOpportunityChime(snapshot.settings.opportunitySoundVolume)
+    soundCooldownRef.current.set(selected.id, now)
+  }, [canExecute, now, selected?.id, snapshot?.settings.opportunitySoundCooldownSeconds, snapshot?.settings.opportunitySoundEnabled, snapshot?.settings.opportunitySoundVolume])
 
   useEffect(() => {
     if (!selected || snapshot?.activeSession?.opportunityId !== selected.id) return
@@ -359,6 +456,127 @@ function App(): JSX.Element {
       : result.connectionDetails.polymarket ?? 'Polymarket 仍未连接')
   }
 
+  function updateSettlementRule(id: string, field: 'remainingSeconds' | 'minimumBps', value: string): void {
+    setSettlementRuleDrafts((rules) => rules.map((rule) => rule.id === id ? { ...rule, [field]: value } : rule))
+    setSettlementRuleError(undefined)
+  }
+
+  function addSettlementRule(): void {
+    const usedSeconds = new Set(settlementRuleDrafts.map((rule) => Number(rule.remainingSeconds)))
+    let suggestedSeconds = 60
+    while (usedSeconds.has(suggestedSeconds)) suggestedSeconds += 10
+    setSettlementRuleDrafts((rules) => [
+      ...rules,
+      { id: `rule-${Date.now()}-${rules.length}`, remainingSeconds: String(suggestedSeconds), minimumBps: '' }
+    ])
+    setSettlementRuleError(undefined)
+  }
+
+  function removeSettlementRule(id: string): void {
+    if (settlementRuleDrafts.length <= 1) {
+      setSettlementRuleError('动态安全距离至少保留一个规则节点')
+      return
+    }
+    setSettlementRuleDrafts((rules) => rules.filter((rule) => rule.id !== id))
+    setSettlementRuleError(undefined)
+  }
+
+  function resetSettlementRules(): void {
+    setSettlementRuleDrafts(defaultSettlementDistanceRules().map((rule) => ({
+      id: rule.id,
+      remainingSeconds: String(rule.remainingSeconds),
+      minimumBps: rule.minimumBps
+    })))
+    setSettlementRuleError(undefined)
+  }
+
+  function parseSettlementRules(): SettlementDistanceRule[] | undefined {
+    if (settlementRuleDrafts.length === 0) {
+      setSettlementRuleError('动态安全距离至少保留一个规则节点')
+      return undefined
+    }
+    const secondsSeen = new Set<number>()
+    const parsed: SettlementDistanceRule[] = []
+    for (const [index, draft] of settlementRuleDrafts.entries()) {
+      const remainingSeconds = Number(draft.remainingSeconds)
+      const minimumBps = Number(draft.minimumBps)
+      if (!draft.remainingSeconds.trim() || !Number.isInteger(remainingSeconds) || remainingSeconds < 0 || remainingSeconds > 86_400) {
+        setSettlementRuleError(`第${index + 1}行：剩余秒数须为0至86400的整数`)
+        return undefined
+      }
+      if (!draft.minimumBps.trim() || !Number.isFinite(minimumBps) || minimumBps < 0 || minimumBps > 10_000) {
+        setSettlementRuleError(`第${index + 1}行：最低bps须在0至10000之间`)
+        return undefined
+      }
+      if (secondsSeen.has(remainingSeconds)) {
+        setSettlementRuleError(`剩余${remainingSeconds}秒存在重复规则`)
+        return undefined
+      }
+      secondsSeen.add(remainingSeconds)
+      parsed.push({ id: draft.id, remainingSeconds, minimumBps: String(minimumBps) })
+    }
+    return parsed.sort((left, right) => right.remainingSeconds - left.remainingSeconds)
+  }
+
+  async function saveSettlementRules(): Promise<void> {
+    const settlementDistanceRules = parseSettlementRules()
+    if (!settlementDistanceRules) return
+    const result = await run(async () => {
+      await window.arbApp.updateSettings({ settlementDistanceRules })
+      return await window.arbApp.refreshOpportunities()
+    }, '动态安全距离规则已保存并应用')
+    if (!result) return
+    setSnapshot(result)
+    setSettlementRuleDrafts(result.settings.settlementDistanceRules.map((rule) => ({
+      id: rule.id,
+      remainingSeconds: String(rule.remainingSeconds),
+      minimumBps: rule.minimumBps
+    })))
+    setSettlementRuleError(undefined)
+  }
+
+  async function saveDecisionSettings(): Promise<void> {
+    const edge = Number(minNetEdgeDraft)
+    if (!Number.isFinite(edge) || edge < 0 || edge >= 1) {
+      setMessage('最低净边际须为0至1之间的美元/份数值')
+      return
+    }
+    const cooldownSeconds = Number(soundCooldownDraft)
+    if (!Number.isInteger(cooldownSeconds) || cooldownSeconds < 5 || cooldownSeconds > 3_600) {
+      setMessage('提示音重复间隔须为5至3600秒的整数')
+      return
+    }
+    const result = await run(() => window.arbApp.updateSettings({
+      minNetEdgePerShare: edge.toFixed(4),
+      opportunitySoundEnabled: soundEnabledDraft,
+      opportunitySoundVolume: soundVolumeDraft,
+      opportunitySoundCooldownSeconds: cooldownSeconds
+    }), '下单门槛与提示音设置已保存')
+    if (result && snapshot) setSnapshot({ ...snapshot, settings: result })
+  }
+
+  async function confirmCloseOrder(): Promise<void> {
+    if (!closeIntent) return
+    const result = await run(
+      () => window.arbApp.closeOrder({ orderId: closeIntent.order.id, target: closeIntent.target }),
+      closeIntent.target === 'BOTH' ? '双腿平仓流程已完成' : '单腿平仓流程已完成，请注意剩余敞口'
+    )
+    if (result) {
+      setCloseIntent(undefined)
+      setHistoryOpen(true)
+    }
+  }
+
+  function openSettings(view: SettingsView = 'MAIN'): void {
+    setSettingsView(view)
+    setSettingsOpen(true)
+  }
+
+  function closeSettings(): void {
+    setSettingsOpen(false)
+    setSettingsView('MAIN')
+  }
+
   if (!snapshot) {
     return (
       <main className="loading-screen">
@@ -379,10 +597,7 @@ function App(): JSX.Element {
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark"><Activity aria-hidden="true" /></div>
-          <div>
-            <strong>ArbDesk</strong>
-            <span>MEXC × Polymarket</span>
-          </div>
+          <strong>ArbDesk</strong>
         </div>
         <div className="connection-strip" aria-label="连接状态">
           <span title={snapshot.connectionDetails.mexc}><StatusDot status={snapshot.connection.mexc} />MEXC {snapshot.connection.mexc === 'BROWSER_READY' ? (snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? 'Hubstudio' : '内嵌') : '未连接'}</span>
@@ -392,68 +607,59 @@ function App(): JSX.Element {
           <div className={`mode-badge ${snapshot.settings.mode.toLowerCase()}`}>
             {snapshot.settings.mode === 'SIMULATION' ? '模拟模式' : snapshot.settings.mode === 'ASSISTED' ? '人工监督' : '实盘'}
           </div>
-          <button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="打开设置">
+          <button className="icon-button has-count" onClick={() => setHistoryOpen(true)} aria-label={`打开历史订单，共${snapshot.orderHistory.length}组`}>
+            <History aria-hidden="true" />{snapshot.orderHistory.length > 0 && <span>{Math.min(99, snapshot.orderHistory.length)}</span>}
+          </button>
+          <button className="icon-button" onClick={() => setLogsOpen(true)} aria-label="打开执行日志">
+            <ScrollText aria-hidden="true" />
+          </button>
+          <button className="icon-button" onClick={() => openSettings()} aria-label="打开设置">
             <Settings2 aria-hidden="true" />
           </button>
         </div>
       </header>
 
-      <div className="risk-banner">
+      <button className="risk-banner" type="button" onClick={() => openSettings('RISK')} aria-label="查看条件型结算风险设置">
         <ShieldAlert aria-hidden="true" />
-        <span><strong>条件型机会：</strong>MEXC 与 Polymarket 结算源不同，界面利润不是保证收益。</span>
-        <button onClick={() => setSettingsOpen(true)}>查看风控 <ChevronRight aria-hidden="true" /></button>
-      </div>
+        <span><strong>条件型：</strong>两平台结算源不同</span>
+        <ChevronRight className="risk-banner-arrow" aria-hidden="true" />
+      </button>
 
       <main className="workspace">
         <section className="main-column">
-          <div className="metrics-grid">
-            <article className="metric-card">
-              <div className="metric-icon green"><Gauge aria-hidden="true" /></div>
-              <div><span>最佳净边际</span><strong>{money(snapshot.opportunities[0]?.netEdgePerShare ?? '0', 4)}</strong><small>每份结算份额</small></div>
-            </article>
-            <article className="metric-card">
-              <div className="metric-icon blue"><Activity aria-hidden="true" /></div>
-              <div><span>可执行机会</span><strong>{snapshot.opportunities.filter((item) => Number(item.netEdgePerShare) > 0 && !item.settlementRiskBlocked).length}</strong><small>已通过结算源风控</small></div>
-            </article>
-            <article className="metric-card">
-              <div className="metric-icon amber"><Clock3 aria-hidden="true" /></div>
-              <div><span>最快到期</span><strong>{snapshot.opportunities.length ? secondsRemaining(Math.min(...snapshot.opportunities.map((item) => item.endTime)), now) : '—'}</strong><small>停止前 20 秒禁开仓</small></div>
-            </article>
-            <article className="metric-card">
-              <div className="metric-icon slate"><CircleDollarSign aria-hidden="true" /></div>
-              <div><span>单笔限额</span><strong>${money(snapshot.settings.maxCapitalPerTrade)}</strong><small>本地风控</small></div>
-            </article>
-          </div>
-
           <section className="panel opportunities-panel">
             <div className="panel-header">
-              <div><span className="eyebrow">LIVE SCANNER</span><h1>BTC 跨平台机会</h1></div>
-              <button className="secondary-button" onClick={() => void run(() => window.arbApp.refreshOpportunities())} disabled={busy}>
-                <RefreshCw className={busy ? 'spin' : ''} aria-hidden="true" />刷新
+              <div className="scanner-title"><h1>BTC 跨平台机会</h1><span>{snapshot.opportunities.length}条 · {readyOpportunityCount}条可执行</span></div>
+              <button className="icon-button scanner-refresh" onClick={() => void run(() => window.arbApp.refreshOpportunities())} disabled={busy} aria-label="刷新套利机会" title="刷新套利机会">
+                <RefreshCw className={busy ? 'spin' : ''} aria-hidden="true" />
               </button>
             </div>
             <div className="table-wrap">
               <table>
                 <thead>
-                  <tr><th>周期</th><th>MEXC</th><th>Polymarket</th><th>全部成本</th><th>净边际</th><th>可执行量</th><th>剩余</th><th aria-label="选择" /></tr>
+                  <tr><th>周期</th><th>MEXC</th><th>Polymarket</th><th>全部成本</th><th>净边际</th><th>可执行量</th><th>剩余</th></tr>
                 </thead>
                 <tbody>
                   {snapshot.opportunities.length === 0 && (
-                    <tr><td colSpan={8}><div className="empty-state">暂无真实跨平台报价。{snapshot.connectionDetails.polymarket}</div></td></tr>
+                    <tr><td colSpan={7}><div className="empty-state">暂无真实跨平台报价。{snapshot.connectionDetails.polymarket}</div></td></tr>
                   )}
                   {snapshot.opportunities.map((opportunity) => {
-                    const positive = Number(opportunity.netEdgePerShare) > 0 && !opportunity.settlementRiskBlocked
+                    const positive = opportunityReady(opportunity, snapshot, now)
                     const isSelected = opportunity.id === selected?.id
                     return (
                       <tr key={opportunity.id} className={isSelected ? 'selected' : ''} onClick={() => setSelectedId(opportunity.id)} tabIndex={0} onKeyDown={(event) => event.key === 'Enter' && setSelectedId(opportunity.id)}>
                         <td><span className="duration-pill">{opportunity.durationMinutes}m</span></td>
-                        <td><Direction direction={opportunity.mexcDirection} /><small>@ {money(opportunity.mexcPrice, 4)}</small></td>
-                        <td><Direction direction={opportunity.polymarketDirection} /><small>@ {money(opportunity.polymarketPrice, 4)}</small></td>
-                        <td className="mono">{money(opportunity.allInCostPerShare, 4)}</td>
-                        <td><span className={positive ? 'positive-value' : 'negative-value'}>{positive ? '+' : ''}{money(opportunity.netEdgePerShare, 4)}</span><small>{opportunity.settlementRiskBlocked ? '风控拦截' : '条件型'}</small></td>
+                        <td><span className="quote-inline"><Direction direction={opportunity.mexcDirection} /><span className="mono">{money(opportunity.mexcPrice, 4)}</span></span></td>
+                        <td><span className="quote-inline"><Direction direction={opportunity.polymarketDirection} /><span className="mono">{money(opportunity.polymarketPrice, 4)}</span></span></td>
+                        <td className="mono">{opportunity.feeVerificationBlocked ? '—' : money(opportunity.allInCostPerShare, 4)}</td>
+                        <td><span className="edge-cell" title={opportunity.feeVerificationBlocked ? '费用待校验' : opportunity.settlementRiskBlocked ? '风控拦截' : positive ? '当前可执行' : '未通过全部执行门槛'}>
+                          <span className={positive ? 'positive-value' : 'negative-value'}>
+                            {opportunity.feeVerificationBlocked ? '—' : `${positive ? '+' : ''}${money(opportunity.netEdgePerShare, 4)}`}
+                          </span>
+                          {!positive && <AlertTriangle aria-hidden="true" />}
+                        </span></td>
                         <td className="mono">{money(opportunity.maxQuantity, 0)}</td>
                         <td className="mono countdown">{secondsRemaining(opportunity.endTime, now)}</td>
-                        <td><ChevronRight className="row-arrow" aria-hidden="true" /></td>
                       </tr>
                     )
                   })}
@@ -462,50 +668,11 @@ function App(): JSX.Element {
             </div>
           </section>
 
-          <section className="panel event-panel">
-            <div className="panel-header compact">
-              <div><span className="eyebrow">EXECUTION AUDIT</span><h2>执行记录</h2></div>
-              <span className="audit-path"><TerminalSquare aria-hidden="true" /> 本地审计日志</span>
-            </div>
-            <div className="event-list">
-              {snapshot.recentEvents.length === 0 ? <div className="empty-state">尚无执行记录。先用模拟模式跑一笔。</div> : snapshot.recentEvents.slice(0, 7).map((event) => (
-                <div className="event-row" key={event.id}>
-                  <span className={`event-marker ${event.state === 'HEDGED' ? 'ok' : event.state === 'RECOVERY_REQUIRED' ? 'danger' : ''}`} />
-                  <time>{new Date(event.timestamp).toLocaleTimeString('zh-CN', { hour12: false })}</time>
-                  <strong>{STATE_LABELS[event.state]}</strong>
-                  <p>{event.message}</p>
-                </div>
-              ))}
-            </div>
-          </section>
         </section>
 
         <aside className="order-ticket panel" aria-label="执行面板">
-          <div className="ticket-heading">
-            <div><span className="eyebrow">ORDER TICKET</span><h2>执行套利</h2></div>
-            <span className="conditional-badge">CONDITIONAL</span>
-          </div>
           {selected ? (
             <>
-              <div className="market-summary">
-                <div><span>BTC/USD · {selected.durationMinutes}分钟</span><strong>{new Date(selected.endTime).toLocaleTimeString('zh-CN', { hour12: false })} 到期</strong></div>
-                <div className="large-countdown">{secondsRemaining(selected.endTime, now)}</div>
-              </div>
-
-              <div className="legs">
-                <div className="leg-card">
-                  <div><span className="venue-logo mexc">M</span><div><strong>MEXC</strong><small>第一腿 · 网页监督</small></div></div>
-                  <Direction direction={selected.mexcDirection} />
-                  <span className="leg-price">{money(selected.mexcPrice, 4)}</span>
-                </div>
-                <div className="leg-connector"><ArrowDown aria-hidden="true" /></div>
-                <div className="leg-card">
-                  <div><span className="venue-logo poly">P</span><div><strong>Polymarket</strong><small>第二腿 · API对冲</small></div></div>
-                  <Direction direction={selected.polymarketDirection} />
-                  <span className="leg-price">{money(selected.polymarketPrice, 4)}</span>
-                </div>
-              </div>
-
               <label className="field-label" htmlFor="quantity">对齐份额</label>
               <div className="quantity-control">
                 <input id="quantity" value={quantity} inputMode="decimal" onChange={(event) => setQuantity(event.target.value)} />
@@ -516,25 +683,7 @@ function App(): JSX.Element {
                 </button>
               </div>
 
-              <div className="cost-breakdown">
-                <Row label="MEXC本金" value={`$${money(Number(selected.mexcPrice) * Number(quantity || 0) + '', 2)}`} />
-                <Row label="Polymarket本金" value={`$${money(Number(selected.polymarketPrice) * Number(quantity || 0) + '', 2)}`} />
-                <Row label={`MEXC手续费（${selected.mexcFeeRateSource === 'HISTORY' ? '历史校准' : '保守兜底'} ${(Number(selected.mexcFeeRate) * 100).toFixed(2)}%）`} value={`$${money(Number(selected.mexcFeePerShare) * Number(quantity || 0) + '', 2)}`} />
-                <Row label={`Polymarket曲线手续费（r=${(Number(selected.polymarketFeeRate) * 100).toFixed(2)}%）`} value={`$${money(Number(selected.polymarketFeePerShare) * Number(quantity || 0) + '', 2)}`} />
-                <Row label="风险缓冲（预留）" value={`$${money(Number(selected.riskBufferPerShare) * Number(quantity || 0) + '', 2)}`} />
-                <div className="breakdown-divider" />
-                <Row label="预计占用本金" value={`$${requestedCapital.toFixed(2)}`} emphasized />
-                <Row label="正常一赢一输" value={`${requestedProfit >= 0 ? '+' : ''}$${requestedProfit.toFixed(2)}`} positive={requestedProfit > 0} />
-                <Row label="两边同时输" value={`-$${Math.abs(requestedBothLose).toFixed(2)}`} />
-                <Row label="两边同时赢" value={`+$${requestedBothWin.toFixed(2)}`} positive />
-                <div className="breakdown-divider" />
-                <Row label="MEXC结算信号" value={`${selected.mexcSignal ?? '未知'}${selected.mexcDistanceBps ? ` · ${Number(selected.mexcDistanceBps) >= 0 ? '+' : ''}${money(selected.mexcDistanceBps, 2)} bps` : ''}`} />
-                <Row label="Polymarket信号" value={`${selected.polymarketSignal ?? '未知'}${selected.polymarketDistanceBps ? ` · ${Number(selected.polymarketDistanceBps) >= 0 ? '+' : ''}${money(selected.polymarketDistanceBps, 2)} bps` : ''}`} />
-              </div>
-
-              {selected.riskFlags.length > 0 && <div className="inline-warning"><AlertTriangle aria-hidden="true" /><span>{selected.riskFlags[0]}</span></div>}
-
-              <button className="execute-button" onClick={() => void execute()} disabled={!canExecute}>
+              <button className="execute-button" onClick={() => void execute()} disabled={!canExecute} title="确认MEXC实际成交后才会提交Polymarket对冲">
                 {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <ArrowRight aria-hidden="true" />}
                 {snapshot.settings.mode === 'SIMULATION'
                   ? '模拟执行两腿'
@@ -543,7 +692,42 @@ function App(): JSX.Element {
                     : '准备MEXC第一腿'}
               </button>
               {!canExecute && executeBlockReason && <p className="execution-note"><AlertTriangle aria-hidden="true" />禁用原因：{executeBlockReason}</p>}
-              <p className="execution-note"><LockKeyhole aria-hidden="true" />只有确认MEXC实际成交后，才允许提交Polymarket对冲。</p>
+
+              {(selected.feeVerificationBlocked || selected.settlementRiskBlocked || selected.stale || Number(selected.netEdgePerShare) < Number(snapshot.settings.minNetEdgePerShare)) && selected.riskFlags.length > 0 && (
+                <div className="inline-warning"><AlertTriangle aria-hidden="true" /><span>{selected.riskFlags[0]}</span></div>
+              )}
+
+              <div className="cost-breakdown">
+                <Row label="预计占用本金" value={selected.feeVerificationBlocked ? '—' : `$${requestedCapital.toFixed(2)}`} emphasized />
+                <Row label="预计利润" value={selected.feeVerificationBlocked ? '—' : `${requestedProfit >= 0 ? '+' : ''}$${requestedProfit.toFixed(2)}`} positive={!selected.feeVerificationBlocked && requestedProfit > 0} />
+                <Row label="动态安全距离" value={`${money(selected.settlementDistanceBps, 2)} / ${money(selected.requiredSettlementDistanceBps, 2)} bps`} positive={Number(selected.settlementDistanceBps) >= Number(selected.requiredSettlementDistanceBps)} />
+                <details className="ticket-calculation-details">
+                  <summary>风险与费用明细</summary>
+                  <div>
+                    <FormulaHelp inline />
+                    <Row
+                      label="条件收益率"
+                      value={selected.feeVerificationBlocked ? '—' : `${Number(selected.conditionalReturnPct) >= 0 ? '+' : ''}${money(selected.conditionalReturnPct, 2)}%`}
+                      positive={!selected.feeVerificationBlocked && Number(selected.conditionalReturnPct) > 0}
+                    />
+                    <Row label="最坏亏损率" value={selected.feeVerificationBlocked ? '—' : `${money(selected.worstCaseReturnPct, 2)}%`} />
+                    <Row label="MEXC结算信号" value={selected.mexcSignal
+                      ? <SignalValue direction={selected.mexcSignal} distanceBps={selected.mexcDistanceBps} />
+                      : '未知'} />
+                    <Row label="Polymarket结算信号" value={selected.polymarketSignal
+                      ? <SignalValue direction={selected.polymarketSignal} distanceBps={selected.polymarketDistanceBps} />
+                      : '未知'} />
+                    <div className="breakdown-divider" />
+                    <Row label="MEXC本金" value={`$${money(Number(selected.mexcPrice) * Number(quantity || 0) + '', 2)}`} />
+                    <Row label="Polymarket本金" value={`$${money(Number(selected.polymarketPrice) * Number(quantity || 0) + '', 2)}`} />
+                    <Row label="MEXC手续费" value={selected.mexcFeeRateSource === 'HISTORY' ? `$${money(Number(selected.mexcFeePerShare) * Number(quantity || 0) + '', 2)}` : '—'} />
+                    <Row label="Polymarket手续费" value={`$${money(Number(selected.polymarketFeePerShare) * Number(quantity || 0) + '', 2)}`} />
+                    <Row label="风险缓冲" value={`$${money(Number(selected.riskBufferPerShare) * Number(quantity || 0) + '', 2)}`} />
+                    <Row label="两边同时输" value={selected.feeVerificationBlocked ? '—' : `-$${Math.abs(requestedBothLose).toFixed(2)}`} />
+                    <Row label="两边同时赢" value={selected.feeVerificationBlocked ? '—' : `+$${requestedBothWin.toFixed(2)}`} positive={!selected.feeVerificationBlocked} />
+                  </div>
+                </details>
+              </div>
             </>
           ) : <div className="empty-state">没有可用机会</div>}
         </aside>
@@ -569,31 +753,134 @@ function App(): JSX.Element {
         </div>
       )}
 
+      {historyOpen && <HistoryModal
+        orders={snapshot.orderHistory}
+        busy={busy}
+        onDismiss={() => setHistoryOpen(false)}
+        onCloseOrder={(order, target) => {
+          setHistoryOpen(false)
+          setCloseIntent({ order, target })
+        }}
+      />}
+
+      {logsOpen && <LogsModal events={snapshot.recentEvents} onDismiss={() => setLogsOpen(false)} />}
+
+      {closeIntent && <CloseConfirmModal
+        intent={closeIntent}
+        busy={busy}
+        onDismiss={() => setCloseIntent(undefined)}
+        onConfirm={() => void confirmCloseOrder()}
+      />}
+
       {settingsOpen && (
-        <div className="drawer-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setSettingsOpen(false)}>
+        <div className="drawer-backdrop" onMouseDown={(event) => event.target === event.currentTarget && closeSettings()}>
           <aside className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-            <div className="drawer-header"><div><span className="eyebrow">LOCAL CONTROL</span><h2 id="settings-title">运行与校准</h2></div><button className="icon-button" onClick={() => setSettingsOpen(false)} aria-label="关闭设置"><X /></button></div>
-            <section className="settings-section">
-              <h3>执行模式</h3>
+            <div className="drawer-header">
+              <div className="drawer-heading">
+                {settingsView !== 'MAIN' && <button className="settings-back-button" onClick={() => setSettingsView('MAIN')} aria-label="返回设置主页"><ArrowLeft /></button>}
+                <div><h2 id="settings-title">{settingsView === 'MAIN' ? '设置' : settingsView === 'RISK' ? '风控规则' : settingsView === 'LIVE' ? '实盘控制' : '账户与环境'}</h2></div>
+              </div>
+              <button className="icon-button" onClick={closeSettings} aria-label="关闭设置"><X /></button>
+            </div>
+            {settingsView === 'MAIN' && <>
+            <section className="settings-section decision-settings-section">
+              <div className="settings-title-row"><h3>执行与提醒</h3><span className="ready-text">实时生效</span></div>
               <div className="segmented-control">
                 <button className={snapshot.settings.mode === 'SIMULATION' ? 'active' : ''} onClick={() => void setMode('SIMULATION')}><Bot />模拟</button>
                 <button className={snapshot.settings.mode === 'ASSISTED' ? 'active' : ''} onClick={() => void setMode('ASSISTED')}><SlidersHorizontal />人工监督</button>
               </div>
-              <p>人工监督模式会先打开MEXC窗口，确认实际成交后才对冲。</p>
+              <p>人工监督会先执行MEXC，确认实际成交后才对冲；最低净边际按每份美元判断。</p>
+              <label className="settings-field" htmlFor="min-net-edge">最低净边际（美元/份）
+                <input id="min-net-edge" value={minNetEdgeDraft} onChange={(event) => setMinNetEdgeDraft(event.target.value)} inputMode="decimal" />
+              </label>
+              <div className="sound-setting-row">
+                <label htmlFor="opportunity-sound"><input id="opportunity-sound" type="checkbox" checked={soundEnabledDraft} onChange={(event) => setSoundEnabledDraft(event.target.checked)} />可下单提示音</label>
+                <button className="secondary-button" onClick={() => playOpportunityChime(soundVolumeDraft)}><Volume2 aria-hidden="true" />测试</button>
+              </div>
+              {soundEnabledDraft && <><label className="settings-field volume-field" htmlFor="sound-volume">提示音音量 · {Math.round(soundVolumeDraft * 100)}%
+                <input id="sound-volume" type="range" min="0.1" max="1" step="0.05" value={soundVolumeDraft} onChange={(event) => setSoundVolumeDraft(Number(event.target.value))} disabled={!soundEnabledDraft} />
+              </label>
+              <label className="settings-field" htmlFor="sound-cooldown">重复提示间隔（秒）
+                <input id="sound-cooldown" type="number" min="5" max="3600" step="1" value={soundCooldownDraft} onChange={(event) => setSoundCooldownDraft(event.target.value)} disabled={!soundEnabledDraft} inputMode="numeric" />
+              </label></>}
+              <button className="wide-secondary rule-save-button" onClick={() => void saveDecisionSettings()} disabled={busy}><Check aria-hidden="true" />保存执行与提醒</button>
             </section>
-            <section className="settings-section">
-              <div className="settings-title-row"><h3>MEXC浏览器</h3><span className={mexcStatus?.open ? 'ready-text' : ''}>{mexcStatus?.open ? (mexcStatus.authenticated ? '已连接 · 已检测登录' : '已连接 · 待登录') : '尚未打开'}</span></div>
+            <nav className="settings-menu" aria-label="更多设置模块">
+              <button className="settings-menu-card" onClick={() => setSettingsView('RISK')}>
+                <div><strong>风控规则</strong><span>动态安全距离 · {snapshot.settings.settlementDistanceRules.length}个节点</span><small>控制临近结算时允许开仓的最小价格距离</small></div><ChevronRight />
+              </button>
+              <button className="settings-menu-card" onClick={() => setSettingsView('LIVE')}>
+                <div><strong>实盘控制</strong><span>{snapshot.settings.mexcAutomationEnabled ? 'MEXC自动点击已开' : 'MEXC自动点击已关'} · {snapshot.settings.polymarketLiveEnabled ? '真实对冲已开' : '真实对冲已关'}</span><small>管理自动点击、真实FOK与一次性小额联调</small></div><ChevronRight />
+              </button>
+              <button className="settings-menu-card" onClick={() => setSettingsView('ACCOUNT')}>
+                <div><strong>账户与环境</strong><span>{snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? 'Hubstudio' : '内嵌MEXC'} · {polymarketCredentials?.configured ? 'Polymarket已配置' : 'Polymarket未配置'}</span><small>低频配置：浏览器环境、网络、校准和交易身份</small></div><ChevronRight />
+              </button>
+            </nav>
+            </>}
+            {settingsView === 'RISK' && <section className="settings-section settlement-rules-section settings-subpage-section">
+              <div className="settings-title-row">
+                <div><h3>动态安全距离</h3><span className="settings-kicker">剩余时间 → 最低 bps</span></div>
+                <FormulaHelp compact />
+              </div>
+              <p>规则按剩余秒数从大到小应用，节点之间线性插值；超出节点范围时使用最近端点。到期前{snapshot.settings.stopBeforeExpirySeconds}秒禁止开仓仍独立生效。</p>
+              <div className="settlement-rule-head" aria-hidden="true"><span>剩余秒数</span><span>最低距离</span><span>操作</span></div>
+              <div className="settlement-rule-list">
+                {settlementRuleDrafts.map((rule, index) => (
+                  <div className="settlement-rule-row" key={rule.id}>
+                    <label>
+                      <span>第{index + 1}行剩余秒数</span>
+                      <input
+                        value={rule.remainingSeconds}
+                        onChange={(event) => updateSettlementRule(rule.id, 'remainingSeconds', event.target.value)}
+                        inputMode="numeric"
+                        aria-label={`第${index + 1}行剩余秒数`}
+                      />
+                      <small>秒</small>
+                    </label>
+                    <label>
+                      <span>第{index + 1}行最低距离</span>
+                      <input
+                        value={rule.minimumBps}
+                        onChange={(event) => updateSettlementRule(rule.id, 'minimumBps', event.target.value)}
+                        inputMode="decimal"
+                        aria-label={`第${index + 1}行最低距离bps`}
+                      />
+                      <small>bps</small>
+                    </label>
+                    <button
+                      className="rule-delete-button"
+                      onClick={() => removeSettlementRule(rule.id)}
+                      disabled={settlementRuleDrafts.length <= 1}
+                      aria-label={`删除第${index + 1}行规则`}
+                    ><Trash2 aria-hidden="true" /></button>
+                  </div>
+                ))}
+              </div>
+              {settlementRuleError && <p className="settings-inline-error" role="alert">{settlementRuleError}</p>}
+              <div className="settlement-rule-actions">
+                <button className="secondary-button" onClick={addSettlementRule} disabled={settlementRuleDrafts.length >= 20}><Plus aria-hidden="true" />添加节点</button>
+                <button className="secondary-button" onClick={resetSettlementRules}><RotateCcw aria-hidden="true" />恢复默认</button>
+              </div>
+              <button className="wide-secondary rule-save-button" onClick={() => void saveSettlementRules()} disabled={busy}><Check aria-hidden="true" />保存并立即应用</button>
+            </section>}
+            {settingsView === 'ACCOUNT' && <>
+            <div className="settings-module-intro">这些项目通常只在首次安装、更换环境或连接异常时调整。</div>
+            <details className="settings-module">
+              <summary><div><strong>MEXC环境</strong><span className={mexcStatus?.open ? 'ready-text' : ''}>{mexcStatus?.open ? (mexcStatus.authenticated ? '已连接 · 已登录' : '已连接 · 待登录') : '尚未打开'}</span><small>浏览器模式、Hubstudio环境和账户读取</small></div><ChevronRight /></summary>
+              <div className="settings-module-body">
               <div className="segmented-control browser-mode-control">
                 <button className={snapshot.settings.mexcBrowserMode === 'EMBEDDED' ? 'active' : ''} onClick={() => void setMexcBrowser('EMBEDDED')}><Bot />内嵌浏览器</button>
                 <button className={snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? 'active' : ''} onClick={() => void setMexcBrowser('HUBSTUDIO')}><ExternalLink />Hubstudio</button>
               </div>
-              <label className="settings-field">Hubstudio环境ID
+              {snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' && <><label className="settings-field">Hubstudio环境ID
                 <input value={hubstudioCode} onChange={(event) => setHubstudioCode(event.target.value)} placeholder="例如 223012801" inputMode="numeric" />
               </label>
-              <button className="wide-secondary" onClick={() => void setMexcBrowser('HUBSTUDIO')} disabled={!hubstudioCode.trim()}><Check />保存并使用Hubstudio</button>
+              <button className="wide-secondary" onClick={() => void setMexcBrowser('HUBSTUDIO')} disabled={!hubstudioCode.trim()}><Check />保存并使用Hubstudio</button></>}
               <button className="wide-secondary" onClick={() => void openMexc()}><ExternalLink />打开{snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? 'Hubstudio环境' : '内嵌MEXC窗口'}</button>
               <button className="wide-secondary" onClick={() => void refreshMexcAccount()} disabled={!mexcStatus?.open || busy}><RefreshCw />读取账户与委托状态（不下单）</button>
-              <p>{snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? '每次启动ArbDesk时最多自动打开一次；用户关闭后不会反复拉起，需要点击上方按钮重新打开。' : '每次启动时最多自动打开一次内嵌窗口；关闭后由用户手动重新打开，登录Cookie独立持久保存。'}应用不读取或保存登录密码。</p>
+              <p>{snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? '行情固定并行扫描BTC 5m/15m，不依赖当前详情页；执行时自动切换到所选周期和轮次。每次启动最多自动打开一次，关闭后需手动重新打开。' : '每次启动时最多自动打开一次内嵌窗口；关闭后由用户手动重新打开，登录Cookie独立持久保存。'}应用不读取或保存登录密码。</p>
+              {(mexcStatus?.message || mexcStatus?.account || mexcStatus?.lastOrderCapture) && <details className="credential-help diagnostics-details">
+                <summary>连接与账户诊断</summary><div>
               {mexcStatus?.message && <div className="browser-status-detail"><span>{mexcStatus.mode === 'HUBSTUDIO' ? 'HUB' : '内嵌'}</span><p>{mexcStatus.message}{mexcStatus.debuggingPort ? ` · CDP ${mexcStatus.debuggingPort}` : ''}</p></div>}
               {mexcStatus?.account && <div className="browser-status-detail"><span>账户</span><p>
                 可用 {mexcStatus.account.availableUsdt ?? '—'} USDT · 持仓 {mexcStatus.account.positionCount} · 活动委托 {mexcStatus.account.openOrderCount} · 历史 {mexcStatus.account.historyCount}<br />
@@ -604,9 +891,13 @@ function App(): JSX.Element {
                 {mexcStatus.lastOrderCapture.method} {mexcStatus.lastOrderCapture.endpoint} · 请求字段 {mexcStatus.lastOrderCapture.requestFields.length} · 响应字段 {mexcStatus.lastOrderCapture.responseFields.length}<br />
                 {mexcStatus.lastOrderCapture.message}
               </p></div>}
-            </section>
-            <section className="settings-section">
-              <h3>网页元素校准</h3>
+                </div>
+              </details>}
+              </div>
+            </details>
+            <details className="settings-module">
+              <summary><div><strong>网页控制</strong><span>{snapshot.settings.mexcElementMode === 'AUTO' ? '自动识别' : `${Object.values(mexcStatus?.calibrated ?? {}).filter(Boolean).length}/4已校准`}</span><small>自动定位下单元素；页面变化时可改为手动校准</small></div><ChevronRight /></summary>
+              <div className="settings-module-body">
               <div className="segmented-control browser-mode-control">
                 <button className={snapshot.settings.mexcElementMode === 'AUTO' ? 'active' : ''} onClick={() => void setMexcElementMode('AUTO')}><Bot />系统自动识别</button>
                 <button className={snapshot.settings.mexcElementMode === 'MANUAL' ? 'active' : ''} onClick={() => void setMexcElementMode('MANUAL')}><SlidersHorizontal />手动校准</button>
@@ -620,9 +911,11 @@ function App(): JSX.Element {
                   return <button key={kind} onClick={() => void calibrate(kind)} disabled={busy}><span>{index + 1}</span><strong>{CALIBRATION_LABELS[kind]}</strong>{calibrated ? <Check className="check-icon" /> : <ChevronRight />}</button>
                 })}
               </div>}
-            </section>
-            <section className="settings-section credential-section">
-              <div className="settings-title-row"><h3>Polymarket 网络</h3><span className={snapshot.connection.polymarket === 'CONNECTED' ? 'ready-text' : ''}>{snapshot.connection.polymarket === 'CONNECTED' ? '公共盘口在线' : '未连接'}</span></div>
+              </div>
+            </details>
+            <details className="settings-module credential-section">
+              <summary><div><strong>Polymarket网络</strong><span className={snapshot.connection.polymarket === 'CONNECTED' ? 'ready-text' : ''}>{snapshot.connection.polymarket === 'CONNECTED' ? '公共盘口在线' : '未连接'}</span><small>公开行情连接和独立代理设置</small></div><ChevronRight /></summary>
+              <div className="settings-module-body">
               <p>独立测试 Gamma 与 CLOB 公共接口，不依赖MEXC窗口或当前是否有BTC市场；不改变Hubstudio的代理。</p>
               <label className="settings-field" htmlFor="poly-proxy-url">HTTP/HTTPS 代理地址
                 <input id="poly-proxy-url" value={polymarketProxyUrl} onChange={(event) => setPolymarketProxyUrl(event.target.value)} placeholder="留空为直连，例如 http://127.0.0.1:7890" spellCheck={false} autoComplete="off" />
@@ -630,9 +923,11 @@ function App(): JSX.Element {
               <button className="wide-secondary" onClick={() => void saveAndTestPolymarketProxy()} disabled={busy}><Network />保存并测试公开行情</button>
               <div className="browser-status-detail"><span>NET</span><p>{snapshot.connectionDetails.polymarket}</p></div>
               <div className="browser-status-detail"><span>价格源</span><p>当前套利判断直接比较MEXC与Polymarket官方盘口，不需要Chainlink密钥。Chainlink只适合以后作为结算参考价和偏差预警，不作为下单前置条件。</p></div>
-            </section>
-            <section className="settings-section credential-section">
-              <div className="settings-title-row"><h3>Polymarket 交易身份</h3><span className={polymarketCredentials?.configured ? 'ready-text' : ''}>{polymarketCredentials?.configured ? '已加密配置' : '未配置'}</span></div>
+              </div>
+            </details>
+            <details className="settings-module credential-section">
+              <summary><div><strong>Polymarket交易身份</strong><span className={polymarketCredentials?.configured ? 'ready-text' : ''}>{polymarketCredentials?.configured ? '已加密配置' : '未配置'}</span><small>仅用于真实下单的账户签名和身份验证</small></div><ChevronRight /></summary>
+              <div className="settings-module-body">
               <p>公开行情无需这些信息。以下凭据仅用于真实下单，秘密字段经系统安全存储加密，之后不会回显。</p>
               <div className="credential-route-card">
                 <strong>当前可直接配置：Magic邮箱账户或专用EOA</strong>
@@ -690,8 +985,10 @@ function App(): JSX.Element {
               <button className="wide-secondary" onClick={() => void validatePolymarketIdentity()} disabled={busy || !polymarketCredentials?.configured}><ShieldAlert />验证交易身份（不下单）</button>
               {polymarketCredentials?.message && <div className="browser-status-detail"><span>POLY</span><p>{polymarketCredentials.message}{polymarketCredentials.signerAddress ? ` · Signer ${polymarketCredentials.signerAddress.slice(0, 6)}…${polymarketCredentials.signerAddress.slice(-4)}` : ''}</p></div>}
               {polyValidation && <div className="browser-status-detail"><span>{polyValidation.ok ? 'PASS' : 'CHECK'}</span><p>{polyValidation.message} · 余额 ${polyValidation.collateralBalance} · 授权 {polyValidation.allowanceCount} · 活动委托 {polyValidation.openOrderCount} · 最近成交 {polyValidation.recentTradeCount}{polyValidation.suggestedSignatureType !== undefined ? ` · 已切换建议类型 ${polyValidation.suggestedSignatureType}（尚未保存）` : ''}{polyValidation.closedOnly ? ' · 账户仅可平仓' : ''}</p></div>}
-            </section>
-            <section className="settings-section danger-zone">
+              </div>
+            </details>
+            </>}
+            {settingsView === 'LIVE' && <section className="settings-section danger-zone settings-subpage-section">
               <div><ShieldAlert /><div><h3>一次性最小实盘联调</h3><p>绕过一次净收益与结算信号门槛；通常不超过5 USDT。若最小可成交份额需要更多本金，会按实时最小本金放宽，绝对上限12 USDT，使用后自动关闭。</p></div></div>
               <button className={`automation-toggle ${snapshot.settings.allowUnprofitableTestTrade ? 'enabled' : ''}`} onClick={() => void toggleUnprofitableTestTrade()}>
                 {snapshot.settings.allowUnprofitableTestTrade ? <Check /> : <LockKeyhole />}
@@ -707,7 +1004,7 @@ function App(): JSX.Element {
                 {snapshot.settings.polymarketLiveEnabled ? <Check /> : <LockKeyhole />}
                 {snapshot.settings.polymarketLiveEnabled ? '真实对冲已启用 · 点击关闭' : '验证后启用真实对冲'}
               </button>
-            </section>
+            </section>}
           </aside>
         </div>
       )}
@@ -718,11 +1015,144 @@ function App(): JSX.Element {
 }
 
 function Direction({ direction }: { direction: Direction }): JSX.Element {
-  return <span className={`direction ${direction.toLowerCase()}`}>{direction === 'UP' ? <ArrowUp aria-hidden="true" /> : <ArrowDown aria-hidden="true" />}{directionLabel(direction)}</span>
+  const label = directionLabel(direction)
+  return <span className={`direction ${direction.toLowerCase()}`} aria-label={label} title={label}>{direction === 'UP' ? <ArrowUp aria-hidden="true" /> : <ArrowDown aria-hidden="true" />}</span>
 }
 
-function Row({ label, value, emphasized, positive }: { label: string; value: string; emphasized?: boolean; positive?: boolean }): JSX.Element {
+function SignalValue({ direction, distanceBps }: { direction: Direction; distanceBps?: string }): JSX.Element {
+  return <span className="signal-value"><Direction direction={direction} />{distanceBps && <span>{Number(distanceBps) >= 0 ? '+' : ''}{money(distanceBps, 2)} bps</span>}</span>
+}
+
+function Row({ label, value, emphasized, positive }: { label: string; value: ReactNode; emphasized?: boolean; positive?: boolean }): JSX.Element {
   return <div className={`breakdown-row ${emphasized ? 'emphasized' : ''} ${positive ? 'positive' : ''}`}><span>{label}</span><strong>{value}</strong></div>
+}
+
+function FormulaHelp({ compact = false, inline = false }: { compact?: boolean; inline?: boolean }): JSX.Element {
+  return (
+    <details className={`formula-help ${compact ? 'compact' : ''} ${inline ? 'inline' : ''}`}>
+      <summary aria-label="查看费用、利润和动态安全距离计算方式"><Info aria-hidden="true" />计算方式</summary>
+      <div className="formula-popover">
+        <strong>费用与收益</strong>
+        <p>MEXC手续费/份 = MEXC价格 × 账户最近买入实际费率</p>
+        <p>Polymarket手续费/份 = r × [价格 × (1 − 价格)]<sup>e</sup></p>
+        <p>总成本/份 = MEXC价格 + Polymarket价格 + 两边手续费 + 风险缓冲</p>
+        <p>条件利润 = 份额 × (1 − 总成本/份)</p>
+        <p>条件收益率 = 条件利润 ÷ 预计占用本金 × 100%</p>
+        <p>最坏亏损率 = 两边同时输损失 ÷ 预计占用本金 × 100%</p>
+        <strong>动态安全距离</strong>
+        <p>单边bps = |实时价 − 基准价| ÷ 基准价 × 10,000；实际距离取两边较小值。</p>
+        <p>插值bps = 低节点bps + (高节点bps − 低节点bps) × (剩余秒数 − 低节点秒数) ÷ (高节点秒数 − 低节点秒数)。</p>
+        <p>实际距离须不低于插值结果。默认120秒=2bps、20秒=0.5bps；计算结果是条件场景，不代表保证盈利。</p>
+      </div>
+    </details>
+  )
+}
+
+function HistoryModal({
+  orders,
+  busy,
+  onDismiss,
+  onCloseOrder
+}: {
+  orders: ArbitrageOrderRecord[]
+  busy: boolean
+  onDismiss: () => void
+  onCloseOrder: (order: ArbitrageOrderRecord, target: CloseTarget) => void
+}): JSX.Element {
+  const statusLabels: Record<ArbitrageOrderRecord['status'], string> = {
+    OPENING: '开仓中', OPEN: '双腿持仓', UNHEDGED: '单腿敞口', CLOSED: '已平仓',
+    RECOVERY_REQUIRED: '需要恢复', CANCELLED: '已取消'
+  }
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onDismiss()}>
+      <section className="history-modal" role="dialog" aria-modal="true" aria-labelledby="history-title">
+        <div className="modal-heading history-heading">
+          <div><span className="eyebrow">ORDER GROUPS</span><h2 id="history-title">套利订单与持仓</h2></div>
+          <button className="icon-button" onClick={onDismiss} aria-label="关闭历史订单"><X /></button>
+        </div>
+        <div className="history-list">
+          {orders.length === 0 ? <div className="empty-state">升级后尚无ArbDesk套利订单。</div> : orders.map((order) => {
+            const mexcOpen = Number(order.mexc.openQuantity) > 0
+            const polymarketOpen = Number(order.polymarket.openQuantity) > 0
+            const closeable = Date.now() < order.endTime && order.status !== 'CLOSED' && order.status !== 'CANCELLED'
+            return (
+              <article className={`history-order ${order.status.toLowerCase()}`} key={order.id}>
+                <div className="history-order-head">
+                  <div><strong>BTC/USD · {order.durationMinutes}m</strong><span>{new Date(order.createdAt).toLocaleString('zh-CN', { hour12: false })}</span></div>
+                  <span className="order-status">{statusLabels[order.status]}</span>
+                </div>
+                <div className="history-legs">
+                  <div><span className="history-venue">MEXC <Direction direction={order.mexc.direction} /></span><strong>{order.mexc.entryFill ? `${order.mexc.entryFill.quantity}份 @ ${money(order.mexc.entryFill.averagePrice, 4)}` : '未成交'}</strong>{order.mexc.closeFills.at(-1) && <small>最近卖出 @ {money(order.mexc.closeFills.at(-1)!.averagePrice, 4)}</small>}<small>剩余 {money(order.mexc.openQuantity, 2)}份</small></div>
+                  <div><span className="history-venue">Polymarket <Direction direction={order.polymarket.direction} /></span><strong>{order.polymarket.entryFill ? `${order.polymarket.entryFill.quantity}份 @ ${money(order.polymarket.entryFill.averagePrice, 4)}` : '未成交'}</strong>{order.polymarket.closeFills.at(-1) && <small>最近卖出 @ {money(order.polymarket.closeFills.at(-1)!.averagePrice, 4)}</small>}<small>剩余 {money(order.polymarket.openQuantity, 2)}份</small></div>
+                  <div><span>预计本金 / 利润</span><strong>${money(order.expectedCapital)} / {Number(order.expectedProfit) >= 0 ? '+' : ''}${money(order.expectedProfit)}</strong><small>{order.mode === 'SIMULATION' ? '模拟' : '实盘记录'}</small></div>
+                </div>
+                {order.closeOperation?.error && <p className="history-error">{order.closeOperation.error}</p>}
+                {closeable && (mexcOpen || polymarketOpen) && <div className="history-actions">
+                  <button onClick={() => onCloseOrder(order, 'MEXC')} disabled={busy || !mexcOpen}>平 MEXC</button>
+                  <button onClick={() => onCloseOrder(order, 'POLYMARKET')} disabled={busy || !polymarketOpen}>平 Polymarket</button>
+                  <button className="close-both-button" onClick={() => onCloseOrder(order, 'BOTH')} disabled={busy || !mexcOpen || !polymarketOpen}>双腿平仓</button>
+                </div>}
+              </article>
+            )
+          })}
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function LogsModal({ events, onDismiss }: { events: AppSnapshot['recentEvents']; onDismiss: () => void }): JSX.Element {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onDismiss()}>
+      <section className="history-modal logs-modal" role="dialog" aria-modal="true" aria-labelledby="logs-title">
+        <div className="modal-heading history-heading"><div><span className="eyebrow">EXECUTION AUDIT</span><h2 id="logs-title">本地执行日志</h2></div><button className="icon-button" onClick={onDismiss} aria-label="关闭日志"><X /></button></div>
+        <div className="event-list expanded">
+          {events.length === 0 ? <div className="empty-state">尚无执行记录。</div> : events.map((event) => (
+            <div className="event-row" key={event.id}>
+              <span className={`event-marker ${['HEDGED', 'CLOSED'].includes(event.state) ? 'ok' : event.state === 'RECOVERY_REQUIRED' ? 'danger' : ''}`} />
+              <time>{new Date(event.timestamp).toLocaleString('zh-CN', { hour12: false })}</time>
+              <strong>{STATE_LABELS[event.state]}</strong>
+              <p title={event.message}>{event.message}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function CloseConfirmModal({
+  intent,
+  busy,
+  onDismiss,
+  onConfirm
+}: {
+  intent: { order: ArbitrageOrderRecord; target: CloseTarget }
+  busy: boolean
+  onDismiss: () => void
+  onConfirm: () => void
+}): JSX.Element {
+  const targetLabel = intent.target === 'BOTH' ? 'MEXC与Polymarket双腿' : intent.target
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="modal close-confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="close-title">
+        <div className="modal-heading"><div><span className="eyebrow">POSITION CLOSE</span><h2 id="close-title">确认中途平仓</h2></div></div>
+        <div className="modal-warning"><ShieldAlert aria-hidden="true" /><span>
+          将平掉{targetLabel}。{intent.target === 'BOTH'
+            ? '系统会先自动卖出MEXC并回读实际成交，再按该数量提交Polymarket SELL FOK；两腿不能原子同时成交。'
+            : '这是单腿平仓，会留下方向性敞口，价格继续波动可能扩大损失。'}
+        </span></div>
+        <div className="close-summary">
+          <span>MEXC剩余 <strong>{money(intent.order.mexc.openQuantity, 2)}份</strong></span>
+          <span>Polymarket剩余 <strong>{money(intent.order.polymarket.openQuantity, 2)}份</strong></span>
+        </div>
+        <div className="modal-actions">
+          <button className="secondary-button" onClick={onDismiss} disabled={busy}>取消</button>
+          <button className="danger-confirm-button" onClick={onConfirm} disabled={busy}>{busy ? <LoaderCircle className="spin" /> : <ShieldAlert />}确认平仓</button>
+        </div>
+      </section>
+    </div>
+  )
 }
 
 function ExecutionBar({ state, quantity, error }: { state: ExecutionState; quantity: string; error?: string }): JSX.Element {
