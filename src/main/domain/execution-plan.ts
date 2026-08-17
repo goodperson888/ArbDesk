@@ -20,6 +20,7 @@ interface ExecutionPlanInput {
   polymarketBalance?: string
   requireBalances?: boolean
   accountDataAgeMs?: number
+  balanceUsageRatio?: string
 }
 
 interface BookFill {
@@ -40,6 +41,7 @@ interface EvaluatedQuantity {
   profit: Decimal
   netEdge: Decimal
   conditionalReturn: Decimal
+  affordabilityFailures: string[]
   failures: string[]
 }
 
@@ -114,6 +116,9 @@ export function calculateDepthExecutionPlan(input: ExecutionPlanInput): Executio
   const minReturn = new Decimal(input.minConditionalReturnPct || 0)
   const mexcBalance = input.mexcBalance === undefined ? undefined : new Decimal(input.mexcBalance || 0)
   const polymarketBalance = input.polymarketBalance === undefined ? undefined : new Decimal(input.polymarketBalance || 0)
+  const balanceUsageRatio = Decimal.min(1, Decimal.max(0, new Decimal(input.balanceUsageRatio ?? '0.99')))
+  const usableMexcBalance = mexcBalance?.mul(balanceUsageRatio)
+  const usablePolymarketBalance = polymarketBalance?.mul(balanceUsageRatio)
 
   const evaluate = (quantity: Decimal): EvaluatedQuantity | undefined => {
     const mexc = fillBook(mexcLevels, quantity)
@@ -124,29 +129,38 @@ export function calculateDepthExecutionPlan(input: ExecutionPlanInput): Executio
     const profit = quantity.minus(capital)
     const netEdge = profit.div(quantity)
     const conditionalReturn = capital.gt(0) ? profit.div(capital).mul(100) : new Decimal(0)
-    const failures: string[] = []
-    if (capital.gt(maxCapital)) failures.push('单笔本金上限')
-    if (netEdge.lt(minNetEdge)) failures.push('最低净边际')
-    if (conditionalReturn.lt(minReturn)) failures.push('最低条件收益率')
-    if (input.requireBalances && mexcBalance === undefined) failures.push('MEXC余额待刷新')
-    if (input.requireBalances && polymarketBalance === undefined) failures.push('Polymarket余额待刷新')
-    if (mexcBalance !== undefined && mexc.cost.add(mexcFee).gt(mexcBalance)) failures.push('MEXC可用余额')
-    if (polymarketBalance !== undefined && polymarket.cost.add(polymarket.polymarketFee).gt(polymarketBalance)) failures.push('Polymarket可用余额')
-    return { quantity, mexc, polymarket, mexcFee, capital, profit, netEdge, conditionalReturn, failures }
+    const affordabilityFailures: string[] = []
+    const thresholdFailures: string[] = []
+    if (capital.gt(maxCapital)) affordabilityFailures.push('单笔本金上限')
+    if (input.requireBalances && usableMexcBalance === undefined) affordabilityFailures.push('MEXC余额待刷新')
+    if (input.requireBalances && usablePolymarketBalance === undefined) affordabilityFailures.push('Polymarket余额待刷新')
+    if (usableMexcBalance !== undefined && mexc.cost.add(mexcFee).gt(usableMexcBalance)) affordabilityFailures.push('MEXC可用余额')
+    if (usablePolymarketBalance !== undefined && polymarket.cost.add(polymarket.polymarketFee).gt(usablePolymarketBalance)) affordabilityFailures.push('Polymarket可用余额')
+    if (netEdge.lt(minNetEdge)) thresholdFailures.push('最低净边际')
+    if (conditionalReturn.lt(minReturn)) thresholdFailures.push('最低条件收益率')
+    return {
+      quantity, mexc, polymarket, mexcFee, capital, profit, netEdge, conditionalReturn,
+      affordabilityFailures,
+      failures: [...thresholdFailures, ...affordabilityFailures]
+    }
   }
 
   const maximumCents = marketDepth.isFinite() && marketDepth.gt(0)
     ? Math.max(0, Math.floor(marketDepth.mul(100).toNumber()))
     : 0
-  let low = 0
-  let high = maximumCents
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2)
-    const evaluated = evaluate(new Decimal(middle).div(100))
-    if (evaluated && evaluated.failures.length === 0) low = middle
-    else high = middle - 1
+  const findMaximum = (isAllowed: (evaluated: EvaluatedQuantity) => boolean): Decimal => {
+    let low = 0
+    let high = maximumCents
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2)
+      const evaluated = evaluate(new Decimal(middle).div(100))
+      if (evaluated && isAllowed(evaluated)) low = middle
+      else high = middle - 1
+    }
+    return new Decimal(low).div(100)
   }
-  const maximumQuantity = new Decimal(low).div(100)
+  const maximumAffordableQuantity = findMaximum((evaluated) => evaluated.affordabilityFailures.length === 0)
+  const maximumQuantity = findMaximum((evaluated) => evaluated.failures.length === 0)
   const requested = input.quantity !== undefined
     ? new Decimal(input.quantity || 0).toDecimalPlaces(2, Decimal.ROUND_FLOOR)
     : maximumQuantity
@@ -155,6 +169,12 @@ export function calculateDepthExecutionPlan(input: ExecutionPlanInput): Executio
   const nextEvaluated = maximumQuantity.lt(marketDepth)
     ? evaluate(maximumQuantity.add('0.01'))
     : undefined
+  const nextAffordableEvaluated = maximumAffordableQuantity.lt(marketDepth)
+    ? evaluate(maximumAffordableQuantity.add('0.01'))
+    : undefined
+  const affordableLimitingFactors = nextAffordableEvaluated?.affordabilityFailures.length
+    ? [...new Set(nextAffordableEvaluated.affordabilityFailures)]
+    : maximumAffordableQuantity.gte(marketDepth) && marketDepth.gt(0) ? ['盘口深度'] : []
   const limitingFactors = nextEvaluated?.failures.length
     ? [...new Set(nextEvaluated.failures)]
     : maximumQuantity.gte(marketDepth) && marketDepth.gt(0) ? ['盘口深度'] : []
@@ -166,6 +186,7 @@ export function calculateDepthExecutionPlan(input: ExecutionPlanInput): Executio
     opportunityId: input.opportunityId,
     requestedQuantity: requested.isFinite() ? requested.toFixed(2) : '0.00',
     minimumQuantity: minimumQuantity.isFinite() ? minimumQuantity.toFixed(2) : '0.00',
+    maxAffordableQuantity: maximumAffordableQuantity.toFixed(2),
     maxExecutableQuantity: maximumQuantity.toFixed(2),
     bestLevelQuantity: bestLevelQuantity.toFixed(2),
     marketDepthQuantity: marketDepth.toFixed(2),
@@ -182,7 +203,9 @@ export function calculateDepthExecutionPlan(input: ExecutionPlanInput): Executio
     conditionalReturnPct: values?.conditionalReturn.toFixed(2) ?? '0.00',
     mexcLevelsUsed: values?.mexc.levelsUsed ?? 0,
     polymarketLevelsUsed: values?.polymarket.levelsUsed ?? 0,
+    affordableLimitingFactors,
     limitingFactors,
+    accountBalanceReservePct: new Decimal(1).minus(balanceUsageRatio).mul(100).toFixed(2),
     executable: Boolean(evaluated && failures.length === 0 && requested.gt(0)),
     blockReason: failures.length > 0 ? failures.join('、') : undefined,
     accountDataAgeMs: input.accountDataAgeMs

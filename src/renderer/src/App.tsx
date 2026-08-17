@@ -399,7 +399,11 @@ function App(): JSX.Element {
   const executionChecks: ExecutionCheck[] = selected && snapshot ? [
     { passed: Number(quantity) > 0, label: `输入份额 ${Number(quantity || 0).toFixed(2)} > 0` },
     { passed: Number(quantity) >= minimumAlignedQuantity, label: `最小对齐 ${Number(quantity || 0).toFixed(2)} ≥ ${minimumAlignedQuantity.toFixed(2)}份` },
-    { passed: Number(quantity) <= Number(currentPlan?.maxExecutableQuantity ?? selected.maxQuantity), label: `深度可执行量 输入${Number(quantity || 0).toFixed(2)} ≤ ${currentPlan?.maxExecutableQuantity ?? selected.maxQuantity}份${currentPlan ? `（MEXC ${currentPlan.mexcLevelsUsed}档 / Poly ${currentPlan.polymarketLevelsUsed}档）` : ''}` },
+    ...(currentPlan ? [{
+      passed: Number(quantity) <= Number(currentPlan.maxAffordableQuantity),
+      label: `账户可支付 输入${Number(quantity || 0).toFixed(2)} ≤ ${currentPlan.maxAffordableQuantity}份（余额预留${currentPlan.accountBalanceReservePct}%）`
+    }] : []),
+    { passed: Number(quantity) <= Number(currentPlan?.maxExecutableQuantity ?? selected.maxQuantity), label: `收益可执行上限 输入${Number(quantity || 0).toFixed(2)} ≤ ${currentPlan?.maxExecutableQuantity ?? selected.maxQuantity}份${currentPlan ? `（MEXC ${currentPlan.mexcLevelsUsed}档 / Poly ${currentPlan.polymarketLevelsUsed}档）` : ''}` },
     { passed: requestedCapital <= Number(snapshot.settings.maxCapitalPerTrade), label: `预计本金 $${requestedCapital.toFixed(2)} ≤ $${Number(snapshot.settings.maxCapitalPerTrade).toFixed(2)}` },
     { passed: netEdgePassed || testOverrideReady, label: `滑点后净边际 ${money(effectiveNetEdge, 4)} ≥ ${money(snapshot.settings.minNetEdgePerShare, 4)}美元/份${!netEdgePassed && testOverrideReady ? '（小额联调豁免）' : ''}` },
     { passed: conditionalReturnPassed || testOverrideReady, label: `滑点后条件收益率 ${money(effectiveConditionalReturn, 2)}% ≥ ${money(snapshot.settings.minConditionalReturnPct, 2)}%${!conditionalReturnPassed && testOverrideReady ? '（小额联调豁免）' : ''}` },
@@ -766,19 +770,37 @@ function App(): JSX.Element {
 
   async function setMaximumQuantity(): Promise<void> {
     if (!snapshot || !selected) return
-    const plan = await run(() => window.arbApp.calculateExecutionPlan({
-      opportunityId: selected.id,
-      useMaximum: true,
-      refreshStaleAccounts: snapshot.settings.mode === 'ASSISTED'
-    }))
-    if (!plan) return
-    setExecutionPlan(plan)
-    if (!(Number(plan.maxExecutableQuantity) >= Number(plan.minimumQuantity))) {
-      setMessage(`当前不足最小对齐份额${plan.minimumQuantity}份：${plan.blockReason ?? plan.limitingFactors.join('、')}`)
+    const result = await run(async () => {
+      const maximumPlan = await window.arbApp.calculateExecutionPlan({
+        opportunityId: selected.id,
+        useMaximum: true,
+        refreshStaleAccounts: snapshot.settings.mode === 'ASSISTED'
+      })
+      if (Number(maximumPlan.maxExecutableQuantity) >= Number(maximumPlan.minimumQuantity)) {
+        return { kind: 'EXECUTABLE' as const, plan: maximumPlan, quantity: maximumPlan.maxExecutableQuantity }
+      }
+      if (Number(maximumPlan.maxAffordableQuantity) >= Number(maximumPlan.minimumQuantity)) {
+        const affordablePlan = await window.arbApp.calculateExecutionPlan({
+          opportunityId: selected.id,
+          quantity: maximumPlan.maxAffordableQuantity,
+          refreshStaleAccounts: false
+        })
+        return { kind: 'AFFORDABLE' as const, plan: affordablePlan, quantity: maximumPlan.maxAffordableQuantity }
+      }
+      return { kind: 'BELOW_MINIMUM' as const, plan: maximumPlan }
+    })
+    if (!result) return
+    setExecutionPlan(result.plan)
+    if (result.kind === 'BELOW_MINIMUM') {
+      setMessage(`账户、单笔本金和盘口最多支持${result.plan.maxAffordableQuantity}份，低于平台最小对齐${result.plan.minimumQuantity}份；限制：${result.plan.affordableLimitingFactors.join('、') || '盘口深度'}`)
       return
     }
-    setQuantity(plan.maxExecutableQuantity)
-    setMessage(`最大${plan.maxExecutableQuantity}份 · MEXC ${plan.mexcLevelsUsed}档 / Poly ${plan.polymarketLevelsUsed}档 · 滑点后收益率${plan.conditionalReturnPct}% · 限制：${plan.limitingFactors.join('、') || '盘口'}`)
+    setQuantity(result.quantity)
+    if (result.kind === 'AFFORDABLE') {
+      setMessage(`已按账户可支付上限调整为${result.quantity}份（余额预留${result.plan.accountBalanceReservePct}%）；当前仍不可执行：${result.plan.blockReason ?? result.plan.limitingFactors.join('、')}`)
+      return
+    }
+    setMessage(`最大可执行${result.quantity}份 · 账户可付${result.plan.maxAffordableQuantity}份 · MEXC ${result.plan.mexcLevelsUsed}档 / Poly ${result.plan.polymarketLevelsUsed}档 · 滑点后收益率${result.plan.conditionalReturnPct}%`)
   }
 
   async function confirmCloseOrder(): Promise<void> {
@@ -864,7 +886,7 @@ function App(): JSX.Element {
             <div className="table-wrap">
               <table>
                 <thead>
-                  <tr><th>周期</th><th>MEXC</th><th>Polymarket</th><th>全部成本</th><th>净边际</th><th>可执行量</th><th>剩余</th></tr>
+                  <tr><th>周期</th><th>MEXC</th><th>Polymarket</th><th>全部成本</th><th>净边际</th><th title="两边盘口深度允许的对齐数量，不含账户余额和收益门槛">盘口量</th><th>剩余</th></tr>
                 </thead>
                 <tbody>
                   {snapshot.opportunities.length === 0 && (
@@ -923,6 +945,10 @@ function App(): JSX.Element {
                 <ExecutionConditionsHelp checks={executionChecks} />
               </div>
               {snapshot.settings.autoOpenEnabled && <div className={`browser-status-detail auto-open-status ${snapshot.autoOpenState.status.toLowerCase()}`} role="status" aria-live="polite"><span>AUTO</span><p>{snapshot.autoOpenState.message}</p></div>}
+              {currentPlan && <div className="capacity-summary" title={`账户余额计算已预留${currentPlan.accountBalanceReservePct}%安全垫`}>
+                <span title={`限制：${currentPlan.affordableLimitingFactors.join('、') || '盘口深度'}`}>{snapshot.settings.mode === 'ASSISTED' ? '账户可付' : '本金可用'} <strong>{currentPlan.maxAffordableQuantity}</strong>份</span>
+                <span title={`限制：${currentPlan.limitingFactors.join('、') || '盘口深度'}`}>收益可执行 <strong>{currentPlan.maxExecutableQuantity}</strong>份</span>
+              </div>}
               {!canExecute && executeBlockReason && <p className="execution-note"><AlertTriangle aria-hidden="true" />禁用原因：{executeBlockReason}</p>}
 
               {(selected.feeVerificationBlocked || selected.settlementRiskBlocked || selected.stale || Number(selected.netEdgePerShare) < Number(snapshot.settings.minNetEdgePerShare)) && selected.riskFlags.length > 0 && (

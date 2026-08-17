@@ -761,7 +761,8 @@ export class AppController {
       mexcBalance: this.settings.mode === 'ASSISTED' ? mexcAccount?.availableUsdt : undefined,
       polymarketBalance: this.settings.mode === 'ASSISTED' ? polymarketCapacity?.collateralBalance : undefined,
       requireBalances,
-      accountDataAgeMs
+      accountDataAgeMs,
+      balanceUsageRatio: '0.99'
     })
     if (this.settings.mode === 'ASSISTED' && polymarketCapacity?.closedOnly) {
       return { ...plan, executable: false, blockReason: 'Polymarket账户当前仅允许平仓' }

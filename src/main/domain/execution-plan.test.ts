@@ -37,6 +37,7 @@ describe('depth execution plan', () => {
 
     expect(Number(plan.maxExecutableQuantity)).toBeLessThan(6)
     expect(plan.limitingFactors).toContain('MEXC可用余额')
+    expect(plan.affordableLimitingFactors).toContain('MEXC可用余额')
   })
 
   it('rejects deeper liquidity when slippage makes the configured return impossible', () => {
@@ -47,5 +48,26 @@ describe('depth execution plan', () => {
 
     expect(Number(plan.maxExecutableQuantity)).toBeLessThan(Number(plan.marketDepthQuantity))
     expect(plan.limitingFactors).toContain('最低条件收益率')
+  })
+
+  it('separates what the accounts can afford from what the profit rules allow', () => {
+    const plan = calculateDepthExecutionPlan({
+      ...base,
+      mexcLevels: [{ price: '0.99', size: '100' }],
+      polymarketLevels: [{ price: '0.01', size: '100' }],
+      mexcBalance: '48',
+      polymarketBalance: '126',
+      requireBalances: true,
+      minNetEdgePerShare: '0.01',
+      maxHedgeSlippage: '0.06',
+      balanceUsageRatio: '0.99'
+    })
+
+    expect(plan.minimumQuantity).toBe('14.29')
+    expect(plan.maxAffordableQuantity).toBe('47.29')
+    expect(plan.maxExecutableQuantity).toBe('0.00')
+    expect(plan.accountBalanceReservePct).toBe('1.00')
+    expect(plan.affordableLimitingFactors).toEqual(['MEXC可用余额'])
+    expect(plan.limitingFactors).toEqual(expect.arrayContaining(['最低净边际', '最低条件收益率']))
   })
 })

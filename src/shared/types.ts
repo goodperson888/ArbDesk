@@ -199,6 +199,7 @@ export interface ExecutionPlan {
   opportunityId: string
   requestedQuantity: string
   minimumQuantity: string
+  maxAffordableQuantity: string
   maxExecutableQuantity: string
   bestLevelQuantity: string
   marketDepthQuantity: string
@@ -215,7 +216,9 @@ export interface ExecutionPlan {
   conditionalReturnPct: string
   mexcLevelsUsed: number
   polymarketLevelsUsed: number
+  affordableLimitingFactors: string[]
   limitingFactors: string[]
+  accountBalanceReservePct: string
   executable: boolean
   blockReason?: string
   accountDataAgeMs?: number
