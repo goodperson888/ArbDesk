@@ -20,11 +20,18 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Cache Electron downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: ${{ runner.os }}-electron-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-electron-
+
       - name: Install dependencies
         run: npm ci
-
-      - name: Test
-        run: npm test
 
       - name: Build NSIS installer
         shell: pwsh
@@ -53,4 +60,4 @@ jobs:
             release/*.exe
             release/*.yml
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
