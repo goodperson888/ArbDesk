@@ -21,7 +21,11 @@ function normalizeTimestamp(timestamp: number): number {
   return timestamp > 0 && timestamp < 10_000_000_000 ? timestamp * 1_000 : timestamp
 }
 
-export function deriveMexcFeeRate(rows: MexcAssetLogRow[], now = Date.now()): MexcFeeCalibration {
+export function deriveMexcFeeRate(
+  rows: MexcAssetLogRow[],
+  now = Date.now(),
+  allowUnpairedBuyAsZero = true
+): MexcFeeCalibration {
   const grouped = new Map<string, Array<{ amount: number; businessType: number; timestamp: number }>>()
   for (const row of rows) {
     const timestamp = normalizeTimestamp(Number(row.tt))
@@ -44,6 +48,7 @@ export function deriveMexcFeeRate(rows: MexcAssetLogRow[], now = Date.now()): Me
     // genuine zero-fee sample rather than a reason to inject a guessed fallback.
     const trade = group.find((row) => row.businessType === 107)
     if (!trade || trade.amount === 0 || now - trade.timestamp > MAX_SAMPLE_AGE_MS || trade.timestamp > now + 60_000) continue
+    if (!fee && !allowUnpairedBuyAsZero) continue
     const ratio = fee ? Math.abs(fee.amount / trade.amount) : 0
     if (ratio >= 0 && ratio < 0.1) samples.push({ ratio, timestamp: trade.timestamp })
   }
@@ -60,9 +65,10 @@ export function updateMexcFeeCalibrationCache(
   current: CachedMexcFeeCalibration | undefined,
   rows: MexcAssetLogRow[],
   receivedAt: number,
-  validForMs: number
+  validForMs: number,
+  allowUnpairedBuyAsZero = true
 ): CachedMexcFeeCalibration {
-  const next = { ...deriveMexcFeeRate(rows, receivedAt), receivedAt }
+  const next = { ...deriveMexcFeeRate(rows, receivedAt, allowUnpairedBuyAsZero), receivedAt }
   if (next.source === 'HISTORY') return next
   if (current?.source === 'HISTORY' && receivedAt - current.receivedAt < validForMs) return current
   return next

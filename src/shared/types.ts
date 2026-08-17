@@ -189,6 +189,50 @@ export interface RiskSettings {
   mexcAutomationEnabled: boolean
   polymarketLiveEnabled: boolean
   allowUnprofitableTestTrade: boolean
+  autoOpenEnabled: boolean
+  autoOpenQuantityMode: 'FIXED' | 'MAX_PERCENT'
+  autoOpenFixedQuantity: string
+  autoOpenMaxQuantityPct: number
+}
+
+export interface ExecutionPlan {
+  opportunityId: string
+  requestedQuantity: string
+  minimumQuantity: string
+  maxExecutableQuantity: string
+  bestLevelQuantity: string
+  marketDepthQuantity: string
+  mexcAveragePrice: string
+  polymarketAveragePrice: string
+  polymarketMaximumPrice: string
+  mexcSpend: string
+  polymarketSpend: string
+  mexcFee: string
+  polymarketFee: string
+  capitalRequired: string
+  expectedProfit: string
+  netEdgePerShare: string
+  conditionalReturnPct: string
+  mexcLevelsUsed: number
+  polymarketLevelsUsed: number
+  limitingFactors: string[]
+  executable: boolean
+  blockReason?: string
+  accountDataAgeMs?: number
+}
+
+export interface CalculateExecutionPlanRequest {
+  opportunityId: string
+  quantity?: string
+  useMaximum?: boolean
+  refreshStaleAccounts?: boolean
+}
+
+export interface AutoOpenState {
+  status: 'OFF' | 'MONITORING' | 'STABILIZING' | 'VERIFYING' | 'COOLDOWN' | 'ERROR'
+  message: string
+  opportunityId?: string
+  since: number
 }
 
 export interface AppSnapshot {
@@ -208,6 +252,7 @@ export interface AppSnapshot {
   orderHistory: ArbitrageOrderRecord[]
   activeSession?: ExecutionSession
   recentEvents: ExecutionEvent[]
+  autoOpenState: AutoOpenState
 }
 
 export interface ExecuteRequest {
@@ -320,6 +365,7 @@ export interface ArbAppApi {
   refreshOpportunities(): Promise<AppSnapshot>
   testPolymarketConnection(): Promise<AppSnapshot>
   execute(request: ExecuteRequest): Promise<ExecutionSession>
+  calculateExecutionPlan(request: CalculateExecutionPlanRequest): Promise<ExecutionPlan>
   confirmMexcFill(fill: Pick<Fill, 'quantity' | 'averagePrice' | 'orderId'>): Promise<ExecutionSession>
   cancelExecution(): Promise<ExecutionSession | undefined>
   closeOrder(request: CloseOrderRequest): Promise<ArbitrageOrderRecord>

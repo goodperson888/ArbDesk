@@ -34,6 +34,7 @@ import type {
   CloseTarget,
   Direction,
   ExecutionState,
+  ExecutionPlan,
   MexcBrowserMode,
   MexcBrowserStatus,
   MexcCalibrationKind,
@@ -208,7 +209,10 @@ function App(): JSX.Element {
   const [quoteValidityDraft, setQuoteValidityDraft] = useState('8')
   const [soundEnabledDraft, setSoundEnabledDraft] = useState(true)
   const [soundVolumeDraft, setSoundVolumeDraft] = useState(0.65)
+  const [executionPlan, setExecutionPlan] = useState<ExecutionPlan>()
   const [soundCooldownDraft, setSoundCooldownDraft] = useState('30')
+  const [autoFixedQuantityDraft, setAutoFixedQuantityDraft] = useState('5.00')
+  const [autoMaxQuantityPctDraft, setAutoMaxQuantityPctDraft] = useState('80')
   const previousCanExecuteRef = useRef(false)
   const soundCooldownRef = useRef(new Map<string, number>())
   const manualSelectionUntilRef = useRef(0)
@@ -243,6 +247,8 @@ function App(): JSX.Element {
     setSoundEnabledDraft(snapshot?.settings.opportunitySoundEnabled ?? true)
     setSoundVolumeDraft(snapshot?.settings.opportunitySoundVolume ?? 0.65)
     setSoundCooldownDraft(String(snapshot?.settings.opportunitySoundCooldownSeconds ?? 30))
+    setAutoFixedQuantityDraft(snapshot?.settings.autoOpenFixedQuantity ?? '5.00')
+    setAutoMaxQuantityPctDraft(String(snapshot?.settings.autoOpenMaxQuantityPct ?? 80))
     setSettlementRuleDrafts((snapshot?.settings.settlementDistanceRules ?? defaultSettlementDistanceRules()).map((rule) => ({
       id: rule.id,
       remainingSeconds: String(rule.remainingSeconds),
@@ -280,8 +286,38 @@ function App(): JSX.Element {
       Number(left.mexcDirection === 'DOWN') - Number(right.mexcDirection === 'DOWN')
     )
     : [], [snapshot])
-  const requestedCapital = selected ? Number(selected.allInCostPerShare) * Number(quantity || 0) : 0
-  const requestedProfit = selected ? Number(selected.netEdgePerShare) * Number(quantity || 0) : 0
+
+  useEffect(() => {
+    if (!selected?.id || !(Number(quantity) > 0)) {
+      setExecutionPlan(undefined)
+      return
+    }
+    const timer = window.setTimeout(() => {
+      void window.arbApp.calculateExecutionPlan({
+        opportunityId: selected.id,
+        quantity,
+        refreshStaleAccounts: false
+      }).then(setExecutionPlan).catch(() => undefined)
+    }, 150)
+    return () => window.clearTimeout(timer)
+  }, [
+    quantity,
+    selected?.id,
+    selected?.mexcPrice,
+    selected?.polymarketPrice,
+    selected?.mexcAvailableQuantity,
+    selected?.polymarketAvailableQuantity,
+    snapshot?.settings.maxCapitalPerTrade,
+    snapshot?.settings.maxHedgeSlippage,
+    snapshot?.settings.minConditionalReturnPct,
+    snapshot?.settings.minNetEdgePerShare
+  ])
+
+  const currentPlan = executionPlan && executionPlan.opportunityId === selected?.id && executionPlan.requestedQuantity === Number(quantity || 0).toFixed(2)
+    ? executionPlan
+    : undefined
+  const requestedCapital = currentPlan ? Number(currentPlan.capitalRequired) : selected ? Number(selected.allInCostPerShare) * Number(quantity || 0) : 0
+  const requestedProfit = currentPlan ? Number(currentPlan.expectedProfit) : selected ? Number(selected.netEdgePerShare) * Number(quantity || 0) : 0
   const requestedBothLose = selected ? Number(selected.bothLosePnlPerShare) * Number(quantity || 0) : 0
   const requestedBothWin = selected ? Number(selected.bothWinPnlPerShare) * Number(quantity || 0) : 0
   const polymarketMaximumPrice = selected
@@ -296,12 +332,6 @@ function App(): JSX.Element {
     : 0
   const minimumTestCapital = selected ? minimumAlignedQuantity * Number(selected.allInCostPerShare) : 0
   const dynamicTestCapitalLimit = Math.max(5, minimumTestCapital)
-  const ticketCapitalLimit = snapshot?.settings.allowUnprofitableTestTrade
-    ? Math.min(12, dynamicTestCapitalLimit, Number(snapshot.settings.maxCapitalPerTrade))
-    : Number(snapshot?.settings.maxCapitalPerTrade ?? 0)
-  const maximumTicketQuantity = selected && minimumTestCapital <= ticketCapitalLimit
-    ? Math.max(minimumAlignedQuantity, Math.floor(ticketCapitalLimit / Number(selected.allInCostPerShare) * 100) / 100)
-    : 0
   const testOverrideReady = Boolean(
     snapshot?.settings.allowUnprofitableTestTrade &&
     snapshot.settings.mode === 'ASSISTED' &&
@@ -310,19 +340,22 @@ function App(): JSX.Element {
     requestedCapital <= dynamicTestCapitalLimit
   )
   const executionSessionIdle = !snapshot?.activeSession || ['HEDGED', 'CANCELLED'].includes(snapshot.activeSession.state)
-  const netEdgePassed = Boolean(selected && snapshot && Number(selected.netEdgePerShare) >= Number(snapshot.settings.minNetEdgePerShare))
-  const conditionalReturnPassed = Boolean(selected && snapshot && Number(selected.conditionalReturnPct) >= Number(snapshot.settings.minConditionalReturnPct))
+  const effectiveNetEdge = currentPlan?.netEdgePerShare ?? selected?.netEdgePerShare ?? '0'
+  const effectiveConditionalReturn = currentPlan?.conditionalReturnPct ?? selected?.conditionalReturnPct ?? '0'
+  const netEdgePassed = Boolean(selected && snapshot && Number(effectiveNetEdge) >= Number(snapshot.settings.minNetEdgePerShare))
+  const conditionalReturnPassed = Boolean(selected && snapshot && Number(effectiveConditionalReturn) >= Number(snapshot.settings.minConditionalReturnPct))
   const settlementRiskPassed = Boolean(selected && !selected.settlementRiskBlocked)
   const canExecute = Boolean(
     selected &&
       Number(quantity) > 0 &&
       Number(quantity) >= minimumAlignedQuantity &&
-      Number(quantity) <= Number(selected.maxQuantity) &&
+      (!currentPlan || currentPlan.executable) &&
+      Number(quantity) <= Number(currentPlan?.maxExecutableQuantity ?? selected.maxQuantity) &&
       requestedCapital <= Number(snapshot?.settings.maxCapitalPerTrade ?? 0) &&
       !selected.feeVerificationBlocked &&
       (!snapshot?.settings.allowUnprofitableTestTrade || (minimumTestCapital <= 12 && requestedCapital <= dynamicTestCapitalLimit)) &&
-      (Number(selected.netEdgePerShare) >= Number(snapshot?.settings.minNetEdgePerShare ?? 0) || testOverrideReady) &&
-      (Number(selected.conditionalReturnPct) >= Number(snapshot?.settings.minConditionalReturnPct ?? 0) || testOverrideReady) &&
+      (Number(effectiveNetEdge) >= Number(snapshot?.settings.minNetEdgePerShare ?? 0) || testOverrideReady) &&
+      (Number(effectiveConditionalReturn) >= Number(snapshot?.settings.minConditionalReturnPct ?? 0) || testOverrideReady) &&
       (!selected.settlementRiskBlocked || testOverrideReady) &&
       !selected.stale &&
       (selected.endTime - now) / 1_000 > Number(snapshot?.settings.stopBeforeExpirySeconds ?? 0) &&
@@ -337,8 +370,10 @@ function App(): JSX.Element {
       ? '请输入大于0的对齐份额'
     : Number(quantity) < minimumAlignedQuantity
         ? `最小对齐份额为${minimumAlignedQuantity.toFixed(2)}份（Polymarket至少${selected.polymarketMinOrderSize}份且BUY金额至少1，MEXC本金至少1 USDT）`
-      : Number(quantity) > Number(selected.maxQuantity)
-        ? `输入${Number(quantity).toFixed(2)}份超过盘口：MEXC可用${selected.mexcAvailableQuantity}份，Polymarket可用${selected.polymarketAvailableQuantity}份`
+    : currentPlan && !currentPlan.executable
+        ? currentPlan.blockReason ?? '当前深度、余额或收益门槛不允许执行'
+      : Number(quantity) > Number(currentPlan?.maxExecutableQuantity ?? selected.maxQuantity)
+        ? `输入${Number(quantity).toFixed(2)}份超过当前可执行上限${currentPlan?.maxExecutableQuantity ?? selected.maxQuantity}份`
         : requestedCapital > Number(snapshot?.settings.maxCapitalPerTrade ?? 0)
           ? '预计本金超过单笔上限'
           : selected.stale
@@ -349,9 +384,9 @@ function App(): JSX.Element {
               ? selected.feeVerificationReason ?? '手续费尚未校验'
               : selected.settlementRiskBlocked && !testOverrideReady
               ? selected.settlementRiskReason ?? '结算信号风控拦截'
-              : Number(selected.netEdgePerShare) < Number(snapshot?.settings.minNetEdgePerShare ?? 0) && !snapshot?.settings.allowUnprofitableTestTrade
+              : Number(effectiveNetEdge) < Number(snapshot?.settings.minNetEdgePerShare ?? 0) && !snapshot?.settings.allowUnprofitableTestTrade
                 ? '净收益低于门槛；可在设置中放开一次小额亏损联调'
-              : Number(selected.conditionalReturnPct) < Number(snapshot?.settings.minConditionalReturnPct ?? 0) && !snapshot?.settings.allowUnprofitableTestTrade
+              : Number(effectiveConditionalReturn) < Number(snapshot?.settings.minConditionalReturnPct ?? 0) && !snapshot?.settings.allowUnprofitableTestTrade
                 ? '条件收益率低于设置门槛'
                 : snapshot?.settings.allowUnprofitableTestTrade && !snapshot.settings.polymarketLiveEnabled
                   ? '小额亏损联调需先验证身份并开启Polymarket真实FOK'
@@ -364,10 +399,10 @@ function App(): JSX.Element {
   const executionChecks: ExecutionCheck[] = selected && snapshot ? [
     { passed: Number(quantity) > 0, label: `输入份额 ${Number(quantity || 0).toFixed(2)} > 0` },
     { passed: Number(quantity) >= minimumAlignedQuantity, label: `最小对齐 ${Number(quantity || 0).toFixed(2)} ≥ ${minimumAlignedQuantity.toFixed(2)}份` },
-    { passed: Number(quantity) <= Number(selected.maxQuantity), label: `两边盘口 输入${Number(quantity || 0).toFixed(2)} ≤ ${selected.maxQuantity}份（MEXC ${selected.mexcAvailableQuantity} / Poly ${selected.polymarketAvailableQuantity}）` },
+    { passed: Number(quantity) <= Number(currentPlan?.maxExecutableQuantity ?? selected.maxQuantity), label: `深度可执行量 输入${Number(quantity || 0).toFixed(2)} ≤ ${currentPlan?.maxExecutableQuantity ?? selected.maxQuantity}份${currentPlan ? `（MEXC ${currentPlan.mexcLevelsUsed}档 / Poly ${currentPlan.polymarketLevelsUsed}档）` : ''}` },
     { passed: requestedCapital <= Number(snapshot.settings.maxCapitalPerTrade), label: `预计本金 $${requestedCapital.toFixed(2)} ≤ $${Number(snapshot.settings.maxCapitalPerTrade).toFixed(2)}` },
-    { passed: netEdgePassed || testOverrideReady, label: `净边际 ${money(selected.netEdgePerShare, 4)} ≥ ${money(snapshot.settings.minNetEdgePerShare, 4)}美元/份${!netEdgePassed && testOverrideReady ? '（小额联调豁免）' : ''}` },
-    { passed: conditionalReturnPassed || testOverrideReady, label: `条件收益率 ${money(selected.conditionalReturnPct, 2)}% ≥ ${money(snapshot.settings.minConditionalReturnPct, 2)}%${!conditionalReturnPassed && testOverrideReady ? '（小额联调豁免）' : ''}` },
+    { passed: netEdgePassed || testOverrideReady, label: `滑点后净边际 ${money(effectiveNetEdge, 4)} ≥ ${money(snapshot.settings.minNetEdgePerShare, 4)}美元/份${!netEdgePassed && testOverrideReady ? '（小额联调豁免）' : ''}` },
+    { passed: conditionalReturnPassed || testOverrideReady, label: `滑点后条件收益率 ${money(effectiveConditionalReturn, 2)}% ≥ ${money(snapshot.settings.minConditionalReturnPct, 2)}%${!conditionalReturnPassed && testOverrideReady ? '（小额联调豁免）' : ''}` },
     { passed: !selected.feeVerificationBlocked, label: selected.feeVerificationBlocked ? 'MEXC手续费尚未校验' : 'MEXC手续费已校验' },
     { passed: settlementRiskPassed || testOverrideReady, label: !settlementRiskPassed && testOverrideReady ? '结算信号门槛（小额联调豁免）' : selected.settlementRiskBlocked ? (selected.settlementRiskReason ?? '结算风控未通过') : '结算方向与动态安全距离通过' },
     { passed: !selected.stale, label: `行情 MEXC ${quoteAgeLabel(selected.mexcQuoteAgeMs)} / Poly ${quoteAgeLabel(selected.polymarketQuoteAgeMs)} ≤ ${(snapshot.settings.maxQuoteAgeMs / 1_000).toFixed(0)}秒` },
@@ -418,7 +453,11 @@ function App(): JSX.Element {
       if (success) setMessage(success)
       return result
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error))
+      const rawMessage = error instanceof Error ? error.message : String(error)
+      const normalized = rawMessage.replace(/^Error invoking remote method '[^']+':\s*/i, '')
+      setMessage(/ApiError:\s*aborted/i.test(normalized)
+        ? `${normalized.replace(/ApiError:\s*aborted/ig, '请求被中断')}。请检查7890代理连接后重试`
+        : normalized)
       return undefined
     } finally {
       setBusy(false)
@@ -538,6 +577,47 @@ function App(): JSX.Element {
       if (!confirmed) return
     }
     const result = await run(() => window.arbApp.updateSettings({ polymarketLiveEnabled: enabling }))
+    if (result) setSnapshot({ ...snapshot, settings: result })
+  }
+
+  async function toggleAutoOpen(): Promise<void> {
+    if (!snapshot) return
+    const enabling = !snapshot.settings.autoOpenEnabled
+    if (enabling) {
+      if (!snapshot.settings.mexcAutomationEnabled || !snapshot.settings.polymarketLiveEnabled) {
+        setMessage('请先启用MEXC自动点击和Polymarket真实FOK')
+        return
+      }
+      const fixedQuantity = Number(autoFixedQuantityDraft)
+      const maximumPercentage = Number(autoMaxQuantityPctDraft)
+      if (!(fixedQuantity > 0)) {
+        setMessage('自动开单固定份额须大于0')
+        return
+      }
+      if (!Number.isInteger(maximumPercentage) || maximumPercentage < 10 || maximumPercentage > 100) {
+        setMessage('最大可执行量比例须为10至100的整数')
+        return
+      }
+      const quantityDescription = snapshot.settings.autoOpenQuantityMode === 'FIXED'
+        ? `固定${fixedQuantity.toFixed(2)}份`
+        : `当前最大可执行量的${maximumPercentage}%`
+      const confirmed = window.confirm(`启用后，机会连续500毫秒满足全部按钮条件就会自动执行${quantityDescription}；每个市场轮次最多一单，异常会自动停用。软件重启后需要重新开启。确认布防？`)
+      if (!confirmed) return
+    }
+    const result = await run(() => window.arbApp.updateSettings(enabling ? {
+      autoOpenEnabled: true,
+      autoOpenFixedQuantity: Number(autoFixedQuantityDraft).toFixed(2),
+      autoOpenMaxQuantityPct: Number(autoMaxQuantityPctDraft)
+    } : { autoOpenEnabled: false }))
+    if (result) setSnapshot({ ...snapshot, settings: result })
+  }
+
+  async function setAutoQuantityMode(mode: 'FIXED' | 'MAX_PERCENT'): Promise<void> {
+    if (!snapshot) return
+    const result = await run(() => window.arbApp.updateSettings({
+      autoOpenQuantityMode: mode,
+      autoOpenEnabled: false
+    }))
     if (result) setSnapshot({ ...snapshot, settings: result })
   }
 
@@ -686,58 +766,19 @@ function App(): JSX.Element {
 
   async function setMaximumQuantity(): Promise<void> {
     if (!snapshot || !selected) return
-    const constraints = [
-      { label: 'MEXC盘口', quantity: Number(selected.mexcAvailableQuantity) },
-      { label: 'Polymarket盘口', quantity: Number(selected.polymarketAvailableQuantity) },
-      { label: '单笔金额上限', quantity: maximumTicketQuantity }
-    ]
-
-    if (snapshot.settings.mode === 'ASSISTED') {
-      const accountResult = await run(async () => {
-        const [mexc, polymarket] = await Promise.all([
-          window.arbApp.refreshMexcAccount(),
-          window.arbApp.validatePolymarketIdentity(selected.polymarketTokenId)
-        ])
-        return { mexc, polymarket }
-      })
-      if (!accountResult) return
-      setMexcStatus(accountResult.mexc)
-      setPolyValidation(accountResult.polymarket)
-      if (!accountResult.polymarket.ok) {
-        setMessage(`Polymarket账户暂不可开仓：${accountResult.polymarket.message}`)
-        return
-      }
-      const mexcBalance = Number(accountResult.mexc.account?.availableUsdt)
-      const polymarketBalance = Number(accountResult.polymarket.collateralBalance)
-      if (!Number.isFinite(mexcBalance) || mexcBalance < 0) {
-        setMessage('未读取到MEXC可用USDT，无法计算账户最大份额')
-        return
-      }
-      if (!Number.isFinite(polymarketBalance) || polymarketBalance < 0) {
-        setMessage('未读取到Polymarket抵押余额，无法计算账户最大份额')
-        return
-      }
-      const mexcCashPerShare = Number(selected.mexcPrice) + Number(selected.mexcFeePerShare)
-      const polymarketCashPerShare = polymarketMaximumPrice + Number(selected.polymarketFeePerShare)
-      constraints.push(
-        { label: 'MEXC可用余额', quantity: mexcCashPerShare > 0 ? mexcBalance / mexcCashPerShare : 0 },
-        { label: 'Polymarket可用余额', quantity: polymarketCashPerShare > 0 ? polymarketBalance / polymarketCashPerShare : 0 }
-      )
-    }
-
-    const rawMaximum = Math.min(...constraints.map((item) => item.quantity))
-    const maximum = Math.max(0, Math.floor(rawMaximum * 100) / 100)
-    if (!Number.isFinite(maximum) || maximum < minimumAlignedQuantity) {
-      const details = constraints.map((item) => `${item.label}${Number.isFinite(item.quantity) ? Math.max(0, item.quantity).toFixed(2) : '—'}份`).join('；')
-      setMessage(`不足最小对齐份额${minimumAlignedQuantity.toFixed(2)}份：${details}`)
+    const plan = await run(() => window.arbApp.calculateExecutionPlan({
+      opportunityId: selected.id,
+      useMaximum: true,
+      refreshStaleAccounts: snapshot.settings.mode === 'ASSISTED'
+    }))
+    if (!plan) return
+    setExecutionPlan(plan)
+    if (!(Number(plan.maxExecutableQuantity) >= Number(plan.minimumQuantity))) {
+      setMessage(`当前不足最小对齐份额${plan.minimumQuantity}份：${plan.blockReason ?? plan.limitingFactors.join('、')}`)
       return
     }
-    const binding = constraints
-      .filter((item) => Math.abs(item.quantity - rawMaximum) < 0.01)
-      .map((item) => item.label)
-      .join('、')
-    setQuantity(maximum.toFixed(2))
-    setMessage(`已按${binding}设置最大${maximum.toFixed(2)}份`)
+    setQuantity(plan.maxExecutableQuantity)
+    setMessage(`最大${plan.maxExecutableQuantity}份 · MEXC ${plan.mexcLevelsUsed}档 / Poly ${plan.polymarketLevelsUsed}档 · 滑点后收益率${plan.conditionalReturnPct}% · 限制：${plan.limitingFactors.join('、') || '盘口'}`)
   }
 
   async function confirmCloseOrder(): Promise<void> {
@@ -881,6 +922,7 @@ function App(): JSX.Element {
                 </button>
                 <ExecutionConditionsHelp checks={executionChecks} />
               </div>
+              {snapshot.settings.autoOpenEnabled && <div className={`browser-status-detail auto-open-status ${snapshot.autoOpenState.status.toLowerCase()}`} role="status" aria-live="polite"><span>AUTO</span><p>{snapshot.autoOpenState.message}</p></div>}
               {!canExecute && executeBlockReason && <p className="execution-note"><AlertTriangle aria-hidden="true" />禁用原因：{executeBlockReason}</p>}
 
               {(selected.feeVerificationBlocked || selected.settlementRiskBlocked || selected.stale || Number(selected.netEdgePerShare) < Number(snapshot.settings.minNetEdgePerShare)) && selected.riskFlags.length > 0 && (
@@ -897,8 +939,8 @@ function App(): JSX.Element {
                     <FormulaHelp inline />
                     <Row
                       label="条件收益率"
-                      value={selected.feeVerificationBlocked ? '—' : `${Number(selected.conditionalReturnPct) >= 0 ? '+' : ''}${money(selected.conditionalReturnPct, 2)}%`}
-                      positive={!selected.feeVerificationBlocked && Number(selected.conditionalReturnPct) > 0}
+                      value={selected.feeVerificationBlocked ? '—' : `${Number(effectiveConditionalReturn) >= 0 ? '+' : ''}${money(effectiveConditionalReturn, 2)}%`}
+                      positive={!selected.feeVerificationBlocked && Number(effectiveConditionalReturn) > 0}
                     />
                     <Row label="最坏亏损率" value={selected.feeVerificationBlocked ? '—' : `${money(selected.worstCaseReturnPct, 2)}%`} />
                     <Row label="MEXC结算信号" value={selected.mexcSignal
@@ -908,10 +950,11 @@ function App(): JSX.Element {
                       ? <SignalValue direction={selected.polymarketSignal} distanceBps={selected.polymarketDistanceBps} />
                       : '未知'} />
                     <div className="breakdown-divider" />
-                    <Row label="MEXC本金" value={`$${money(Number(selected.mexcPrice) * Number(quantity || 0) + '', 2)}`} />
-                    <Row label="Polymarket本金" value={`$${money(Number(selected.polymarketPrice) * Number(quantity || 0) + '', 2)}`} />
-                    <Row label="MEXC手续费" value={selected.mexcFeeRateSource === 'HISTORY' ? `$${money(Number(selected.mexcFeePerShare) * Number(quantity || 0) + '', 2)}` : '—'} />
-                    <Row label="Polymarket手续费" value={`$${money(Number(selected.polymarketFeePerShare) * Number(quantity || 0) + '', 2)}`} />
+                    <Row label="MEXC本金" value={`$${currentPlan?.mexcSpend ?? money(Number(selected.mexcPrice) * Number(quantity || 0) + '', 2)}`} />
+                    <Row label="Polymarket本金" value={`$${currentPlan?.polymarketSpend ?? money(Number(selected.polymarketPrice) * Number(quantity || 0) + '', 2)}`} />
+                    <Row label="MEXC手续费" value={selected.mexcFeeRateSource === 'HISTORY' ? `$${currentPlan ? money(currentPlan.mexcFee, 2) : money(Number(selected.mexcFeePerShare) * Number(quantity || 0) + '', 2)}` : '—'} />
+                    <Row label="Polymarket手续费" value={`$${currentPlan ? money(currentPlan.polymarketFee, 2) : money(Number(selected.polymarketFeePerShare) * Number(quantity || 0) + '', 2)}`} />
+                    {currentPlan && <Row label="盘口档位" value={`MEXC ${currentPlan.mexcLevelsUsed}档 / Poly ${currentPlan.polymarketLevelsUsed}档`} />}
                     <Row label="风险缓冲" value={`$${money(Number(selected.riskBufferPerShare) * Number(quantity || 0) + '', 2)}`} />
                     <Row label="两边同时输" value={selected.feeVerificationBlocked ? '—' : `-$${Math.abs(requestedBothLose).toFixed(2)}`} />
                     <Row label="两边同时赢" value={selected.feeVerificationBlocked ? '—' : `+$${requestedBothWin.toFixed(2)}`} positive={!selected.feeVerificationBlocked} />
@@ -984,7 +1027,7 @@ function App(): JSX.Element {
                 <button className={snapshot.settings.mode === 'SIMULATION' ? 'active' : ''} onClick={() => void setMode('SIMULATION')}><Bot />模拟</button>
                 <button className={snapshot.settings.mode === 'ASSISTED' ? 'active' : ''} onClick={() => void setMode('ASSISTED')}><SlidersHorizontal />人工监督</button>
               </div>
-              <p>人工监督会先执行MEXC，确认实际成交后才对冲；“最大”会取盘口、两边账户余额和单笔本金上限中的最小值。</p>
+              <p>人工监督会先执行MEXC，确认实际成交后才对冲；“最大”会逐档计算两边深度、滑点和费用，并受余额、本金及最低收益门槛共同限制。</p>
               <div className="decision-field-grid">
                 <label className="settings-field" htmlFor="max-capital">单笔最大本金（USDT）
                   <input id="max-capital" value={maxCapitalDraft} onChange={(event) => setMaxCapitalDraft(event.target.value)} inputMode="decimal" />
@@ -1016,7 +1059,7 @@ function App(): JSX.Element {
                 <div><strong>风控规则</strong><span>动态安全距离 · {snapshot.settings.settlementDistanceRules.length}个节点</span><small>控制临近结算时允许开仓的最小价格距离</small></div><ChevronRight />
               </button>
               <button className="settings-menu-card" onClick={() => setSettingsView('LIVE')}>
-                <div><strong>实盘控制</strong><span>{snapshot.settings.mexcAutomationEnabled ? 'MEXC自动点击已开' : 'MEXC自动点击已关'} · {snapshot.settings.polymarketLiveEnabled ? '真实对冲已开' : '真实对冲已关'}</span><small>管理自动点击、真实FOK与一次性小额联调</small></div><ChevronRight />
+                <div><strong>实盘控制</strong><span>{snapshot.settings.autoOpenEnabled ? '自动开单已布防' : snapshot.settings.mexcAutomationEnabled ? 'MEXC自动点击已开' : '自动执行已关'} · {snapshot.settings.polymarketLiveEnabled ? '真实对冲已开' : '真实对冲已关'}</span><small>管理自动点击、真实FOK、自动开单与一次性小额联调</small></div><ChevronRight />
               </button>
               <button className="settings-menu-card" onClick={() => setSettingsView('ACCOUNT')}>
                 <div><strong>账户与环境</strong><span>{snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? 'Hubstudio' : '内嵌MEXC'} · {polymarketCredentials?.configured ? 'Polymarket已配置' : 'Polymarket未配置'}</span><small>低频配置：浏览器环境、网络、校准和交易身份</small></div><ChevronRight />
@@ -1210,6 +1253,24 @@ function App(): JSX.Element {
                 {snapshot.settings.polymarketLiveEnabled ? <Check /> : <LockKeyhole />}
                 {snapshot.settings.polymarketLiveEnabled ? '真实对冲已启用 · 点击关闭' : '验证后启用真实对冲'}
               </button>
+              <div><Bot /><div><h3>自动开单</h3><p>全部按钮条件连续满足500毫秒后触发；期间只读WebSocket缓存，最终仅补充过期数据。每轮最多一单，异常自动停用。</p></div></div>
+              <div className="segmented-control browser-mode-control">
+                <button className={snapshot.settings.autoOpenQuantityMode === 'FIXED' ? 'active' : ''} onClick={() => void setAutoQuantityMode('FIXED')} disabled={snapshot.settings.autoOpenEnabled}>固定份额</button>
+                <button className={snapshot.settings.autoOpenQuantityMode === 'MAX_PERCENT' ? 'active' : ''} onClick={() => void setAutoQuantityMode('MAX_PERCENT')} disabled={snapshot.settings.autoOpenEnabled}>按最大比例</button>
+              </div>
+              {snapshot.settings.autoOpenQuantityMode === 'FIXED'
+                ? <label className="settings-field" htmlFor="auto-fixed-quantity">每次自动开单份额
+                  <input id="auto-fixed-quantity" value={autoFixedQuantityDraft} onChange={(event) => setAutoFixedQuantityDraft(event.target.value)} inputMode="decimal" disabled={snapshot.settings.autoOpenEnabled} />
+                </label>
+                : <label className="settings-field" htmlFor="auto-max-pct">最大可执行量使用比例
+                  <input id="auto-max-pct" value={autoMaxQuantityPctDraft} onChange={(event) => setAutoMaxQuantityPctDraft(event.target.value)} inputMode="numeric" disabled={snapshot.settings.autoOpenEnabled} />
+                  <small>建议80%，允许10%至100%</small>
+                </label>}
+              <button className={`automation-toggle ${snapshot.settings.autoOpenEnabled ? 'enabled' : ''}`} onClick={() => void toggleAutoOpen()} disabled={busy}>
+                {snapshot.settings.autoOpenEnabled ? <Check /> : <LockKeyhole />}
+                {snapshot.settings.autoOpenEnabled ? '已布防 · 点击停止' : '确认参数并启用自动开单'}
+              </button>
+              <div className="browser-status-detail"><span>{snapshot.autoOpenState.status}</span><p>{snapshot.autoOpenState.message}</p></div>
             </section>}
           </aside>
         </div>

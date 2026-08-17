@@ -6,6 +6,7 @@ const api: ArbAppApi = {
   refreshOpportunities: () => ipcRenderer.invoke('app:refresh-opportunities'),
   testPolymarketConnection: () => ipcRenderer.invoke('polymarket:test-connection'),
   execute: (request) => ipcRenderer.invoke('app:execute', request),
+  calculateExecutionPlan: (request) => ipcRenderer.invoke('app:calculate-execution-plan', request),
   confirmMexcFill: (fill) => ipcRenderer.invoke('app:confirm-mexc-fill', fill),
   cancelExecution: () => ipcRenderer.invoke('app:cancel-execution'),
   closeOrder: (request) => ipcRenderer.invoke('app:close-order', request),

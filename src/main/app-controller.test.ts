@@ -11,6 +11,7 @@ import type { PolymarketLiveBroker } from './services/polymarket-live'
 const temporaryDirectories: string[] = []
 
 afterEach(async () => {
+  vi.useRealTimers()
   vi.unstubAllEnvs()
   for (const directory of temporaryDirectories.splice(0)) {
     await rm(directory, { recursive: true })
@@ -37,6 +38,8 @@ describe('AppController simulation', () => {
         calibrated: { amountInput: false, upButton: false, downButton: false, submitButton: false },
         message: 'test'
       }),
+      getCachedAccountState: () => ({ checkedAt: Date.now(), reachable: true, authenticated: true, availableUsdt: '100', positionCount: 0, openOrderCount: 0, historyCount: 0, positionFields: [], openOrderFields: [], historyFields: [], fillReadbackReady: true, message: 'test' }),
+      ensureAccountBalance: async () => ({ checkedAt: Date.now(), reachable: true, authenticated: true, availableUsdt: '100', positionCount: 0, openOrderCount: 0, historyCount: 0, positionFields: [], openOrderFields: [], historyFields: [], fillReadbackReady: true, message: 'test' }),
       confirmMarketQuote: confirmMexcQuote,
       fetchActiveBtcWindows: async () => [{
         eventId: 'mexc-test',
@@ -226,6 +229,8 @@ describe('AppController simulation', () => {
         mode: 'HUBSTUDIO', open: true, authenticated: true, automationAvailable: true, monitoring: true,
         calibrated: { amountInput: false, upButton: false, downButton: false, submitButton: false }, message: 'test'
       }),
+      getCachedAccountState: () => ({ checkedAt: Date.now(), reachable: true, authenticated: true, availableUsdt: '100', positionCount: 0, openOrderCount: 0, historyCount: 0, positionFields: [], openOrderFields: [], historyFields: [], fillReadbackReady: true, message: 'test' }),
+      ensureAccountBalance: async () => ({ checkedAt: Date.now(), reachable: true, authenticated: true, availableUsdt: '100', positionCount: 0, openOrderCount: 0, historyCount: 0, positionFields: [], openOrderFields: [], historyFields: [], fillReadbackReady: true, message: 'test' }),
       fetchActiveBtcWindows: async () => [{
         eventId: 'mexc-live-test', durationMinutes: 5, startTime, endTime: startTime + 300_000,
         baselinePrice: '60000', indexPrice: '60030', indexReceivedAt: Date.now(), feeRate: '0.015', feeRateSource: 'HISTORY',
@@ -260,6 +265,8 @@ describe('AppController simulation', () => {
     const liveBroker = {
       configureProxy: () => undefined,
       isConfigured: async () => true,
+      getCachedTradingCapacity: () => ({ checkedAt: Date.now(), collateralBalance: '100', allowanceReady: true, closedOnly: false }),
+      ensureTradingCapacity: async () => ({ checkedAt: Date.now(), collateralBalance: '100', allowanceReady: true, closedOnly: false }),
       hedge
     } as unknown as PolymarketLiveBroker
     const controller = new AppController(new EventStore(directory), mexcBrowser, polymarketData, liveBroker)
@@ -272,9 +279,94 @@ describe('AppController simulation', () => {
     const session = await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-fill' })
 
     expect(hedge).toHaveBeenCalledWith(expect.objectContaining({
-      tokenId: 'poly-down', direction: 'DOWN', quantity: '10.00', maximumPrice: '0.5300'
+      tokenId: 'poly-down', direction: 'DOWN', quantity: '10.00', maximumPrice: '0.5000'
     }))
     expect(session.state).toBe('HEDGED')
     expect(session.polymarketFill?.orderId).toBe('poly-live-order')
+  })
+
+  it('waits 500ms using cached quotes before automatic opening performs lightweight balance checks', async () => {
+    vi.useFakeTimers()
+    const now = 1_800_000_000_000
+    vi.setSystemTime(now)
+    const store = {
+      initialize: async () => undefined,
+      loadSettings: async (defaults: unknown) => defaults,
+      saveSettings: async () => undefined,
+      loadRecentEvents: async () => [],
+      loadOrderHistory: async () => [],
+      saveOrderHistory: async () => undefined,
+      appendEvent: async () => undefined
+    } as unknown as EventStore
+    const startTime = now - 60_000
+    const ensureMexcBalance = vi.fn(async () => ({
+      checkedAt: Date.now(), reachable: true, authenticated: true, availableUsdt: '100',
+      positionCount: 0, openOrderCount: 0, historyCount: 0, positionFields: [], openOrderFields: [], historyFields: [],
+      fillReadbackReady: true, message: 'test'
+    }))
+    const prepareOrder = vi.fn(async () => ({ ok: true, orderAccepted: true, submittedAt: Date.now(), message: 'accepted', matched: {} }))
+    const mexcBrowser = {
+      configure: () => undefined,
+      onMarketData: () => () => undefined,
+      getCalibration: () => ({ amountInput: false, upButton: false, downButton: false, submitButton: false }),
+      getStatus: () => ({
+        mode: 'HUBSTUDIO', open: true, authenticated: true, automationAvailable: true, monitoring: true,
+        calibrated: { amountInput: false, upButton: false, downButton: false, submitButton: false }, message: 'test'
+      }),
+      getCachedAccountState: () => undefined,
+      ensureAccountBalance: ensureMexcBalance,
+      fetchActiveBtcWindows: async () => [{
+        eventId: 'mexc-auto', durationMinutes: 5, startTime, endTime: startTime + 300_000,
+        baselinePrice: '60000', indexPrice: '60060', indexReceivedAt: Date.now(), feeRate: '0.015', feeRateSource: 'HISTORY',
+        outcomes: {
+          UP: { direction: 'UP', symbolId: 'mexc-up', bestAsk: '0.35', askSize: '20', levels: [{ price: '0.35', size: '20' }], receivedAt: Date.now() },
+          DOWN: { direction: 'DOWN', symbolId: 'mexc-down', bestAsk: '0.65', askSize: '20', levels: [{ price: '0.65', size: '20' }], receivedAt: Date.now() }
+        }
+      }],
+      open: async () => undefined,
+      prepareOrder,
+      waitForFill: async () => undefined
+    } as unknown as MexcBrowserManager
+    const polymarketData = {
+      configureProxy: () => undefined,
+      onMarketData: () => () => undefined,
+      getStatus: () => ({ connected: true, message: 'test' }),
+      fetchWindows: async () => [{
+        durationMinutes: 5, startTime, endTime: startTime + 300_000,
+        baselinePrice: '60000', indexPrice: '60060', indexReceivedAt: Date.now(),
+        outcomes: {
+          UP: { direction: 'UP', tokenId: 'poly-up', bestAsk: '0.70', askSize: '20', levels: [{ price: '0.70', size: '20' }], receivedAt: Date.now(), feeRate: '0.07', feeExponent: '1', minOrderSize: '1' },
+          DOWN: { direction: 'DOWN', tokenId: 'poly-down', bestAsk: '0.45', askSize: '20', levels: [{ price: '0.45', size: '20' }], receivedAt: Date.now(), feeRate: '0.07', feeExponent: '1', minOrderSize: '1' }
+        }
+      }]
+    } as unknown as PolymarketMarketData
+    const ensurePolyCapacity = vi.fn(async () => ({ checkedAt: Date.now(), collateralBalance: '100', allowanceReady: true, closedOnly: false }))
+    const liveBroker = {
+      configureProxy: () => undefined,
+      isConfigured: async () => true,
+      getCachedTradingCapacity: () => undefined,
+      ensureTradingCapacity: ensurePolyCapacity
+    } as unknown as PolymarketLiveBroker
+    const controller = new AppController(store, mexcBrowser, polymarketData, liveBroker, true)
+    await controller.initialize()
+    await controller.updateSettings({
+      mode: 'ASSISTED', mexcAutomationEnabled: true, polymarketLiveEnabled: true,
+      minNetEdgePerShare: '0', minConditionalReturnPct: '0', autoOpenEnabled: true,
+      autoOpenQuantityMode: 'FIXED', autoOpenFixedQuantity: '5'
+    })
+    const automaticSnapshot = await controller.refreshOpportunities()
+    expect(automaticSnapshot.opportunities).toHaveLength(2)
+    expect(automaticSnapshot.autoOpenState.status).toBe('STABILIZING')
+
+    await vi.advanceTimersByTimeAsync(499)
+    expect(prepareOrder).not.toHaveBeenCalled()
+    expect(ensureMexcBalance).not.toHaveBeenCalled()
+    expect(ensurePolyCapacity).not.toHaveBeenCalled()
+
+    await vi.runOnlyPendingTimersAsync()
+    expect(prepareOrder).toHaveBeenCalledTimes(1)
+    expect(ensureMexcBalance).toHaveBeenCalledTimes(1)
+    expect(ensurePolyCapacity).toHaveBeenCalledTimes(1)
+    expect(controller.getSnapshot().autoOpenState.status).toBe('COOLDOWN')
   })
 })

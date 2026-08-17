@@ -24,7 +24,7 @@ const MEXC_URL = 'https://prediction.mexc.com/prediction-markets/all'
 const HUBSTUDIO_API = 'http://127.0.0.1:6873'
 const MEXC_USDT_COIN_ID = '128f589271cb4951b03e71e6323eb7be'
 const MEXC_EVENT_CACHE_MS = 10_000
-const MEXC_FEE_CACHE_MS = 60_000
+const MEXC_FEE_CACHE_MS = 10 * 60_000
 const MEXC_REST_FALLBACK_MS = 10_000
 const MEXC_PREFLIGHT_QUOTE_MS = 500
 
@@ -159,6 +159,7 @@ export class MexcBrowserManager {
   private interceptedEvents?: { receivedAt: number; events: MexcRawEvent[] }
   private latestMexcIndex?: { price: string; receivedAt: number }
   private cachedFeeCalibration?: CachedMexcFeeCalibration
+  private feeRows = new Map<string, MexcAssetLogRow>()
   private latestWindows: MexcWindowQuote[] = []
   private marketDataListeners = new Set<() => void>()
   private instrumentedHubstudioPages = new WeakSet<Page>()
@@ -196,6 +197,19 @@ export class MexcBrowserManager {
 
   getLatestWindows(): MexcWindowQuote[] {
     return this.latestWindows
+  }
+
+  getCachedAccountState(): MexcAccountState | undefined {
+    return this.latestAccountState
+  }
+
+  async ensureAccountBalance(maximumAgeMs = 30_000): Promise<MexcAccountState> {
+    const cached = this.latestAccountState
+    if (
+      cached?.authenticated && cached.reachable && cached.availableUsdt !== undefined &&
+      Date.now() - cached.checkedAt <= maximumAgeMs
+    ) return cached
+    return await this.refreshAccountBalanceState()
   }
 
   getCalibration(mode = this.mode): MexcBrowserStatus['calibrated'] {
@@ -308,7 +322,7 @@ export class MexcBrowserManager {
         .sort((left, right) => Number(right.ts) - Number(left.ts))[0]
       if (latestIndex?.p) this.latestMexcIndex = { price: String(latestIndex.p), receivedAt: Date.now() }
       if (fallback.feeRows) {
-        this.applyFeeCalibration(fallback.feeRows, Date.now())
+        this.applyFeeCalibration(fallback.feeRows, Date.now(), true)
       }
     }
 
@@ -412,7 +426,7 @@ export class MexcBrowserManager {
       .filter((point) => Number(point.p) > 0 && Number(point.ts) > 0)
       .sort((left, right) => Number(right.ts) - Number(left.ts))[0]
     if (latestIndex?.p) this.applyMexcIndex(String(latestIndex.p), result.receivedAt)
-    if (result.feeRows) this.applyFeeCalibration(result.feeRows, result.receivedAt)
+    if (result.feeRows) this.applyFeeCalibration(result.feeRows, result.receivedAt, true)
   }
 
   getStatus(): MexcBrowserStatus {
@@ -476,7 +490,7 @@ export class MexcBrowserManager {
         ? payload.history.data as Record<string, unknown>
         : {}
       const historyRows = Array.isArray(historyData.result) ? historyData.result as Record<string, unknown>[] : []
-      this.applyFeeCalibration(historyRows as MexcAssetLogRow[], Date.now())
+      this.applyFeeCalibration(historyRows as MexcAssetLogRow[], Date.now(), true)
       const balanceRows = Array.isArray(payload.balances.data) ? payload.balances.data as Record<string, unknown>[] : []
       const usdtBalance = balanceRows.find((row) => row.coinId === MEXC_USDT_COIN_ID)
       const totalHistory = Number(historyData.total)
@@ -546,6 +560,7 @@ export class MexcBrowserManager {
         const body = await response.json() as { data?: { result?: MexcFillLogRow[] } }
         return body.data?.result ?? []
       })
+      this.applyFeeCalibration(rows as MexcAssetLogRow[], Date.now(), false)
       const fill = parseMexcFill(rows, match)
       if (fill) return fill
       await new Promise((resolve) => setTimeout(resolve, 750))
@@ -740,9 +755,10 @@ export class MexcBrowserManager {
       }
       if (/\/api\/platform\/predict\/asset\/query\/web\/summaryLog/.test(responseUrl)) {
         const query = new URL(responseUrl).searchParams
-        if (Number(query.get('pageNum') ?? '1') !== 1 || Number(query.get('pageSize') ?? '0') < 100) return
+        if (Number(query.get('pageNum') ?? '1') !== 1) return
+        const allowUnpairedBuyAsZero = Number(query.get('pageSize') ?? '0') >= 100
         void response.json().then((body: { data?: { result?: MexcAssetLogRow[] } }) => {
-          this.applyFeeCalibration(body.data?.result ?? [], Date.now())
+          this.applyFeeCalibration(body.data?.result ?? [], Date.now(), allowUnpairedBuyAsZero)
         }).catch(() => undefined)
       }
       if (!isOrderEndpoint(responseUrl)) return
@@ -917,9 +933,30 @@ export class MexcBrowserManager {
     if (changed) for (const listener of this.marketDataListeners) listener()
   }
 
-  private applyFeeCalibration(rows: MexcAssetLogRow[], receivedAt: number): void {
+  private applyFeeCalibration(
+    rows: MexcAssetLogRow[],
+    receivedAt: number,
+    allowUnpairedBuyAsZero: boolean
+  ): void {
+    for (const row of rows) {
+      if (!row.tn) continue
+      const key = `${row.tn}:${String(row.bt ?? '')}:${String(row.ta ?? '')}:${String(row.tt ?? '')}`
+      this.feeRows.set(key, row)
+    }
+    const oldestAllowed = receivedAt - 7 * 24 * 60 * 60 * 1_000
+    for (const [key, row] of this.feeRows) {
+      const timestamp = Number(row.tt)
+      const normalized = timestamp > 0 && timestamp < 10_000_000_000 ? timestamp * 1_000 : timestamp
+      if (!Number.isFinite(normalized) || normalized < oldestAllowed) this.feeRows.delete(key)
+    }
     const previous = this.cachedFeeCalibration
-    const calibration = updateMexcFeeCalibrationCache(previous, rows, receivedAt, MEXC_FEE_CACHE_MS)
+    const calibration = updateMexcFeeCalibrationCache(
+      previous,
+      [...this.feeRows.values()],
+      receivedAt,
+      MEXC_FEE_CACHE_MS,
+      allowUnpairedBuyAsZero
+    )
     if (calibration === previous) return
     this.cachedFeeCalibration = calibration
     this.latestWindows = this.latestWindows.map((window) => ({
@@ -1556,13 +1593,46 @@ export class MexcBrowserManager {
       void this.followHubstudioLiveMarket().catch(() => undefined)
       if (Date.now() - this.lastHubstudioAccountRefreshAt < 15_000 || this.hubstudioAccountRefreshing) return
       this.hubstudioAccountRefreshing = true
-      void this.refreshAccountState()
+      void this.refreshAccountBalanceState()
         .finally(() => {
           this.lastHubstudioAccountRefreshAt = Date.now()
           this.hubstudioAccountRefreshing = false
         })
         .catch(() => undefined)
     }, 5_000)
+  }
+
+  private async refreshAccountBalanceState(): Promise<MexcAccountState> {
+    const current = this.getStatus()
+    if (!current.open) throw new Error('MEXC窗口尚未连接')
+    await this.refreshAuthentication()
+    if (!this.getStatus().authenticated) throw new Error('MEXC登录态不可用')
+    const balances = await this.evaluateMexcPage(async () => {
+      const response = await fetch('/api/platform/predict/asset/query/web/balances?coinIds=128f589271cb4951b03e71e6323eb7be', {
+        headers: { accept: 'application/json' }, credentials: 'include'
+      })
+      if (!response.ok) throw new Error(`MEXC balances HTTP ${response.status}`)
+      return await response.json() as { data?: Array<{ coinId?: string; available?: string }> }
+    })
+    const usdt = (balances.data ?? []).find((row) => row.coinId === MEXC_USDT_COIN_ID)
+    const previous = this.latestAccountState
+    this.latestAccountState = {
+      checkedAt: Date.now(),
+      reachable: true,
+      authenticated: true,
+      availableUsdt: usdt?.available,
+      positionCount: previous?.positionCount ?? 0,
+      openOrderCount: previous?.openOrderCount ?? 0,
+      historyCount: previous?.historyCount ?? 0,
+      positionFields: previous?.positionFields ?? [],
+      openOrderFields: previous?.openOrderFields ?? [],
+      historyFields: previous?.historyFields ?? [],
+      fillReadbackReady: previous?.fillReadbackReady ?? false,
+      latestFill: previous?.latestFill,
+      latestSettlement: previous?.latestSettlement,
+      message: 'MEXC可用余额已轻量刷新；持仓、委托与流水沿用最近完整读取结果'
+    }
+    return this.latestAccountState
   }
 
   private clearHubstudioConnection(): void {

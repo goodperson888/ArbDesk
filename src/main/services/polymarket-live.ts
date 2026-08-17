@@ -32,6 +32,13 @@ const POLYGON_RPC = 'https://polygon-rpc.com'
 const TOKEN_SCALE = new Decimal(1_000_000)
 const MIN_MARKETABLE_BUY_AMOUNT = new Decimal(1)
 
+export interface PolymarketTradingCapacity {
+  checkedAt: number
+  collateralBalance: string
+  allowanceReady: boolean
+  closedOnly: boolean
+}
+
 function formatCollateral(raw: string): string {
   const amount = new Decimal(raw || 0).div(TOKEN_SCALE)
   return amount.toDecimalPlaces(6).toString()
@@ -43,6 +50,8 @@ function allowanceValues(response: BalanceAllowanceResponse): Decimal[] {
 
 export class PolymarketLiveBroker implements PolymarketBroker {
   private proxyAgent?: HttpsProxyAgent<string>
+  private cachedTradingCapacity?: PolymarketTradingCapacity
+  private proxyUrl = ''
 
   constructor(
     private readonly credentialStore: PolymarketCredentialStore,
@@ -50,9 +59,12 @@ export class PolymarketLiveBroker implements PolymarketBroker {
   ) {}
 
   configureProxy(proxyUrl: string): void {
+    const normalized = proxyUrl.trim()
+    if (normalized === this.proxyUrl) return
+    this.proxyUrl = normalized
     this.proxyAgent?.destroy()
     this.proxyAgent = undefined
-    const normalized = proxyUrl.trim()
+    this.cachedTradingCapacity = undefined
     if (normalized) {
       this.proxyAgent = new HttpsProxyAgent(normalized)
       axios.defaults.httpAgent = this.proxyAgent
@@ -89,7 +101,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     if (!derived?.key || !derived.secret || !derived.passphrase) {
       throw new Error('Polymarket 未返回完整 API 凭据；请检查代理、私钥和系统时间')
     }
-    return await this.credentialStore.update({
+    const updated = await this.credentialStore.update({
       signatureType: request.signatureType,
       funderAddress,
       signerPrivateKey: privateKey,
@@ -97,6 +109,33 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       apiSecret: derived.secret,
       apiPassphrase: derived.passphrase
     })
+    this.cachedTradingCapacity = undefined
+    return updated
+  }
+
+  getCachedTradingCapacity(): PolymarketTradingCapacity | undefined {
+    return this.cachedTradingCapacity
+  }
+
+  async ensureTradingCapacity(maximumAgeMs = 30_000): Promise<PolymarketTradingCapacity> {
+    if (this.cachedTradingCapacity && Date.now() - this.cachedTradingCapacity.checkedAt <= maximumAgeMs) {
+      return this.cachedTradingCapacity
+    }
+    const credentials = await this.credentialStore.getCredentials()
+    const signer = this.createSigner(credentials.signerPrivateKey)
+    const client = this.createAuthenticatedClient(credentials, signer)
+    const [balance, closedOnlyResult] = await Promise.all([
+      client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }),
+      client.getClosedOnlyMode()
+    ])
+    const capacity = {
+      checkedAt: Date.now(),
+      collateralBalance: formatCollateral(balance.balance),
+      allowanceReady: allowanceValues(balance).some((value) => value.gt(0)),
+      closedOnly: Boolean(closedOnlyResult.closed_only)
+    }
+    this.cachedTradingCapacity = capacity
+    return capacity
   }
 
   async validateIdentity(tokenId?: string): Promise<PolymarketIdentityValidation> {
@@ -143,6 +182,12 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       ? undefined
       : await this.findFundedSignatureType(credentials, signer)
     const closedOnly = Boolean(closedOnlyResult.closed_only)
+    this.cachedTradingCapacity = {
+      checkedAt: Date.now(),
+      collateralBalance,
+      allowanceReady,
+      closedOnly
+    }
     const ok = apiAuthenticated && allowanceReady && hasCollateral && !closedOnly && (!tokenId || localOrderSigned)
     const message = closedOnly
       ? '身份认证成功，但Polymarket账户当前仅允许平仓，不能执行新的BUY对冲'

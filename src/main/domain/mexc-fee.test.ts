@@ -25,6 +25,12 @@ describe('MEXC prediction fee calibration', () => {
     })
   })
 
+  it('does not treat an unpaired buy from a short intercepted page as zero fee', () => {
+    expect(deriveMexcFeeRate([{ tn: 'partial-page', ta: -10, bt: 107, tt: now - 1_000 }], now, false)).toEqual({
+      feeRate: '0', source: 'UNAVAILABLE', sampleCount: 0
+    })
+  })
+
   it('reports unavailable instead of inventing a fallback when history is stale or absent', () => {
     expect(deriveMexcFeeRate([{ tn: 'stale', ta: -10, bt: 107, tt: now - 8 * 24 * 60 * 60 * 1_000 }], now)).toEqual({
       feeRate: '0',

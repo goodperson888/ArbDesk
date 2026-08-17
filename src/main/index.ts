@@ -83,6 +83,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('app:get-snapshot', () => controller.getSnapshot())
   ipcMain.handle('app:refresh-opportunities', () => controller.refreshOpportunities())
   ipcMain.handle('app:execute', (_event, request) => controller.execute(request))
+  ipcMain.handle('app:calculate-execution-plan', (_event, request) => controller.calculateExecutionPlan(request))
   ipcMain.handle('app:confirm-mexc-fill', (_event, fill) => controller.confirmMexcFill(fill))
   ipcMain.handle('app:cancel-execution', () => controller.cancelExecution())
   ipcMain.handle('app:close-order', (_event, request) => controller.closeOrder(request))
@@ -93,7 +94,10 @@ app.whenReady().then(async () => {
   ipcMain.handle('mexc:calibrate', (_event, kind) => mexcBrowser.calibrate(kind))
   ipcMain.handle('polymarket:credential-summary', () => polymarketCredentials.getSummary())
   ipcMain.handle('polymarket:test-connection', () => controller.testPolymarketConnection())
-  ipcMain.handle('polymarket:update-credentials', (_event, request) => polymarketLive.configureIdentity(request))
+  ipcMain.handle('polymarket:update-credentials', async (_event, request) => {
+    await controller.disarmAutoOpen('Polymarket交易身份已变更，自动开单已停用')
+    return await polymarketLive.configureIdentity(request)
+  })
   ipcMain.handle('polymarket:validate-identity', (_event, tokenId) => polymarketLive.validateIdentity(tokenId))
 
   await createWindow()

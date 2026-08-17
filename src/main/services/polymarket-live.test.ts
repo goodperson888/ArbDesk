@@ -157,6 +157,23 @@ describe('PolymarketLiveBroker', () => {
     expect(result.ok).toBe(true)
   })
 
+  it('refreshes maximum-order capacity with only balance and closed-only requests, then reuses the cache', async () => {
+    const getBalanceAllowance = vi.fn(async () => ({
+      balance: '42000000', allowances: { exchange: '1000000000' }
+    }))
+    const getClosedOnlyMode = vi.fn(async () => ({ closed_only: false }))
+    const client = { getBalanceAllowance, getClosedOnlyMode } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    await expect(broker.ensureTradingCapacity()).resolves.toEqual(expect.objectContaining({
+      collateralBalance: '42', allowanceReady: true, closedOnly: false
+    }))
+    await broker.ensureTradingCapacity()
+
+    expect(getBalanceAllowance).toHaveBeenCalledTimes(1)
+    expect(getClosedOnlyMode).toHaveBeenCalledTimes(1)
+  })
+
   it('probes read-only balances and recommends the funded signature type', async () => {
     const proxyFunder = '0x1111111111111111111111111111111111111111'
     const proxyCredentials: PolymarketCredentials = {

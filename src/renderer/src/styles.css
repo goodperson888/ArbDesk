@@ -322,6 +322,9 @@ td small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px
 .browser-status-detail { margin-top: 10px; display: grid !important; grid-template-columns: auto 1fr; align-items: center; gap: 8px; padding: 8px 9px; border: 1px solid var(--border-soft); border-radius: 8px; background: rgba(15,23,42,.4); }
 .browser-status-detail span { padding: 3px 6px; color: #bae6fd; border-radius: 5px; background: rgba(56,189,248,.1); font-size: 8px; font-weight: 800; letter-spacing: .07em; }
 .browser-status-detail p { margin: 0; color: var(--muted); font-size: 9px; line-height: 1.4; }
+.auto-open-status.stabilizing span, .auto-open-status.verifying span { color: #fde68a; background: rgba(245,158,11,.12); }
+.auto-open-status.error span { color: #fecaca; background: rgba(239,68,68,.12); }
+.auto-open-status.cooldown span { color: #cbd5e1; background: rgba(148,163,184,.12); }
 .settings-title-row { justify-content: space-between; }
 .settings-title-row > div:first-child { display: flex; align-items: flex-start; flex-direction: column; }
 .settings-kicker { margin-top: 2px; color: var(--muted); font-size: 9px; font-weight: 500; }
