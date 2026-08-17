@@ -108,12 +108,16 @@ describe('AppController simulation', () => {
 
     const settings = await controller.updateSettings({
       mexcBrowserMode: 'HUBSTUDIO',
-      hubstudioContainerCode: ' 223012801 '
+      hubstudioContainerCode: ' 223012801 ',
+      maxCapitalPerTrade: '250.5'
     })
 
     expect(settings.mexcBrowserMode).toBe('HUBSTUDIO')
     expect(settings.hubstudioContainerCode).toBe('223012801')
+    expect(settings.maxCapitalPerTrade).toBe('250.50')
     expect(configurations.at(-1)).toEqual({ mode: 'HUBSTUDIO', hubstudioContainerCode: '223012801', elementMode: 'AUTO' })
+    await expect(controller.updateSettings({ maxCapitalPerTrade: '0' })).rejects.toThrow('单笔最大本金')
+    await expect(controller.updateSettings({ maxCapitalPerTrade: '1000001' })).rejects.toThrow('单笔最大本金')
   })
 
   it('matches 5m and 15m quotes only within the same duration and round', async () => {

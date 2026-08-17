@@ -161,6 +161,8 @@ function App(): JSX.Element {
   const [historyOpen, setHistoryOpen] = useState(false)
   const [logsOpen, setLogsOpen] = useState(false)
   const [closeIntent, setCloseIntent] = useState<{ order: ArbitrageOrderRecord; target: CloseTarget }>()
+  const [dismissedExecutionNoticeKey, setDismissedExecutionNoticeKey] = useState<string>()
+  const [maxCapitalDraft, setMaxCapitalDraft] = useState('100.00')
   const [minNetEdgeDraft, setMinNetEdgeDraft] = useState('0.0100')
   const [soundEnabledDraft, setSoundEnabledDraft] = useState(true)
   const [soundVolumeDraft, setSoundVolumeDraft] = useState(0.65)
@@ -191,6 +193,7 @@ function App(): JSX.Element {
     if (!settingsOpen) return
     setHubstudioCode(snapshot?.settings.hubstudioContainerCode ?? '')
     setPolymarketProxyUrl(snapshot?.settings.polymarketProxyUrl ?? '')
+    setMaxCapitalDraft(snapshot?.settings.maxCapitalPerTrade ?? '100.00')
     setMinNetEdgeDraft(snapshot?.settings.minNetEdgePerShare ?? '0.0100')
     setSoundEnabledDraft(snapshot?.settings.opportunitySoundEnabled ?? true)
     setSoundVolumeDraft(snapshot?.settings.opportunitySoundVolume ?? 0.65)
@@ -536,6 +539,11 @@ function App(): JSX.Element {
   }
 
   async function saveDecisionSettings(): Promise<void> {
+    const maxCapital = Number(maxCapitalDraft)
+    if (!Number.isFinite(maxCapital) || maxCapital <= 0 || maxCapital > 1_000_000) {
+      setMessage('单笔最大本金须为大于0且不超过1,000,000 USDT的数值')
+      return
+    }
     const edge = Number(minNetEdgeDraft)
     if (!Number.isFinite(edge) || edge < 0 || edge >= 1) {
       setMessage('最低净边际须为0至1之间的美元/份数值')
@@ -547,12 +555,67 @@ function App(): JSX.Element {
       return
     }
     const result = await run(() => window.arbApp.updateSettings({
+      maxCapitalPerTrade: maxCapital.toFixed(2),
       minNetEdgePerShare: edge.toFixed(4),
       opportunitySoundEnabled: soundEnabledDraft,
       opportunitySoundVolume: soundVolumeDraft,
       opportunitySoundCooldownSeconds: cooldownSeconds
     }), '下单门槛与提示音设置已保存')
     if (result && snapshot) setSnapshot({ ...snapshot, settings: result })
+  }
+
+  async function setMaximumQuantity(): Promise<void> {
+    if (!snapshot || !selected) return
+    const constraints = [
+      { label: '两边盘口', quantity: Number(selected.maxQuantity) },
+      { label: '单笔金额上限', quantity: maximumTicketQuantity }
+    ]
+
+    if (snapshot.settings.mode === 'ASSISTED') {
+      const accountResult = await run(async () => {
+        const [mexc, polymarket] = await Promise.all([
+          window.arbApp.refreshMexcAccount(),
+          window.arbApp.validatePolymarketIdentity(selected.polymarketTokenId)
+        ])
+        return { mexc, polymarket }
+      })
+      if (!accountResult) return
+      setMexcStatus(accountResult.mexc)
+      setPolyValidation(accountResult.polymarket)
+      if (!accountResult.polymarket.ok) {
+        setMessage(`Polymarket账户暂不可开仓：${accountResult.polymarket.message}`)
+        return
+      }
+      const mexcBalance = Number(accountResult.mexc.account?.availableUsdt)
+      const polymarketBalance = Number(accountResult.polymarket.collateralBalance)
+      if (!Number.isFinite(mexcBalance) || mexcBalance < 0) {
+        setMessage('未读取到MEXC可用USDT，无法计算账户最大份额')
+        return
+      }
+      if (!Number.isFinite(polymarketBalance) || polymarketBalance < 0) {
+        setMessage('未读取到Polymarket抵押余额，无法计算账户最大份额')
+        return
+      }
+      const mexcCashPerShare = Number(selected.mexcPrice) + Number(selected.mexcFeePerShare)
+      const polymarketCashPerShare = polymarketMaximumPrice + Number(selected.polymarketFeePerShare)
+      constraints.push(
+        { label: 'MEXC可用余额', quantity: mexcCashPerShare > 0 ? mexcBalance / mexcCashPerShare : 0 },
+        { label: 'Polymarket可用余额', quantity: polymarketCashPerShare > 0 ? polymarketBalance / polymarketCashPerShare : 0 }
+      )
+    }
+
+    const rawMaximum = Math.min(...constraints.map((item) => item.quantity))
+    const maximum = Math.max(0, Math.floor(rawMaximum * 100) / 100)
+    if (!Number.isFinite(maximum) || maximum < minimumAlignedQuantity) {
+      setMessage(`当前盘口、账户余额或单笔上限不足最小对齐份额${minimumAlignedQuantity.toFixed(2)}份`)
+      return
+    }
+    const binding = constraints
+      .filter((item) => Math.abs(item.quantity - rawMaximum) < 0.01)
+      .map((item) => item.label)
+      .join('、')
+    setQuantity(maximum.toFixed(2))
+    setMessage(`已按${binding}设置最大${maximum.toFixed(2)}份`)
   }
 
   async function confirmCloseOrder(): Promise<void> {
@@ -587,6 +650,7 @@ function App(): JSX.Element {
   }
 
   const active = snapshot.activeSession
+  const executionNoticeKey = active ? `${active.id}:${active.state}:${active.error ?? ''}` : undefined
   const automaticLiveFlow = snapshot.settings.mexcAutomationEnabled && snapshot.settings.polymarketLiveEnabled
   const needsMexcConfirmation = active &&
     ['MEXC_SUBMITTED', 'MEXC_SUBMITTING'].includes(active.state) &&
@@ -676,10 +740,10 @@ function App(): JSX.Element {
               <label className="field-label" htmlFor="quantity">对齐份额</label>
               <div className="quantity-control">
                 <input id="quantity" value={quantity} inputMode="decimal" onChange={(event) => setQuantity(event.target.value)} />
-                <button onClick={() => setQuantity(snapshot.settings.allowUnprofitableTestTrade
-                  ? minimumAlignedQuantity.toFixed(2)
-                  : String(Math.min(Number(selected.maxQuantity), maximumTicketQuantity).toFixed(2)))}>
-                  {snapshot.settings.allowUnprofitableTestTrade ? '最小' : '最大'}
+                <button onClick={() => snapshot.settings.allowUnprofitableTestTrade
+                  ? setQuantity(minimumAlignedQuantity.toFixed(2))
+                  : void setMaximumQuantity()} disabled={busy}>
+                  {snapshot.settings.allowUnprofitableTestTrade ? '最小' : busy ? '计算中' : '最大'}
                 </button>
               </div>
 
@@ -733,7 +797,12 @@ function App(): JSX.Element {
         </aside>
       </main>
 
-      {active && <ExecutionBar state={active.state} quantity={active.requestedQuantity} error={active.error} />}
+      {active && executionNoticeKey !== dismissedExecutionNoticeKey && <ExecutionBar
+        state={active.state}
+        quantity={active.requestedQuantity}
+        error={active.error}
+        onDismiss={() => setDismissedExecutionNoticeKey(executionNoticeKey)}
+      />}
 
       {needsMexcConfirmation && (
         <div className="modal-backdrop" role="presentation">
@@ -789,10 +858,15 @@ function App(): JSX.Element {
                 <button className={snapshot.settings.mode === 'SIMULATION' ? 'active' : ''} onClick={() => void setMode('SIMULATION')}><Bot />模拟</button>
                 <button className={snapshot.settings.mode === 'ASSISTED' ? 'active' : ''} onClick={() => void setMode('ASSISTED')}><SlidersHorizontal />人工监督</button>
               </div>
-              <p>人工监督会先执行MEXC，确认实际成交后才对冲；最低净边际按每份美元判断。</p>
-              <label className="settings-field" htmlFor="min-net-edge">最低净边际（美元/份）
-                <input id="min-net-edge" value={minNetEdgeDraft} onChange={(event) => setMinNetEdgeDraft(event.target.value)} inputMode="decimal" />
-              </label>
+              <p>人工监督会先执行MEXC，确认实际成交后才对冲；“最大”会取盘口、两边账户余额和单笔本金上限中的最小值。</p>
+              <div className="decision-field-grid">
+                <label className="settings-field" htmlFor="max-capital">单笔最大本金（USDT）
+                  <input id="max-capital" value={maxCapitalDraft} onChange={(event) => setMaxCapitalDraft(event.target.value)} inputMode="decimal" />
+                </label>
+                <label className="settings-field" htmlFor="min-net-edge">最低净边际（美元/份）
+                  <input id="min-net-edge" value={minNetEdgeDraft} onChange={(event) => setMinNetEdgeDraft(event.target.value)} inputMode="decimal" />
+                </label>
+              </div>
               <div className="sound-setting-row">
                 <label htmlFor="opportunity-sound"><input id="opportunity-sound" type="checkbox" checked={soundEnabledDraft} onChange={(event) => setSoundEnabledDraft(event.target.checked)} />可下单提示音</label>
                 <button className="secondary-button" onClick={() => playOpportunityChime(soundVolumeDraft)}><Volume2 aria-hidden="true" />测试</button>
@@ -1155,13 +1229,14 @@ function CloseConfirmModal({
   )
 }
 
-function ExecutionBar({ state, quantity, error }: { state: ExecutionState; quantity: string; error?: string }): JSX.Element {
-  const danger = state === 'RECOVERY_REQUIRED'
-  const done = state === 'HEDGED'
+function ExecutionBar({ state, quantity, error, onDismiss }: { state: ExecutionState; quantity: string; error?: string; onDismiss: () => void }): JSX.Element {
+  const danger = state === 'RECOVERY_REQUIRED' || state === 'UNHEDGED' || Boolean(error)
+  const done = state === 'HEDGED' || state === 'CLOSED'
   return <div className={`execution-bar ${danger ? 'danger' : done ? 'done' : ''}`}>
     <div className="execution-pulse">{done ? <Check /> : danger ? <AlertTriangle /> : <LoaderCircle className="spin" />}</div>
     <div className="execution-summary"><span>当前执行组 · {quantity}份</span><strong>{STATE_LABELS[state]}</strong>{error && <small title={error}>{error}</small>}</div>
     <div className="execution-progress"><span /></div>
+    <button className="execution-close" onClick={onDismiss} aria-label="关闭执行状态提示" title="关闭提示"><X /></button>
   </div>
 }
 

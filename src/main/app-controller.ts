@@ -187,6 +187,11 @@ export class AppController {
   async updateSettings(request: UpdateSettingsRequest): Promise<RiskSettings> {
     const next = { ...this.settings, ...request }
     next.settlementDistanceRules = normalizeSettlementDistanceRules(next.settlementDistanceRules)
+    const maximumCapital = new Decimal(next.maxCapitalPerTrade)
+    if (!maximumCapital.isFinite() || maximumCapital.lte(0) || maximumCapital.gt(1_000_000)) {
+      throw new Error('单笔最大本金须为大于0且不超过1,000,000 USDT的数值')
+    }
+    next.maxCapitalPerTrade = maximumCapital.toDecimalPlaces(2).toFixed(2)
     const minimumEdge = new Decimal(next.minNetEdgePerShare)
     if (!minimumEdge.isFinite() || minimumEdge.lt(0) || minimumEdge.gte(1)) {
       throw new Error('最低净边际须为0至1之间的美元/份数值')
