@@ -12,16 +12,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
 
       - name: Cache Electron downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~\AppData\Local\electron\Cache
@@ -45,19 +45,17 @@ jobs:
           }
 
       - name: Upload packaging log
-        if: always()
-        uses: actions/upload-artifact@v4
+        if: failure()
+        uses: actions/upload-artifact@v7
         with:
           name: ArbDesk-Windows-build-log
           path: package-win.log
           retention-days: 7
 
       - name: Upload Windows installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ArbDesk-Windows
-          path: |
-            release/*.exe
-            release/*.yml
+          name: ArbDesk-Windows-Installer
+          path: release/*.exe
           if-no-files-found: error
           retention-days: 7
