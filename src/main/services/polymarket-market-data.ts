@@ -96,11 +96,6 @@ function timeoutSignal(ms: number): AbortSignal {
   return AbortSignal.timeout(ms)
 }
 
-function eventTimestamp(value: string | number | undefined): number {
-  const parsed = Number(value)
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : Date.now()
-}
-
 export function applyPolymarketStreamEvent(
   windows: PolymarketWindowQuote[],
   event: MarketStreamEvent
@@ -118,7 +113,7 @@ export function applyPolymarketStreamEvent(
   if (updates.length === 0) return windows
 
   let changed = false
-  const receivedAt = eventTimestamp(event.timestamp)
+  const receivedAt = Date.now()
   const next = windows.map((window) => {
     let windowChanged = false
     const outcomes = { ...window.outcomes }
@@ -249,12 +244,23 @@ export class PolymarketMarketData {
         this.lastError = `CLOB实时盘口流已连接（${normalized.length}个 outcome）`
         this.socketHeartbeat = setInterval(() => {
           if (socket.readyState === socket.OPEN) socket.send('PING')
-        }, 10_000)
+        }, 5_000)
         this.socketHeartbeat.unref()
       })
       socket.addEventListener('message', (message) => {
         const raw = String(message.data)
-        if (raw === 'PONG') return
+        if (raw === 'PONG') {
+          const receivedAt = Date.now()
+          this.latestWindows = this.latestWindows.map((window) => ({
+            ...window,
+            outcomes: Object.fromEntries(Object.entries(window.outcomes).map(([direction, outcome]) => [
+              direction,
+              outcome ? { ...outcome, receivedAt } : outcome
+            ])) as Partial<Record<Direction, PolymarketOutcomeQuote>>
+          }))
+          this.emitMarketData()
+          return
+        }
         try {
           const parsed = JSON.parse(raw) as MarketStreamEvent | MarketStreamEvent[]
           let changed = false
@@ -371,14 +377,13 @@ export class PolymarketMarketData {
       .sort((left, right) => Number(left.price) - Number(right.price))
     const best = levels[0]
     if (!best) return undefined
-    const apiTimestamp = Number(book.timestamp)
     return {
       direction,
       tokenId,
       bestAsk: best.price,
       askSize: best.size,
       levels,
-      receivedAt: Number.isFinite(apiTimestamp) && apiTimestamp > 0 ? apiTimestamp : Date.now(),
+      receivedAt: Date.now(),
       feeRate: Number.isFinite(fee.rate) && fee.rate >= 0 ? String(fee.rate) : '0.07',
       feeExponent: Number.isFinite(fee.exponent) && fee.exponent >= 0 ? String(fee.exponent) : '1',
       minOrderSize: String(book.min_order_size || '1')
@@ -418,7 +423,7 @@ export class PolymarketMarketData {
     return {
       baselinePrice: Number(price.openPrice) > 0 ? String(price.openPrice) : undefined,
       indexPrice: Number(current?.value) > 0 ? String(current?.value) : undefined,
-      indexReceivedAt: Number(current?.timestamp) > 0 ? Number(current?.timestamp) : undefined
+      indexReceivedAt: Number(current?.value) > 0 ? Date.now() : undefined
     }
   }
 

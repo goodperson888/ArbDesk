@@ -66,6 +66,9 @@ describe('AppController simulation', () => {
     await controller.refreshOpportunities()
     const opportunity = controller.getSnapshot().opportunities[0]
 
+    await controller.updateSettings({ minConditionalReturnPct: '100' })
+    await expect(controller.execute({ opportunityId: opportunity.id, quantity: '5' })).rejects.toThrow('条件收益率')
+    await controller.updateSettings({ minConditionalReturnPct: '0' })
     const session = await controller.execute({ opportunityId: opportunity.id, quantity: '5' })
 
     expect(session.state).toBe('HEDGED')
@@ -109,15 +112,23 @@ describe('AppController simulation', () => {
     const settings = await controller.updateSettings({
       mexcBrowserMode: 'HUBSTUDIO',
       hubstudioContainerCode: ' 223012801 ',
-      maxCapitalPerTrade: '250.5'
+      maxCapitalPerTrade: '250.5',
+      minConditionalReturnPct: '1.234',
+      maxQuoteAgeMs: 9_000
     })
 
     expect(settings.mexcBrowserMode).toBe('HUBSTUDIO')
     expect(settings.hubstudioContainerCode).toBe('223012801')
     expect(settings.maxCapitalPerTrade).toBe('250.50')
+    expect(settings.minConditionalReturnPct).toBe('1.23')
+    expect(settings.maxQuoteAgeMs).toBe(9_000)
     expect(configurations.at(-1)).toEqual({ mode: 'HUBSTUDIO', hubstudioContainerCode: '223012801', elementMode: 'AUTO' })
     await expect(controller.updateSettings({ maxCapitalPerTrade: '0' })).rejects.toThrow('单笔最大本金')
     await expect(controller.updateSettings({ maxCapitalPerTrade: '1000001' })).rejects.toThrow('单笔最大本金')
+    await expect(controller.updateSettings({ minConditionalReturnPct: '-1' })).rejects.toThrow('最低条件收益率')
+    await expect(controller.updateSettings({ minConditionalReturnPct: '101' })).rejects.toThrow('最低条件收益率')
+    await expect(controller.updateSettings({ maxQuoteAgeMs: 2_000 })).rejects.toThrow('行情最长未确认时间')
+    await expect(controller.updateSettings({ maxQuoteAgeMs: 31_000 })).rejects.toThrow('行情最长未确认时间')
   })
 
   it('matches 5m and 15m quotes only within the same duration and round', async () => {
@@ -163,6 +174,7 @@ describe('AppController simulation', () => {
 
     expect(snapshot.opportunities).toHaveLength(2)
     expect(snapshot.opportunities.every((opportunity) => opportunity.durationMinutes === 5)).toBe(true)
+    expect(snapshot.opportunities.map((opportunity) => opportunity.mexcDirection)).toEqual(['UP', 'DOWN'])
     expect(snapshot.connectionDetails.mexc).toContain('5m/15m 并行监控')
   })
 

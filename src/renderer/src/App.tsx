@@ -9,6 +9,7 @@ import {
   Bot,
   Check,
   ChevronRight,
+  CircleHelp,
   ExternalLink,
   History,
   Info,
@@ -99,21 +100,60 @@ function StatusDot({ status }: { status: string }): JSX.Element {
 }
 
 function opportunityReady(opportunity: Opportunity, snapshot: AppSnapshot, now: number): boolean {
-  const polymarketMaximumPrice = Math.min(0.99, Number(opportunity.polymarketPrice) + Number(snapshot.settings.maxHedgeSlippage))
-  const minimumQuantity = polymarketMaximumPrice > 0 && Number(opportunity.mexcPrice) > 0
+  const minimumQuantity = minimumQuantityForOpportunity(opportunity, snapshot.settings.maxHedgeSlippage)
+  return !opportunity.stale &&
+    !opportunity.feeVerificationBlocked &&
+    !opportunity.settlementRiskBlocked &&
+    Number(opportunity.netEdgePerShare) >= Number(snapshot.settings.minNetEdgePerShare) &&
+    Number(opportunity.conditionalReturnPct) >= Number(snapshot.settings.minConditionalReturnPct) &&
+    Number(opportunity.maxQuantity) >= minimumQuantity &&
+    Number(opportunity.allInCostPerShare) * minimumQuantity <= Number(snapshot.settings.maxCapitalPerTrade) &&
+    (opportunity.endTime - now) / 1_000 > snapshot.settings.stopBeforeExpirySeconds
+}
+
+function minimumQuantityForOpportunity(opportunity: Opportunity, maxHedgeSlippage: string): number {
+  const polymarketMaximumPrice = Math.min(0.99, Number(opportunity.polymarketPrice) + Number(maxHedgeSlippage))
+  return polymarketMaximumPrice > 0 && Number(opportunity.mexcPrice) > 0
     ? Math.ceil(Math.max(
       Number(opportunity.polymarketMinOrderSize),
       1 / Number(opportunity.mexcPrice),
       1 / polymarketMaximumPrice
     ) * 100) / 100
     : Number.POSITIVE_INFINITY
-  return !opportunity.stale &&
-    !opportunity.feeVerificationBlocked &&
-    !opportunity.settlementRiskBlocked &&
-    Number(opportunity.netEdgePerShare) >= Number(snapshot.settings.minNetEdgePerShare) &&
-    Number(opportunity.maxQuantity) >= minimumQuantity &&
-    Number(opportunity.allInCostPerShare) * minimumQuantity <= Number(snapshot.settings.maxCapitalPerTrade) &&
-    (opportunity.endTime - now) / 1_000 > snapshot.settings.stopBeforeExpirySeconds
+}
+
+function opportunityPotentialProfit(opportunity: Opportunity, snapshot: AppSnapshot): number {
+  const cost = Number(opportunity.allInCostPerShare)
+  if (!(cost > 0)) return Number.NEGATIVE_INFINITY
+  const capitalQuantity = Math.floor(Number(snapshot.settings.maxCapitalPerTrade) / cost * 100) / 100
+  const executableQuantity = Math.max(0, Math.min(Number(opportunity.maxQuantity), capitalQuantity))
+  return Number(opportunity.netEdgePerShare) * executableQuantity
+}
+
+function quoteAgeLabel(milliseconds: number): string {
+  return `${Math.max(0, milliseconds / 1_000).toFixed(1)}秒`
+}
+
+interface ExecutionCheck {
+  passed: boolean
+  label: string
+}
+
+function ExecutionConditionsHelp({ checks }: { checks: ExecutionCheck[] }): JSX.Element {
+  const passed = checks.filter((check) => check.passed).length
+  return <details className="execution-conditions-help">
+    <summary aria-label="查看下单条件" title="查看下单条件"><CircleHelp aria-hidden="true" /></summary>
+    <div className="execution-conditions-popover">
+      <strong>下单条件 · {passed}/{checks.length}</strong>
+      <ul>
+        {checks.map((check) => <li key={check.label} className={check.passed ? 'passed' : 'blocked'}>
+          {check.passed ? <Check aria-hidden="true" /> : <X aria-hidden="true" />}
+          <span>{check.label}</span>
+        </li>)}
+      </ul>
+      <small>点击开仓后仍会强制刷新两边盘口；真实下单接口会继续校验账户余额。</small>
+    </div>
+  </details>
 }
 
 function playOpportunityChime(volume: number): void {
@@ -164,11 +204,14 @@ function App(): JSX.Element {
   const [dismissedExecutionNoticeKey, setDismissedExecutionNoticeKey] = useState<string>()
   const [maxCapitalDraft, setMaxCapitalDraft] = useState('100.00')
   const [minNetEdgeDraft, setMinNetEdgeDraft] = useState('0.0100')
+  const [minConditionalReturnDraft, setMinConditionalReturnDraft] = useState('0.00')
+  const [quoteValidityDraft, setQuoteValidityDraft] = useState('8')
   const [soundEnabledDraft, setSoundEnabledDraft] = useState(true)
   const [soundVolumeDraft, setSoundVolumeDraft] = useState(0.65)
   const [soundCooldownDraft, setSoundCooldownDraft] = useState('30')
   const previousCanExecuteRef = useRef(false)
   const soundCooldownRef = useRef(new Map<string, number>())
+  const manualSelectionUntilRef = useRef(0)
 
   useEffect(() => {
     void window.arbApp.getSnapshot().then((value) => {
@@ -179,9 +222,9 @@ function App(): JSX.Element {
     })
     const unsubscribe = window.arbApp.onSnapshot(setSnapshot)
     const clock = window.setInterval(() => setNow(Date.now()), 500)
-    // Market depth arrives through backend streams; this only refreshes rolling
-    // market discovery, settlement references and fees as a fallback.
-    const refresh = window.setInterval(() => void window.arbApp.refreshOpportunities().catch(() => undefined), 10_000)
+    // Market depth arrives through backend streams; the five-second refresh is
+    // a full-book audit for quiet markets and a fallback for broken streams.
+    const refresh = window.setInterval(() => void window.arbApp.refreshOpportunities().catch(() => undefined), 5_000)
     return () => {
       unsubscribe()
       window.clearInterval(clock)
@@ -195,6 +238,8 @@ function App(): JSX.Element {
     setPolymarketProxyUrl(snapshot?.settings.polymarketProxyUrl ?? '')
     setMaxCapitalDraft(snapshot?.settings.maxCapitalPerTrade ?? '100.00')
     setMinNetEdgeDraft(snapshot?.settings.minNetEdgePerShare ?? '0.0100')
+    setMinConditionalReturnDraft(snapshot?.settings.minConditionalReturnPct ?? '0.00')
+    setQuoteValidityDraft(String((snapshot?.settings.maxQuoteAgeMs ?? 8_000) / 1_000))
     setSoundEnabledDraft(snapshot?.settings.opportunitySoundEnabled ?? true)
     setSoundVolumeDraft(snapshot?.settings.opportunitySoundVolume ?? 0.65)
     setSoundCooldownDraft(String(snapshot?.settings.opportunitySoundCooldownSeconds ?? 30))
@@ -219,7 +264,22 @@ function App(): JSX.Element {
     () => snapshot?.opportunities.find((opportunity) => opportunity.id === selectedId) ?? snapshot?.opportunities[0],
     [selectedId, snapshot]
   )
-  const readyOpportunityCount = snapshot?.opportunities.filter((opportunity) => opportunityReady(opportunity, snapshot, now)).length ?? 0
+  const readyOpportunities = useMemo(() => snapshot
+    ? snapshot.opportunities.filter((opportunity) => opportunityReady(opportunity, snapshot, now))
+    : [], [now, snapshot])
+  const bestOpportunity = useMemo(() => snapshot
+    ? [...readyOpportunities].sort((left, right) =>
+      opportunityPotentialProfit(right, snapshot) - opportunityPotentialProfit(left, snapshot) ||
+      Number(right.netEdgePerShare) - Number(left.netEdgePerShare)
+    )[0]
+    : undefined, [readyOpportunities, snapshot])
+  const readyOpportunityCount = readyOpportunities.length
+  const orderedOpportunities = useMemo(() => snapshot
+    ? [...snapshot.opportunities].sort((left, right) =>
+      left.durationMinutes - right.durationMinutes ||
+      Number(left.mexcDirection === 'DOWN') - Number(right.mexcDirection === 'DOWN')
+    )
+    : [], [snapshot])
   const requestedCapital = selected ? Number(selected.allInCostPerShare) * Number(quantity || 0) : 0
   const requestedProfit = selected ? Number(selected.netEdgePerShare) * Number(quantity || 0) : 0
   const requestedBothLose = selected ? Number(selected.bothLosePnlPerShare) * Number(quantity || 0) : 0
@@ -249,6 +309,10 @@ function App(): JSX.Element {
     minimumTestCapital <= 12 &&
     requestedCapital <= dynamicTestCapitalLimit
   )
+  const executionSessionIdle = !snapshot?.activeSession || ['HEDGED', 'CANCELLED'].includes(snapshot.activeSession.state)
+  const netEdgePassed = Boolean(selected && snapshot && Number(selected.netEdgePerShare) >= Number(snapshot.settings.minNetEdgePerShare))
+  const conditionalReturnPassed = Boolean(selected && snapshot && Number(selected.conditionalReturnPct) >= Number(snapshot.settings.minConditionalReturnPct))
+  const settlementRiskPassed = Boolean(selected && !selected.settlementRiskBlocked)
   const canExecute = Boolean(
     selected &&
       Number(quantity) > 0 &&
@@ -258,19 +322,23 @@ function App(): JSX.Element {
       !selected.feeVerificationBlocked &&
       (!snapshot?.settings.allowUnprofitableTestTrade || (minimumTestCapital <= 12 && requestedCapital <= dynamicTestCapitalLimit)) &&
       (Number(selected.netEdgePerShare) >= Number(snapshot?.settings.minNetEdgePerShare ?? 0) || testOverrideReady) &&
+      (Number(selected.conditionalReturnPct) >= Number(snapshot?.settings.minConditionalReturnPct ?? 0) || testOverrideReady) &&
       (!selected.settlementRiskBlocked || testOverrideReady) &&
       !selected.stale &&
       (selected.endTime - now) / 1_000 > Number(snapshot?.settings.stopBeforeExpirySeconds ?? 0) &&
+      executionSessionIdle &&
       !busy
   )
   const executeBlockReason = !selected
     ? '当前没有匹配市场'
+    : !executionSessionIdle
+      ? `已有执行中的套利组（${snapshot?.activeSession?.state ?? '未知状态'}）`
     : !(Number(quantity) > 0)
       ? '请输入大于0的对齐份额'
     : Number(quantity) < minimumAlignedQuantity
         ? `最小对齐份额为${minimumAlignedQuantity.toFixed(2)}份（Polymarket至少${selected.polymarketMinOrderSize}份且BUY金额至少1，MEXC本金至少1 USDT）`
       : Number(quantity) > Number(selected.maxQuantity)
-        ? '份额超过两边当前盘口可执行量'
+        ? `输入${Number(quantity).toFixed(2)}份超过盘口：MEXC可用${selected.mexcAvailableQuantity}份，Polymarket可用${selected.polymarketAvailableQuantity}份`
         : requestedCapital > Number(snapshot?.settings.maxCapitalPerTrade ?? 0)
           ? '预计本金超过单笔上限'
           : selected.stale
@@ -283,6 +351,8 @@ function App(): JSX.Element {
               ? selected.settlementRiskReason ?? '结算信号风控拦截'
               : Number(selected.netEdgePerShare) < Number(snapshot?.settings.minNetEdgePerShare ?? 0) && !snapshot?.settings.allowUnprofitableTestTrade
                 ? '净收益低于门槛；可在设置中放开一次小额亏损联调'
+              : Number(selected.conditionalReturnPct) < Number(snapshot?.settings.minConditionalReturnPct ?? 0) && !snapshot?.settings.allowUnprofitableTestTrade
+                ? '条件收益率低于设置门槛'
                 : snapshot?.settings.allowUnprofitableTestTrade && !snapshot.settings.polymarketLiveEnabled
                   ? '小额亏损联调需先验证身份并开启Polymarket真实FOK'
                   : snapshot?.settings.allowUnprofitableTestTrade && minimumTestCapital > 12
@@ -290,6 +360,39 @@ function App(): JSX.Element {
                   : snapshot?.settings.allowUnprofitableTestTrade && requestedCapital > dynamicTestCapitalLimit
                     ? `小额验证最多使用${dynamicTestCapitalLimit.toFixed(2)} USDT，可点击“最大”自动调整`
                     : undefined
+
+  const executionChecks: ExecutionCheck[] = selected && snapshot ? [
+    { passed: Number(quantity) > 0, label: `输入份额 ${Number(quantity || 0).toFixed(2)} > 0` },
+    { passed: Number(quantity) >= minimumAlignedQuantity, label: `最小对齐 ${Number(quantity || 0).toFixed(2)} ≥ ${minimumAlignedQuantity.toFixed(2)}份` },
+    { passed: Number(quantity) <= Number(selected.maxQuantity), label: `两边盘口 输入${Number(quantity || 0).toFixed(2)} ≤ ${selected.maxQuantity}份（MEXC ${selected.mexcAvailableQuantity} / Poly ${selected.polymarketAvailableQuantity}）` },
+    { passed: requestedCapital <= Number(snapshot.settings.maxCapitalPerTrade), label: `预计本金 $${requestedCapital.toFixed(2)} ≤ $${Number(snapshot.settings.maxCapitalPerTrade).toFixed(2)}` },
+    { passed: netEdgePassed || testOverrideReady, label: `净边际 ${money(selected.netEdgePerShare, 4)} ≥ ${money(snapshot.settings.minNetEdgePerShare, 4)}美元/份${!netEdgePassed && testOverrideReady ? '（小额联调豁免）' : ''}` },
+    { passed: conditionalReturnPassed || testOverrideReady, label: `条件收益率 ${money(selected.conditionalReturnPct, 2)}% ≥ ${money(snapshot.settings.minConditionalReturnPct, 2)}%${!conditionalReturnPassed && testOverrideReady ? '（小额联调豁免）' : ''}` },
+    { passed: !selected.feeVerificationBlocked, label: selected.feeVerificationBlocked ? 'MEXC手续费尚未校验' : 'MEXC手续费已校验' },
+    { passed: settlementRiskPassed || testOverrideReady, label: !settlementRiskPassed && testOverrideReady ? '结算信号门槛（小额联调豁免）' : selected.settlementRiskBlocked ? (selected.settlementRiskReason ?? '结算风控未通过') : '结算方向与动态安全距离通过' },
+    { passed: !selected.stale, label: `行情 MEXC ${quoteAgeLabel(selected.mexcQuoteAgeMs)} / Poly ${quoteAgeLabel(selected.polymarketQuoteAgeMs)} ≤ ${(snapshot.settings.maxQuoteAgeMs / 1_000).toFixed(0)}秒` },
+    { passed: (selected.endTime - now) / 1_000 > snapshot.settings.stopBeforeExpirySeconds, label: `距离到期 ${secondsRemaining(selected.endTime, now)}，开仓截止前仍有效` },
+    ...(snapshot.settings.allowUnprofitableTestTrade
+      ? [{ passed: testOverrideReady, label: `小额联调限制：人工监督、Poly真实FOK、本金≤${dynamicTestCapitalLimit.toFixed(2)} USDT且硬上限12 USDT` }]
+      : []),
+    { passed: executionSessionIdle && !busy, label: executionSessionIdle ? (busy ? '当前操作正在执行' : '当前无执行中操作') : `已有执行中套利组（${snapshot.activeSession?.state ?? '未知状态'}）` }
+  ] : []
+
+  useEffect(() => {
+    const bestId = bestOpportunity?.id
+    if (!bestId || bestId === selected?.id || busy || !executionSessionIdle) return
+    const delay = Math.max(1_000, manualSelectionUntilRef.current - Date.now() + 1_000)
+    let timer = 0
+    const selectWhenIdle = (): void => {
+      if ((document.activeElement as HTMLElement | null)?.id === 'quantity') {
+        timer = window.setTimeout(selectWhenIdle, 1_000)
+        return
+      }
+      setSelectedId(bestId)
+    }
+    timer = window.setTimeout(selectWhenIdle, delay)
+    return () => window.clearTimeout(timer)
+  }, [bestOpportunity?.id, busy, executionSessionIdle, selected?.id])
 
   useEffect(() => {
     const becameExecutable = canExecute && !previousCanExecuteRef.current
@@ -320,6 +423,11 @@ function App(): JSX.Element {
     } finally {
       setBusy(false)
     }
+  }
+
+  function selectOpportunity(id: string): void {
+    manualSelectionUntilRef.current = Date.now() + 15_000
+    setSelectedId(id)
   }
 
   async function execute(): Promise<void> {
@@ -549,6 +657,16 @@ function App(): JSX.Element {
       setMessage('最低净边际须为0至1之间的美元/份数值')
       return
     }
+    const conditionalReturn = Number(minConditionalReturnDraft)
+    if (!Number.isFinite(conditionalReturn) || conditionalReturn < 0 || conditionalReturn > 100) {
+      setMessage('最低条件收益率须为0至100之间的百分比')
+      return
+    }
+    const quoteValiditySeconds = Number(quoteValidityDraft)
+    if (!Number.isInteger(quoteValiditySeconds) || quoteValiditySeconds < 3 || quoteValiditySeconds > 30) {
+      setMessage('行情最长未确认时间须为3至30秒的整数')
+      return
+    }
     const cooldownSeconds = Number(soundCooldownDraft)
     if (!Number.isInteger(cooldownSeconds) || cooldownSeconds < 5 || cooldownSeconds > 3_600) {
       setMessage('提示音重复间隔须为5至3600秒的整数')
@@ -557,6 +675,8 @@ function App(): JSX.Element {
     const result = await run(() => window.arbApp.updateSettings({
       maxCapitalPerTrade: maxCapital.toFixed(2),
       minNetEdgePerShare: edge.toFixed(4),
+      minConditionalReturnPct: conditionalReturn.toFixed(2),
+      maxQuoteAgeMs: quoteValiditySeconds * 1_000,
       opportunitySoundEnabled: soundEnabledDraft,
       opportunitySoundVolume: soundVolumeDraft,
       opportunitySoundCooldownSeconds: cooldownSeconds
@@ -567,7 +687,8 @@ function App(): JSX.Element {
   async function setMaximumQuantity(): Promise<void> {
     if (!snapshot || !selected) return
     const constraints = [
-      { label: '两边盘口', quantity: Number(selected.maxQuantity) },
+      { label: 'MEXC盘口', quantity: Number(selected.mexcAvailableQuantity) },
+      { label: 'Polymarket盘口', quantity: Number(selected.polymarketAvailableQuantity) },
       { label: '单笔金额上限', quantity: maximumTicketQuantity }
     ]
 
@@ -607,7 +728,8 @@ function App(): JSX.Element {
     const rawMaximum = Math.min(...constraints.map((item) => item.quantity))
     const maximum = Math.max(0, Math.floor(rawMaximum * 100) / 100)
     if (!Number.isFinite(maximum) || maximum < minimumAlignedQuantity) {
-      setMessage(`当前盘口、账户余额或单笔上限不足最小对齐份额${minimumAlignedQuantity.toFixed(2)}份`)
+      const details = constraints.map((item) => `${item.label}${Number.isFinite(item.quantity) ? Math.max(0, item.quantity).toFixed(2) : '—'}份`).join('；')
+      setMessage(`不足最小对齐份额${minimumAlignedQuantity.toFixed(2)}份：${details}`)
       return
     }
     const binding = constraints
@@ -707,12 +829,13 @@ function App(): JSX.Element {
                   {snapshot.opportunities.length === 0 && (
                     <tr><td colSpan={7}><div className="empty-state">暂无真实跨平台报价。{snapshot.connectionDetails.polymarket}</div></td></tr>
                   )}
-                  {snapshot.opportunities.map((opportunity) => {
+                  {orderedOpportunities.map((opportunity) => {
                     const positive = opportunityReady(opportunity, snapshot, now)
                     const isSelected = opportunity.id === selected?.id
+                    const isBest = opportunity.id === bestOpportunity?.id
                     return (
-                      <tr key={opportunity.id} className={isSelected ? 'selected' : ''} onClick={() => setSelectedId(opportunity.id)} tabIndex={0} onKeyDown={(event) => event.key === 'Enter' && setSelectedId(opportunity.id)}>
-                        <td><span className="duration-pill">{opportunity.durationMinutes}m</span></td>
+                      <tr key={opportunity.id} className={['opportunity-row', positive ? 'ready' : '', isBest ? 'best' : '', isSelected ? 'selected' : ''].filter(Boolean).join(' ')} onClick={() => selectOpportunity(opportunity.id)} tabIndex={0} onKeyDown={(event) => event.key === 'Enter' && selectOpportunity(opportunity.id)}>
+                        <td><span className="duration-pill">{opportunity.durationMinutes}m</span>{isBest && <span className="best-badge">最佳</span>}</td>
                         <td><span className="quote-inline"><Direction direction={opportunity.mexcDirection} /><span className="mono">{money(opportunity.mexcPrice, 4)}</span></span></td>
                         <td><span className="quote-inline"><Direction direction={opportunity.polymarketDirection} /><span className="mono">{money(opportunity.polymarketPrice, 4)}</span></span></td>
                         <td className="mono">{opportunity.feeVerificationBlocked ? '—' : money(opportunity.allInCostPerShare, 4)}</td>
@@ -747,14 +870,17 @@ function App(): JSX.Element {
                 </button>
               </div>
 
-              <button className="execute-button" onClick={() => void execute()} disabled={!canExecute} title="确认MEXC实际成交后才会提交Polymarket对冲">
-                {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <ArrowRight aria-hidden="true" />}
-                {snapshot.settings.mode === 'SIMULATION'
-                  ? '模拟执行两腿'
-                  : snapshot.settings.mexcAutomationEnabled
-                    ? '执行MEXC第一腿'
-                    : '准备MEXC第一腿'}
-              </button>
+              <div className="execute-action-row">
+                <button className="execute-button" onClick={() => void execute()} disabled={!canExecute} title="点击后先刷新两边盘口；确认MEXC实际成交后才会提交Polymarket对冲">
+                  {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <ArrowRight aria-hidden="true" />}
+                  {snapshot.settings.mode === 'SIMULATION'
+                    ? '模拟执行两腿'
+                    : snapshot.settings.mexcAutomationEnabled
+                      ? '执行MEXC第一腿'
+                      : '准备MEXC第一腿'}
+                </button>
+                <ExecutionConditionsHelp checks={executionChecks} />
+              </div>
               {!canExecute && executeBlockReason && <p className="execution-note"><AlertTriangle aria-hidden="true" />禁用原因：{executeBlockReason}</p>}
 
               {(selected.feeVerificationBlocked || selected.settlementRiskBlocked || selected.stale || Number(selected.netEdgePerShare) < Number(snapshot.settings.minNetEdgePerShare)) && selected.riskFlags.length > 0 && (
@@ -865,6 +991,12 @@ function App(): JSX.Element {
                 </label>
                 <label className="settings-field" htmlFor="min-net-edge">最低净边际（美元/份）
                   <input id="min-net-edge" value={minNetEdgeDraft} onChange={(event) => setMinNetEdgeDraft(event.target.value)} inputMode="decimal" />
+                </label>
+                <label className="settings-field" htmlFor="min-conditional-return">最低条件收益率（%）
+                  <input id="min-conditional-return" value={minConditionalReturnDraft} onChange={(event) => setMinConditionalReturnDraft(event.target.value)} inputMode="decimal" />
+                </label>
+                <label className="settings-field" htmlFor="quote-validity">行情最长未确认（秒）
+                  <input id="quote-validity" type="number" min="3" max="30" step="1" value={quoteValidityDraft} onChange={(event) => setQuoteValidityDraft(event.target.value)} inputMode="numeric" />
                 </label>
               </div>
               <div className="sound-setting-row">

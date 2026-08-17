@@ -29,7 +29,8 @@ const DEFAULT_SETTINGS: RiskSettings = {
   mode: 'SIMULATION',
   maxCapitalPerTrade: '100',
   minNetEdgePerShare: '0.0100',
-  maxQuoteAgeMs: 6_000,
+  minConditionalReturnPct: '0.00',
+  maxQuoteAgeMs: 8_000,
   maxHedgeSlippage: '0.0300',
   stopBeforeExpirySeconds: 20,
   settlementDistanceRules: defaultSettlementDistanceRules(),
@@ -91,8 +92,8 @@ export class AppController {
       this.settings = { ...this.settings, settlementDistanceRules: defaultSettlementDistanceRules() }
       await this.store.saveSettings(this.settings)
     }
-    if (this.settings.maxQuoteAgeMs < 6_000) {
-      this.settings = { ...this.settings, maxQuoteAgeMs: 6_000 }
+    if (this.settings.maxQuoteAgeMs <= 6_000) {
+      this.settings = { ...this.settings, maxQuoteAgeMs: 8_000 }
       await this.store.saveSettings(this.settings)
     }
     if (!this.settings.hubstudioContainerCode) {
@@ -197,6 +198,14 @@ export class AppController {
       throw new Error('最低净边际须为0至1之间的美元/份数值')
     }
     next.minNetEdgePerShare = minimumEdge.toDecimalPlaces(4).toFixed(4)
+    const minimumReturn = new Decimal(next.minConditionalReturnPct)
+    if (!minimumReturn.isFinite() || minimumReturn.lt(0) || minimumReturn.gt(100)) {
+      throw new Error('最低条件收益率须为0至100之间的百分比')
+    }
+    next.minConditionalReturnPct = minimumReturn.toDecimalPlaces(2).toFixed(2)
+    if (!Number.isInteger(next.maxQuoteAgeMs) || next.maxQuoteAgeMs < 3_000 || next.maxQuoteAgeMs > 30_000) {
+      throw new Error('行情最长未确认时间须为3至30秒的整数')
+    }
     if (!Number.isFinite(next.opportunitySoundVolume) || next.opportunitySoundVolume < 0 || next.opportunitySoundVolume > 1) {
       throw new Error('提示音音量须在0至1之间')
     }
@@ -254,6 +263,7 @@ export class AppController {
     if (this.activeSession && !['HEDGED', 'CANCELLED'].includes(this.activeSession.state)) {
       throw new Error('已有执行中的套利组，不能重复开仓')
     }
+    await this.refreshOpportunities()
     const opportunity = this.opportunities.find((candidate) => candidate.id === request.opportunityId)
     if (!opportunity) throw new Error('机会已失效，请刷新后重试')
     this.validateExecution(opportunity, request.quantity)
@@ -603,7 +613,9 @@ export class AppController {
     if (quantity.lt(minimumQuantity)) {
       throw new Error(`最小对齐份额为${minimumQuantity.toFixed(2)}份（Polymarket至少${opportunity.polymarketMinOrderSize}份且BUY金额至少1，MEXC本金至少1 USDT）`)
     }
-    if (quantity.gt(opportunity.maxQuantity)) throw new Error('数量超过当前盘口可执行上限')
+    if (quantity.gt(opportunity.maxQuantity)) {
+      throw new Error(`数量超过当前盘口可执行上限：输入${quantity.toFixed(2)}份，MEXC可用${opportunity.mexcAvailableQuantity}份，Polymarket可用${opportunity.polymarketAvailableQuantity}份`)
+    }
     if (opportunity.stale) throw new Error('行情已过期，请刷新')
     if (opportunity.feeVerificationBlocked) {
       throw new Error(`手续费校验未通过：${opportunity.feeVerificationReason ?? '缺少可验证费率'}`)
@@ -614,6 +626,8 @@ export class AppController {
     const capital = new Decimal(opportunity.allInCostPerShare).mul(quantity)
     const belowEdge = new Decimal(opportunity.netEdgePerShare).lt(this.settings.minNetEdgePerShare)
     if (belowEdge && !this.settings.allowUnprofitableTestTrade) throw new Error('净收益低于风控阈值')
+    const belowReturn = new Decimal(opportunity.conditionalReturnPct).lt(this.settings.minConditionalReturnPct)
+    if (belowReturn && !this.settings.allowUnprofitableTestTrade) throw new Error('条件收益率低于风控阈值')
     if (this.settings.allowUnprofitableTestTrade) {
       if (this.settings.mode !== 'ASSISTED') throw new Error('小额亏损联调只允许在人工监督模式执行')
       if (!this.settings.polymarketLiveEnabled) throw new Error('请先通过身份验证并开启Polymarket真实FOK，再进行小额亏损联调')
@@ -771,7 +785,7 @@ export class AppController {
       this.polymarketDataMessage = this.polymarketData.getStatus().message
       this.opportunities = this.combineLiveQuotes(mexcWindows, polymarketWindows)
       this.broadcast(this.getSnapshot())
-    }, 200)
+    }, 50)
     this.streamRefreshTimer.unref()
   }
 
@@ -816,10 +830,8 @@ export class AppController {
           true
         )
         const quantity = Decimal.min(mexcQuote.askSize, polymarketQuote.askSize)
-        const newestTimestamp = Math.min(
-          this.normalizeQuoteTimestamp(mexcQuote.receivedAt),
-          this.normalizeQuoteTimestamp(polymarketQuote.receivedAt)
-        )
+        const mexcQuoteAgeMs = Math.max(0, now - this.normalizeQuoteTimestamp(mexcQuote.receivedAt))
+        const polymarketQuoteAgeMs = Math.max(0, now - this.normalizeQuoteTimestamp(polymarketQuote.receivedAt))
         opportunities.push(calculateOpportunity({
           id: `btc-${mexc.durationMinutes}m-${mexc.startTime}-mexc-${mexcDirection.toLowerCase()}`,
           mexcEventId: mexc.eventId,
@@ -837,9 +849,13 @@ export class AppController {
           polymarketFeeRate: polymarketQuote.feeRate,
           polymarketFeeExponent: polymarketQuote.feeExponent,
           maxQuantity: quantity.toString(),
+          mexcAvailableQuantity: mexcQuote.askSize,
+          polymarketAvailableQuantity: polymarketQuote.askSize,
           riskBufferPerShare: mexc.durationMinutes === 5 ? '0.008' : '0.012',
           matchClass: 'CONDITIONAL',
-          quoteAgeMs: Math.max(0, now - newestTimestamp),
+          quoteAgeMs: Math.max(mexcQuoteAgeMs, polymarketQuoteAgeMs),
+          mexcQuoteAgeMs,
+          polymarketQuoteAgeMs,
           maxQuoteAgeMs: this.settings.maxQuoteAgeMs,
           mexcSignal: mexcSignal.direction,
           polymarketSignal: polymarketSignal.direction,
@@ -854,12 +870,10 @@ export class AppController {
         }))
       }
     }
-    return opportunities.sort((left, right) => {
-      if (left.feeVerificationBlocked !== right.feeVerificationBlocked) {
-        return Number(left.feeVerificationBlocked) - Number(right.feeVerificationBlocked)
-      }
-      return Number(right.netEdgePerShare) - Number(left.netEdgePerShare)
-    })
+    return opportunities.sort((left, right) =>
+      left.durationMinutes - right.durationMinutes ||
+      Number(left.mexcDirection === 'DOWN') - Number(right.mexcDirection === 'DOWN')
+    )
   }
 
   private normalizeQuoteTimestamp(timestamp: number): number {

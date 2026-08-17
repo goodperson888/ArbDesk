@@ -20,9 +20,13 @@ export interface OpportunityInput {
   polymarketFeeRate?: string
   polymarketFeeExponent?: string
   maxQuantity: string
+  mexcAvailableQuantity?: string
+  polymarketAvailableQuantity?: string
   riskBufferPerShare: string
   matchClass?: MatchClass
   quoteAgeMs?: number
+  mexcQuoteAgeMs?: number
+  polymarketQuoteAgeMs?: number
   maxQuoteAgeMs?: number
   mexcSignal?: Direction
   polymarketSignal?: Direction
@@ -63,6 +67,8 @@ export function calculateOpportunity(input: OpportunityInput): Opportunity {
   const grossEdge = new Decimal(1).minus(grossCost)
   const netEdge = new Decimal(1).minus(allInCost)
   const quantity = new Decimal(input.maxQuantity)
+  const mexcAvailableQuantity = new Decimal(input.mexcAvailableQuantity ?? input.maxQuantity)
+  const polymarketAvailableQuantity = new Decimal(input.polymarketAvailableQuantity ?? input.maxQuantity)
   const capital = allInCost.mul(quantity)
   const expectedProfit = netEdge.mul(quantity)
   const bothLosePnl = cashCost.negated()
@@ -128,7 +134,11 @@ export function calculateOpportunity(input: OpportunityInput): Opportunity {
     allInCostPerShare: allInCost.toFixed(6),
     grossEdgePerShare: grossEdge.toFixed(6),
     netEdgePerShare: netEdge.toFixed(6),
+    mexcAvailableQuantity: mexcAvailableQuantity.toFixed(2),
+    polymarketAvailableQuantity: polymarketAvailableQuantity.toFixed(2),
     maxQuantity: quantity.toFixed(2),
+    mexcQuoteAgeMs: Math.max(0, input.mexcQuoteAgeMs ?? input.quoteAgeMs ?? 0),
+    polymarketQuoteAgeMs: Math.max(0, input.polymarketQuoteAgeMs ?? input.quoteAgeMs ?? 0),
     capitalRequired: capital.toFixed(2),
     expectedProfit: expectedProfit.toFixed(2),
     conditionalReturnPct: conditionalReturnPct.toFixed(2),

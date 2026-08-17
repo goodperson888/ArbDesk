@@ -73,7 +73,11 @@ export interface Opportunity {
   allInCostPerShare: string
   grossEdgePerShare: string
   netEdgePerShare: string
+  mexcAvailableQuantity: string
+  polymarketAvailableQuantity: string
   maxQuantity: string
+  mexcQuoteAgeMs: number
+  polymarketQuoteAgeMs: number
   capitalRequired: string
   expectedProfit: string
   conditionalReturnPct: string
@@ -170,6 +174,7 @@ export interface RiskSettings {
   mode: ExecutionMode
   maxCapitalPerTrade: string
   minNetEdgePerShare: string
+  minConditionalReturnPct: string
   maxQuoteAgeMs: number
   maxHedgeSlippage: string
   stopBeforeExpirySeconds: number

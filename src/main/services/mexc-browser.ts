@@ -87,6 +87,7 @@ interface MexcRawDepth {
     asks?: Array<{ p?: string; q?: string }>
   }
   timestamp?: number
+  receivedAt?: number
 }
 
 interface MexcRawIndexRange {
@@ -127,6 +128,7 @@ export class MexcBrowserManager {
   private hubstudioDebuggingPort?: number
   private hubstudioConnectedContainerCode?: string
   private hubstudioMonitor?: NodeJS.Timeout
+  private hubstudioQuoteMonitor?: NodeJS.Timeout
   private latestResult?: AutomationResult
   private calibrationResolver?: (result: { kind: MexcCalibrationKind; selector: string }) => void
   private selectorStore: SelectorStore = emptySelectors()
@@ -234,7 +236,8 @@ export class MexcBrowserManager {
               headers: { accept: 'application/json' }
             })
             if (!depthResponse.ok) throw new Error(`MEXC depth HTTP ${depthResponse.status}`)
-            return { outcome, depth: await depthResponse.json() as MexcRawDepth }
+            const depth = await depthResponse.json() as MexcRawDepth
+            return { outcome, depth: { ...depth, receivedAt: Date.now() } }
           }))
           return { event, outcomes }
         })),
@@ -275,7 +278,7 @@ export class MexcBrowserManager {
           bestAsk: best.price,
           askSize: best.size,
           levels,
-          receivedAt: Number(effectiveDepth.timestamp) || Date.now()
+          receivedAt: Number(effectiveDepth.receivedAt) || Date.now()
         })
       }
       const up = parsed.get('UP')
@@ -288,7 +291,7 @@ export class MexcBrowserManager {
         endTime: Number(event.et),
         baselinePrice: String(event.bsp ?? ''),
         indexPrice: latestIndex?.p ? String(latestIndex.p) : undefined,
-        indexReceivedAt: latestIndex?.ts ? Number(latestIndex.ts) : undefined,
+        indexReceivedAt: latestIndex?.p ? Date.now() : undefined,
         feeRate: feeCalibration.feeRate,
         feeRateSource: feeCalibration.source,
         outcomes: { UP: up, DOWN: down }
@@ -540,6 +543,7 @@ export class MexcBrowserManager {
     page.on('domcontentloaded', () => void this.refreshHubstudioAuthentication())
     await page.bringToFront()
     this.startHubstudioMonitoring()
+    this.startHubstudioQuoteMonitoring()
     await this.refreshHubstudioAuthentication()
     await this.refreshAccountState()
     return page
@@ -591,11 +595,26 @@ export class MexcBrowserManager {
         void response.json().then((body: MexcRawDepth) => {
           const symbolId = new URL(responseUrl).searchParams.get('symbolId') ?? ''
           if (!symbolId) return
-          const normalizedBody = { ...body, timestamp: Number(body.timestamp) || Date.now() }
+          const normalizedBody = { ...body, timestamp: Number(body.timestamp) || Date.now(), receivedAt: Date.now() }
           const previous = this.interceptedDepth.get(symbolId)
           if (Number(previous?.timestamp) > Number(normalizedBody.timestamp)) return
           this.interceptedDepth.set(symbolId, normalizedBody)
           this.applyInterceptedDepth(symbolId, normalizedBody)
+        }).catch(() => undefined)
+      }
+      if (/\/api\/platform\/predict\/market\/web\/event\/index\/price\/range/.test(responseUrl)) {
+        void response.json().then((body: MexcRawIndexRange) => {
+          const latest = (body.data ?? [])
+            .filter((point) => Number(point.p) > 0 && Number(point.ts) > 0)
+            .sort((left, right) => Number(right.ts) - Number(left.ts))[0]
+          if (!latest?.p) return
+          const receivedAt = Date.now()
+          this.latestWindows = this.latestWindows.map((window) => ({
+            ...window,
+            indexPrice: String(latest.p),
+            indexReceivedAt: receivedAt
+          }))
+          for (const listener of this.marketDataListeners) listener()
         }).catch(() => undefined)
       }
       if (!isOrderEndpoint(responseUrl)) return
@@ -642,7 +661,7 @@ export class MexcBrowserManager {
             bestAsk: best.price,
             askSize: best.size,
             levels,
-            receivedAt: Number(depth.timestamp) || Date.now()
+            receivedAt: Number(depth.receivedAt) || Date.now()
           }
         }
       }
@@ -1241,9 +1260,44 @@ export class MexcBrowserManager {
     }, 5_000)
   }
 
+  private startHubstudioQuoteMonitoring(): void {
+    if (this.hubstudioQuoteMonitor) clearInterval(this.hubstudioQuoteMonitor)
+    const refresh = async (): Promise<void> => {
+      const page = this.hubstudioPage
+      if (!page || page.isClosed()) return
+      const symbolIds = [...new Set(this.latestWindows.flatMap((window) => [
+        window.outcomes.UP.symbolId,
+        window.outcomes.DOWN.symbolId
+      ]).filter(Boolean))]
+      if (symbolIds.length === 0) return
+      await page.evaluate(async (ids: string[]) => {
+        const now = Date.now()
+        await Promise.all([
+          ...ids.map(async (symbolId) => {
+            const response = await fetch(`/api/platform/predict/market/web/depth?symbolId=${encodeURIComponent(symbolId)}`, {
+              headers: { accept: 'application/json' }
+            })
+            if (response.ok) await response.arrayBuffer()
+          }),
+          (async () => {
+            const response = await fetch(`/api/platform/predict/market/web/event/index/price/range?indexName=BTC&start=${now - 30_000}&end=${now}`, {
+              headers: { accept: 'application/json' }
+            })
+            if (response.ok) await response.arrayBuffer()
+          })()
+        ])
+      }, symbolIds)
+    }
+    void refresh().catch(() => undefined)
+    this.hubstudioQuoteMonitor = setInterval(() => void refresh().catch(() => undefined), 2_000)
+    this.hubstudioQuoteMonitor.unref()
+  }
+
   private clearHubstudioConnection(): void {
     if (this.hubstudioMonitor) clearInterval(this.hubstudioMonitor)
+    if (this.hubstudioQuoteMonitor) clearInterval(this.hubstudioQuoteMonitor)
     this.hubstudioMonitor = undefined
+    this.hubstudioQuoteMonitor = undefined
     this.hubstudioPage = undefined
     this.hubstudioBrowser = undefined
     this.hubstudioDebuggingPort = undefined

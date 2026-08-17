@@ -19,6 +19,10 @@ describe('opportunity calculator', () => {
       mexcFeeRateSource: 'HISTORY',
       polymarketPrice: '0.50',
       maxQuantity: '100',
+      mexcAvailableQuantity: '120',
+      polymarketAvailableQuantity: '100',
+      mexcQuoteAgeMs: 250,
+      polymarketQuoteAgeMs: 500,
       riskBufferPerShare: '0.01'
     })
 
@@ -29,6 +33,10 @@ describe('opportunity calculator', () => {
     expect(result.polymarketDirection).toBe('DOWN')
     expect(result.polymarketEffectiveFeeRate).toBe('0.035000')
     expect(result.conditionalReturnPct).toBe('4.84')
+    expect(result.mexcAvailableQuantity).toBe('120.00')
+    expect(result.polymarketAvailableQuantity).toBe('100.00')
+    expect(result.mexcQuoteAgeMs).toBe(250)
+    expect(result.polymarketQuoteAgeMs).toBe(500)
     expect(result.worstCaseReturnPct).toBe('-98.95')
     expect(result.feeVerificationBlocked).toBe(false)
   })

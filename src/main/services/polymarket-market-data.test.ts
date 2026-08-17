@@ -100,8 +100,10 @@ describe('PolymarketMarketData', () => {
       price_changes: [{ asset_id: 'token-up', side: 'SELL', price: '0.51', size: '0', best_ask: '0.53' }]
     })
 
-    expect(afterBook[0].outcomes.UP).toMatchObject({ bestAsk: '0.51', askSize: '3', minOrderSize: '6', receivedAt: 100 })
-    expect(afterChange[0].outcomes.UP).toMatchObject({ bestAsk: '0.53', askSize: '8', receivedAt: 200 })
+    expect(afterBook[0].outcomes.UP).toMatchObject({ bestAsk: '0.51', askSize: '3', minOrderSize: '6' })
+    expect(afterBook[0].outcomes.UP?.receivedAt).toBeGreaterThan(1)
+    expect(afterChange[0].outcomes.UP).toMatchObject({ bestAsk: '0.53', askSize: '8' })
+    expect(afterChange[0].outcomes.UP?.receivedAt).toBeGreaterThanOrEqual(afterBook[0].outcomes.UP?.receivedAt ?? 0)
     expect(afterChange[0].outcomes.UP?.levels).toEqual([{ price: '0.53', size: '8' }])
   })
 })
