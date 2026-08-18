@@ -154,17 +154,18 @@ export class AppController {
     this.orderHistory = (await this.store.loadOrderHistory()).map((order) => {
       const interrupted = order.status === 'OPENING' ||
         ['MEXC_CLOSING', 'MEXC_CLOSE_SUBMITTED', 'POLY_CLOSING'].includes(order.executionState)
-      if (!interrupted) return order
+      if (!interrupted) return this.expireOrderIfElapsed(order)
       const message = '应用上次在订单执行过程中退出；请先核对两边实际持仓'
-      return {
+      const normalized: ArbitrageOrderRecord = {
         ...order,
-        status: 'RECOVERY_REQUIRED' as const,
-        executionState: 'RECOVERY_REQUIRED' as const,
+        status: 'RECOVERY_REQUIRED',
+        executionState: 'RECOVERY_REQUIRED',
         closeOperation: order.closeOperation
-          ? { ...order.closeOperation, state: 'RECOVERY_REQUIRED' as const, updatedAt: Date.now(), error: message }
+          ? { ...order.closeOperation, state: 'RECOVERY_REQUIRED', updatedAt: Date.now(), error: message }
           : undefined,
         updatedAt: Date.now()
       }
+      return this.expireOrderIfElapsed(normalized)
     })
     await this.store.saveOrderHistory(this.orderHistory)
     this.opportunities = []
@@ -182,6 +183,7 @@ export class AppController {
   }
 
   getSnapshot(): AppSnapshot {
+    this.normalizeExpiredOrders()
     const mexcStatus = this.mexcBrowser.getStatus()
     const settlementFeedConnected = this.opportunities.some((opportunity) => Boolean(opportunity.polymarketSignal))
     return {
@@ -208,25 +210,44 @@ export class AppController {
   }
 
   hasRecoverableExposure(): boolean {
-    if (this.activeSession && !['HEDGED', 'CANCELLED', 'CLOSED'].includes(this.activeSession.state)) return true
-    return this.orderHistory.some((order) =>
-      order.status === 'RECOVERY_REQUIRED' || (
-        !['CLOSED', 'CANCELLED'].includes(order.status) &&
-        (new Decimal(order.mexc.openQuantity || 0).gt(0) || new Decimal(order.polymarket.openQuantity || 0).gt(0))
-      )
-    )
+    const now = Date.now()
+    this.normalizeExpiredOrders(now)
+    if (this.hasActionableActiveSession(now)) return true
+    return this.orderHistory.some((order) => this.hasActionableOrderExposure(order, now))
   }
 
   getEmergencyAccessSnapshot(): EmergencyAccessSnapshot {
+    const now = Date.now()
+    this.normalizeExpiredOrders(now)
     return {
-      activeSession: this.activeSession,
-      orders: this.orderHistory.filter((order) =>
-        order.status === 'RECOVERY_REQUIRED' || (
-          !['CLOSED', 'CANCELLED'].includes(order.status) &&
-          (new Decimal(order.mexc.openQuantity || 0).gt(0) || new Decimal(order.polymarket.openQuantity || 0).gt(0))
-        )
-      )
+      activeSession: this.hasActionableActiveSession(now) ? this.activeSession : undefined,
+      orders: this.orderHistory.filter((order) => this.hasActionableOrderExposure(order, now))
     }
+  }
+
+  private expireOrderIfElapsed(order: ArbitrageOrderRecord, now = Date.now()): ArbitrageOrderRecord {
+    if (
+      order.endTime > now ||
+      ['CLOSED', 'CANCELLED', 'EXPIRED'].includes(order.status)
+    ) return order
+    return { ...order, status: 'EXPIRED' }
+  }
+
+  private normalizeExpiredOrders(now = Date.now()): void {
+    this.orderHistory = this.orderHistory.map((order) => this.expireOrderIfElapsed(order, now))
+  }
+
+  private hasActionableActiveSession(now: number): boolean {
+    if (!this.activeSession || ['HEDGED', 'CANCELLED', 'CLOSED'].includes(this.activeSession.state)) return false
+    const order = this.orderHistory.find((candidate) => candidate.id === this.activeSession?.id)
+    return Boolean(order && order.endTime > now && order.status !== 'EXPIRED')
+  }
+
+  private hasActionableOrderExposure(order: ArbitrageOrderRecord, now: number): boolean {
+    if (order.endTime <= now || ['CLOSED', 'CANCELLED', 'EXPIRED'].includes(order.status)) return false
+    return order.status === 'RECOVERY_REQUIRED' ||
+      new Decimal(order.mexc.openQuantity || 0).gt(0) ||
+      new Decimal(order.polymarket.openQuantity || 0).gt(0)
   }
 
   async refreshOpportunities(): Promise<AppSnapshot> {
@@ -380,6 +401,7 @@ export class AppController {
 
   async execute(request: ExecuteRequest): Promise<ExecutionSession> {
     const executeRequestedAt = Date.now()
+    const triggerSource = request.source ?? (this.settings.allowUnprofitableTestTrade ? 'TEST' : 'MANUAL')
     let quotesConfirmedAt = executeRequestedAt
     if (this.closingOrderId) throw new Error('平仓流程正在执行，不能同时开新仓')
     if (this.activeSession && !['HEDGED', 'CANCELLED'].includes(this.activeSession.state)) {
@@ -434,6 +456,7 @@ export class AppController {
       startTime: opportunity.startTime,
       endTime: opportunity.endTime,
       mode: this.settings.mode,
+      triggerSource,
       status: 'OPENING',
       executionState: 'IDLE',
       requestedQuantity: this.activeSession.requestedQuantity,
@@ -605,7 +628,7 @@ export class AppController {
       this.activeSession && !['HEDGED', 'CANCELLED'].includes(this.activeSession.state) &&
       !(this.activeSession.state === 'RECOVERY_REQUIRED' && this.activeSession.id === order.id)
     ) throw new Error('当前仍有开仓或对冲流程，不能同时执行平仓')
-    if (order.status === 'CLOSED' || order.status === 'CANCELLED') throw new Error('该订单已经没有可平持仓')
+    if (['CLOSED', 'CANCELLED', 'EXPIRED'].includes(order.status)) throw new Error('该订单已经没有可平持仓')
     if (Date.now() >= order.endTime) throw new Error('该市场已经到期，不能提交中途平仓')
     const closeMexc = request.target === 'MEXC' || request.target === 'BOTH'
     const closePolymarket = request.target === 'POLYMARKET' || request.target === 'BOTH'
@@ -1121,7 +1144,9 @@ export class AppController {
         openQuantity: session.polymarketFill.quantity
       }
       : current.polymarket
-    const status = session.state === 'HEDGED'
+    const status = current.endTime <= Date.now() && !['CLOSED', 'CANCELLED'].includes(current.status)
+      ? 'EXPIRED' as const
+      : session.state === 'HEDGED'
       ? 'OPEN' as const
       : session.state === 'CANCELLED'
         ? 'CANCELLED' as const
@@ -1403,7 +1428,7 @@ export class AppController {
           throw new Error(`当前自动份额${quantity}低于最小对齐${maximumPlan.minimumQuantity}份`)
         }
       }
-      const session = await this.execute({ opportunityId, quantity })
+      const session = await this.execute({ opportunityId, quantity, source: 'AUTO' })
       if (session.state === 'CANCELLED' || session.state === 'RECOVERY_REQUIRED') {
         throw new Error(session.error ?? `自动执行进入${session.state}`)
       }

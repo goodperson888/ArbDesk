@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AppController } from './app-controller'
-import type { MexcAccountState } from '../shared/types'
+import type { ArbitrageOrderRecord, MexcAccountState } from '../shared/types'
 import { EventStore } from './services/event-store'
 import type { MexcBrowserManager } from './services/mexc-browser'
 import type { PolymarketBroker } from './services/polymarket'
@@ -146,7 +146,7 @@ describe('AppController simulation', () => {
     const events = controller.getSnapshot().recentEvents.map((event) => event.state).reverse()
     expect(events).toEqual(['MEXC_OPENING', 'MEXC_SUBMITTING', 'MEXC_FILLED', 'POLY_HEDGING', 'POLY_HEDGING', 'HEDGED'])
     const openOrder = controller.getSnapshot().orderHistory[0]
-    expect(openOrder).toMatchObject({ status: 'OPEN' })
+    expect(openOrder).toMatchObject({ status: 'OPEN', triggerSource: 'MANUAL' })
     expect(openOrder.mexc.openQuantity).toBe('5.00')
     expect(Number(openOrder.polymarket.openQuantity)).toBe(5)
 
@@ -200,6 +200,43 @@ describe('AppController simulation', () => {
     await expect(controller.updateSettings({ maxQuoteAgeMs: 31_000 })).rejects.toThrow('行情最长未确认时间')
     await expect(controller.updateSettings({ autoOpenStabilityMs: -1 })).rejects.toThrow('自动开单稳定时间')
     await expect(controller.updateSettings({ autoOpenStabilityMs: 1_001 })).rejects.toThrow('自动开单稳定时间')
+  })
+
+  it('archives elapsed local exposure without enabling emergency access', async () => {
+    vi.useFakeTimers()
+    const now = 1_800_000_000_000
+    vi.setSystemTime(now)
+    const directory = await mkdtemp(join(tmpdir(), 'arbdesk-expired-order-test-'))
+    temporaryDirectories.push(directory)
+    const store = new EventStore(directory)
+    await store.initialize()
+    const elapsedOrder: ArbitrageOrderRecord = {
+      id: 'elapsed-recovery', opportunityId: 'elapsed-opportunity', symbol: 'BTC/USD', durationMinutes: 5,
+      startTime: now - 600_000, endTime: now - 300_000, mode: 'ASSISTED', status: 'RECOVERY_REQUIRED',
+      executionState: 'RECOVERY_REQUIRED', requestedQuantity: '44.37', expectedCapital: '20', expectedProfit: '1',
+      createdAt: now - 600_000, updatedAt: now - 590_000,
+      mexc: { venue: 'MEXC', direction: 'DOWN', closeFills: [], openQuantity: '44.37' },
+      polymarket: { venue: 'POLYMARKET', direction: 'UP', closeFills: [], openQuantity: '0' }
+    }
+    await store.saveOrderHistory([elapsedOrder])
+    const mexcBrowser = {
+      configure: () => undefined,
+      getStatus: () => ({
+        mode: 'HUBSTUDIO', open: false, authenticated: false, automationAvailable: false, monitoring: false,
+        calibrated: { amountInput: false, upButton: false, downButton: false, submitButton: false }, message: 'test'
+      })
+    } as unknown as MexcBrowserManager
+    const controller = new AppController(store, mexcBrowser)
+
+    await controller.initialize()
+
+    expect(controller.getSnapshot().orderHistory[0]).toMatchObject({
+      id: 'elapsed-recovery', status: 'EXPIRED', executionState: 'RECOVERY_REQUIRED',
+      updatedAt: now - 590_000, mexc: { openQuantity: '44.37' }
+    })
+    expect(controller.hasRecoverableExposure()).toBe(false)
+    expect(controller.getEmergencyAccessSnapshot()).toEqual({ activeSession: undefined, orders: [] })
+    expect((await store.loadOrderHistory())[0].status).toBe('EXPIRED')
   })
 
   it('matches 5m and 15m quotes only within the same duration and round', async () => {
@@ -503,5 +540,6 @@ describe('AppController simulation', () => {
     expect(ensureMexcBalance).toHaveBeenCalledTimes(1)
     expect(ensurePolyCapacity).toHaveBeenCalledTimes(1)
     expect(controller.getSnapshot().autoOpenState.status).toBe('COOLDOWN')
+    expect(controller.getSnapshot().orderHistory[0].triggerSource).toBe('AUTO')
   })
 })

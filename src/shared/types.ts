@@ -33,7 +33,8 @@ export type ExecutionState =
   | 'CANCELLED'
 
 export type CloseTarget = 'MEXC' | 'POLYMARKET' | 'BOTH'
-export type ArbitrageOrderStatus = 'OPENING' | 'OPEN' | 'UNHEDGED' | 'CLOSED' | 'RECOVERY_REQUIRED' | 'CANCELLED'
+export type ArbitrageOrderStatus = 'OPENING' | 'OPEN' | 'UNHEDGED' | 'CLOSED' | 'RECOVERY_REQUIRED' | 'CANCELLED' | 'EXPIRED'
+export type OrderTriggerSource = 'MANUAL' | 'AUTO' | 'TEST' | 'UNKNOWN'
 
 export interface OrderBookLevel {
   price: string
@@ -138,6 +139,7 @@ export interface ArbitrageOrderRecord {
   startTime: number
   endTime: number
   mode: ExecutionMode
+  triggerSource?: OrderTriggerSource
   status: ArbitrageOrderStatus
   executionState: ExecutionState
   requestedQuantity: string
@@ -285,6 +287,7 @@ export interface AppSnapshot {
 export interface ExecuteRequest {
   opportunityId: string
   quantity: string
+  source?: Exclude<OrderTriggerSource, 'UNKNOWN'>
 }
 
 export interface CloseOrderRequest {

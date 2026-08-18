@@ -94,6 +94,18 @@ function directionLabel(direction: Direction): string {
   return direction === 'UP' ? '看涨 UP' : '看跌 DOWN'
 }
 
+function triggerSourceLabel(source: ArbitrageOrderRecord['triggerSource']): string {
+  return source === 'AUTO' ? '自动开单' : source === 'MANUAL' ? '手动开单' : source === 'TEST' ? '测试开单' : '历史记录（来源未记录）'
+}
+
+function entryOrderIds(order: ArbitrageOrderRecord): { mexc?: string; polymarket?: string } {
+  const polymarketIds = order.polymarket.entryFills?.map((fill) => fill.orderId).filter(Boolean)
+  return {
+    mexc: order.mexc.entryFill?.orderId,
+    polymarket: polymarketIds?.length ? [...new Set(polymarketIds)].join('、') : order.polymarket.entryFill?.orderId
+  }
+}
+
 function secondsRemaining(endTime: number, now: number): string {
   const total = Math.max(0, Math.floor((endTime - now) / 1000))
   const minutes = Math.floor(total / 60)
@@ -320,8 +332,9 @@ function EmergencyLicensePage({ summary, onStateChange }: { summary: LicenseSumm
           const mexcOpen = Number(order.mexc.openQuantity) > 0
           const polymarketOpen = Number(order.polymarket.openQuantity) > 0
           const target: CloseTarget | undefined = mexcOpen && polymarketOpen ? 'BOTH' : mexcOpen ? 'MEXC' : polymarketOpen ? 'POLYMARKET' : undefined
+          const orderIds = entryOrderIds(order)
           return <article key={order.id} className="emergency-order-card">
-            <div><strong>{order.durationMinutes}分钟 · MEXC {directionLabel(order.mexc.direction)}</strong><small>状态 {order.status} · MEXC {Number(order.mexc.openQuantity).toFixed(2)}份 · Poly {Number(order.polymarket.openQuantity).toFixed(2)}份</small></div>
+            <div><strong>{order.durationMinutes}分钟 · MEXC {directionLabel(order.mexc.direction)}</strong><small>{triggerSourceLabel(order.triggerSource)} · 执行 {new Date(order.createdAt).toLocaleString('zh-CN', { hour12: false })}</small><small>状态 {order.status} · MEXC {Number(order.mexc.openQuantity).toFixed(2)}份 · Poly {Number(order.polymarket.openQuantity).toFixed(2)}份</small>{(orderIds.mexc || orderIds.polymarket) && <small className="emergency-order-ids" title={`MEXC ${orderIds.mexc ?? '无'} / Polymarket ${orderIds.polymarket ?? '无'}`}>订单号：MEXC {orderIds.mexc ?? '—'} · Poly {orderIds.polymarket ?? '—'}</small>}</div>
             {target
               ? <button disabled={busy} onClick={() => void recover(() => window.arbApp.closeOrder({ orderId: order.id, target }))}><LogOut />{target === 'BOTH' ? '平掉两腿' : target === 'MEXC' ? '平掉MEXC' : '平掉Polymarket'}</button>
               : <small className="emergency-manual-note">成交数量未知，请先在两平台人工核对；重新授权后可进入完整记录处理。</small>}
@@ -1616,7 +1629,7 @@ function HistoryModal({
 }): JSX.Element {
   const statusLabels: Record<ArbitrageOrderRecord['status'], string> = {
     OPENING: '开仓中', OPEN: '双腿持仓', UNHEDGED: '单腿敞口', CLOSED: '已平仓',
-    RECOVERY_REQUIRED: '需要恢复', CANCELLED: '已取消'
+    RECOVERY_REQUIRED: '需要恢复', CANCELLED: '已取消', EXPIRED: '已到期 · 待结算归档'
   }
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onDismiss()}>
@@ -1629,19 +1642,21 @@ function HistoryModal({
           {orders.length === 0 ? <div className="empty-state">升级后尚无ArbDesk套利订单。</div> : orders.map((order) => {
             const mexcOpen = Number(order.mexc.openQuantity) > 0
             const polymarketOpen = Number(order.polymarket.openQuantity) > 0
-            const closeable = Date.now() < order.endTime && order.status !== 'CLOSED' && order.status !== 'CANCELLED'
+            const closeable = Date.now() < order.endTime && !['CLOSED', 'CANCELLED', 'EXPIRED'].includes(order.status)
+            const orderIds = entryOrderIds(order)
             return (
               <article className={`history-order ${order.status.toLowerCase()}`} key={order.id}>
                 <div className="history-order-head">
-                  <div><strong>BTC/USD · {order.durationMinutes}m</strong><span>{new Date(order.createdAt).toLocaleString('zh-CN', { hour12: false })}</span></div>
+                  <div><strong>BTC/USD · {order.durationMinutes}m</strong><span>{triggerSourceLabel(order.triggerSource)} · 执行 {new Date(order.createdAt).toLocaleString('zh-CN', { hour12: false })}</span></div>
                   <span className="order-status">{statusLabels[order.status]}</span>
                 </div>
+                {order.status === 'EXPIRED' && <p className="history-expired-note"><Info aria-hidden="true" />市场已结束；下方数量是结算前的本地执行记录，不代表当前平台仍有持仓。</p>}
                 <div className="history-legs">
-                  <div><span className="history-venue">MEXC <Direction direction={order.mexc.direction} /></span><strong>{order.mexc.entryFill ? `${order.mexc.entryFill.quantity}份 @ ${money(order.mexc.entryFill.averagePrice, 4)}` : '未成交'}</strong>{order.mexc.closeFills.at(-1) && <small>最近卖出 @ {money(order.mexc.closeFills.at(-1)!.averagePrice, 4)}</small>}<small>剩余 {money(order.mexc.openQuantity, 2)}份</small></div>
-                  <div><span className="history-venue">Polymarket <Direction direction={order.polymarket.direction} /></span><strong>{order.polymarket.entryFill ? `${order.polymarket.entryFill.quantity}份 @ ${money(order.polymarket.entryFill.averagePrice, 4)}` : '未成交'}</strong>{order.polymarket.closeFills.at(-1) && <small>最近卖出 @ {money(order.polymarket.closeFills.at(-1)!.averagePrice, 4)}</small>}<small>剩余 {money(order.polymarket.openQuantity, 2)}份</small></div>
+                  <div><span className="history-venue">MEXC <Direction direction={order.mexc.direction} /></span><strong>{order.mexc.entryFill ? `${order.mexc.entryFill.quantity}份 @ ${money(order.mexc.entryFill.averagePrice, 4)}` : '未成交'}</strong>{orderIds.mexc && <small className="history-order-id" title={orderIds.mexc}>订单号 {orderIds.mexc}</small>}{order.mexc.closeFills.at(-1) && <small>最近卖出 @ {money(order.mexc.closeFills.at(-1)!.averagePrice, 4)}</small>}<small>记录剩余 {money(order.mexc.openQuantity, 2)}份</small></div>
+                  <div><span className="history-venue">Polymarket <Direction direction={order.polymarket.direction} /></span><strong>{order.polymarket.entryFill ? `${order.polymarket.entryFill.quantity}份 @ ${money(order.polymarket.entryFill.averagePrice, 4)}` : '未成交'}</strong>{orderIds.polymarket && <small className="history-order-id" title={orderIds.polymarket}>订单号 {orderIds.polymarket}</small>}{order.polymarket.closeFills.at(-1) && <small>最近卖出 @ {money(order.polymarket.closeFills.at(-1)!.averagePrice, 4)}</small>}<small>记录剩余 {money(order.polymarket.openQuantity, 2)}份</small></div>
                   <div><span>预计本金 / 利润</span><strong>${money(order.expectedCapital)} / {Number(order.expectedProfit) >= 0 ? '+' : ''}${money(order.expectedProfit)}</strong><small>{order.mode === 'SIMULATION' ? '模拟' : '实盘记录'}</small></div>
                 </div>
-                {order.closeOperation?.error && <p className="history-error">{order.closeOperation.error}</p>}
+                {order.closeOperation?.error && <p className={`history-error ${order.status === 'EXPIRED' ? 'archived' : ''}`}>{order.status === 'EXPIRED' ? '历史执行备注：' : ''}{order.closeOperation.error}</p>}
                 {closeable && (mexcOpen || polymarketOpen) && <div className="history-actions">
                   <button onClick={() => onCloseOrder(order, 'MEXC')} disabled={busy || !mexcOpen}>平 MEXC</button>
                   <button onClick={() => onCloseOrder(order, 'POLYMARKET')} disabled={busy || !polymarketOpen}>平 Polymarket</button>
