@@ -3,11 +3,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AppController } from './app-controller'
+import type { MexcAccountState } from '../shared/types'
 import { EventStore } from './services/event-store'
 import type { MexcBrowserManager } from './services/mexc-browser'
 import type { PolymarketBroker } from './services/polymarket'
 import type { PolymarketMarketData } from './services/polymarket-market-data'
-import type { PolymarketLiveBroker } from './services/polymarket-live'
+import type { PolymarketLiveBroker, PolymarketTradingCapacity } from './services/polymarket-live'
 
 const temporaryDirectories: string[] = []
 
@@ -197,6 +198,8 @@ describe('AppController simulation', () => {
     await expect(controller.updateSettings({ minConditionalReturnPct: '101' })).rejects.toThrow('最低条件收益率')
     await expect(controller.updateSettings({ maxQuoteAgeMs: 2_000 })).rejects.toThrow('行情最长未确认时间')
     await expect(controller.updateSettings({ maxQuoteAgeMs: 31_000 })).rejects.toThrow('行情最长未确认时间')
+    await expect(controller.updateSettings({ autoOpenStabilityMs: -1 })).rejects.toThrow('自动开单稳定时间')
+    await expect(controller.updateSettings({ autoOpenStabilityMs: 1_001 })).rejects.toThrow('自动开单稳定时间')
   })
 
   it('matches 5m and 15m quotes only within the same duration and round', async () => {
@@ -427,7 +430,8 @@ describe('AppController simulation', () => {
       appendEvent: async () => undefined
     } as unknown as EventStore
     const startTime = now - 60_000
-    const ensureMexcBalance = vi.fn(async () => ({
+    let cachedMexcBalance: MexcAccountState | undefined
+    const ensureMexcBalance = vi.fn(async () => (cachedMexcBalance = {
       checkedAt: Date.now(), reachable: true, authenticated: true, availableUsdt: '100',
       positionCount: 0, openOrderCount: 0, historyCount: 0, positionFields: [], openOrderFields: [], historyFields: [],
       fillReadbackReady: true, message: 'test'
@@ -441,7 +445,7 @@ describe('AppController simulation', () => {
         mode: 'HUBSTUDIO', open: true, authenticated: true, automationAvailable: true, monitoring: true,
         calibrated: { amountInput: false, upButton: false, downButton: false, submitButton: false }, message: 'test'
       }),
-      getCachedAccountState: () => undefined,
+      getCachedAccountState: () => cachedMexcBalance,
       ensureAccountBalance: ensureMexcBalance,
       fetchActiveBtcWindows: async () => [{
         eventId: 'mexc-auto', durationMinutes: 5, startTime, endTime: startTime + 300_000,
@@ -468,30 +472,33 @@ describe('AppController simulation', () => {
         }
       }]
     } as unknown as PolymarketMarketData
-    const ensurePolyCapacity = vi.fn(async () => ({ checkedAt: Date.now(), collateralBalance: '100', allowanceReady: true, closedOnly: false }))
+    let cachedPolyCapacity: PolymarketTradingCapacity | undefined
+    const ensurePolyCapacity = vi.fn(async () => (cachedPolyCapacity = { checkedAt: Date.now(), collateralBalance: '100', allowanceReady: true, closedOnly: false }))
     const liveBroker = {
       configureProxy: () => undefined,
       isConfigured: async () => true,
-      getCachedTradingCapacity: () => undefined,
+      getCachedTradingCapacity: () => cachedPolyCapacity,
       ensureTradingCapacity: ensurePolyCapacity
     } as unknown as PolymarketLiveBroker
     const controller = new AppController(store, mexcBrowser, polymarketData, liveBroker, true)
     await controller.initialize()
+    controller.setLicenseActive(true)
     await controller.updateSettings({
       mode: 'ASSISTED', mexcAutomationEnabled: true, polymarketLiveEnabled: true,
       minNetEdgePerShare: '0', minConditionalReturnPct: '0', autoOpenEnabled: true,
-      autoOpenQuantityMode: 'FIXED', autoOpenFixedQuantity: '5'
+      autoOpenQuantityMode: 'FIXED', autoOpenFixedQuantity: '5', autoOpenStabilityMs: 500
     })
+    await vi.waitFor(() => expect(ensurePolyCapacity).toHaveBeenCalledTimes(1))
     const automaticSnapshot = await controller.refreshOpportunities()
     expect(automaticSnapshot.opportunities).toHaveLength(2)
     expect(automaticSnapshot.autoOpenState.status).toBe('STABILIZING')
 
     await vi.advanceTimersByTimeAsync(499)
     expect(prepareOrder).not.toHaveBeenCalled()
-    expect(ensureMexcBalance).not.toHaveBeenCalled()
-    expect(ensurePolyCapacity).not.toHaveBeenCalled()
+    expect(ensureMexcBalance).toHaveBeenCalledTimes(1)
+    expect(ensurePolyCapacity).toHaveBeenCalledTimes(1)
 
-    await vi.runOnlyPendingTimersAsync()
+    await vi.advanceTimersByTimeAsync(1)
     expect(prepareOrder).toHaveBeenCalledTimes(1)
     expect(ensureMexcBalance).toHaveBeenCalledTimes(1)
     expect(ensurePolyCapacity).toHaveBeenCalledTimes(1)

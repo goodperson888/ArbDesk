@@ -1,7 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { AppSnapshot, ArbAppApi } from '../shared/types'
+import type { AppSnapshot, ArbAppApi, LicenseSummary } from '../shared/types'
 
 const api: ArbAppApi = {
+  getLicenseSummary: () => ipcRenderer.invoke('license:summary'),
+  activateLicense: (activationCode) => ipcRenderer.invoke('license:activate', activationCode),
+  deactivateLicense: () => ipcRenderer.invoke('license:deactivate'),
+  getEmergencyAccessSnapshot: () => ipcRenderer.invoke('license:emergency-snapshot'),
   getSnapshot: () => ipcRenderer.invoke('app:get-snapshot'),
   refreshOpportunities: () => ipcRenderer.invoke('app:refresh-opportunities'),
   testPolymarketConnection: () => ipcRenderer.invoke('polymarket:test-connection'),
@@ -23,6 +27,11 @@ const api: ArbAppApi = {
     const handler = (_event: Electron.IpcRendererEvent, snapshot: AppSnapshot): void => listener(snapshot)
     ipcRenderer.on('app:snapshot', handler)
     return () => ipcRenderer.removeListener('app:snapshot', handler)
+  },
+  onLicenseState: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, summary: LicenseSummary): void => listener(summary)
+    ipcRenderer.on('license:state', handler)
+    return () => ipcRenderer.removeListener('license:state', handler)
   }
 }
 

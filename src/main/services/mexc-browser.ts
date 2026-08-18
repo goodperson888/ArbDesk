@@ -58,7 +58,11 @@ interface AutomationResult {
   message: string
   matched: Record<string, boolean>
   orderAccepted?: boolean
+  pageReadyAt?: number
+  directionReadyAt?: number
+  buttonReadyAt?: number
   submittedAt?: number
+  responseAt?: number
   submissionUncertain?: boolean
 }
 
@@ -135,6 +139,8 @@ export class MexcBrowserManager {
   private embeddedWindow?: BrowserWindow
   private hubstudioBrowser?: Browser
   private hubstudioPage?: Page
+  private hubstudioOrderPages = new Map<5 | 15, Page>()
+  private hubstudioOrderWarmPromise?: Promise<void>
   private hubstudioDebuggingPort?: number
   private hubstudioConnectedContainerCode?: string
   private hubstudioMonitor?: NodeJS.Timeout
@@ -160,6 +166,8 @@ export class MexcBrowserManager {
   private latestMexcIndex?: { price: string; receivedAt: number }
   private cachedFeeCalibration?: CachedMexcFeeCalibration
   private feeRows = new Map<string, MexcAssetLogRow>()
+  private latestFillRows?: { receivedAt: number; rows: MexcFillLogRow[] }
+  private fillRowListeners = new Set<(rows: MexcFillLogRow[]) => void>()
   private latestWindows: MexcWindowQuote[] = []
   private marketDataListeners = new Set<() => void>()
   private instrumentedHubstudioPages = new WeakSet<Page>()
@@ -367,7 +375,14 @@ export class MexcBrowserManager {
       }
     })
     this.latestWindows = windows
-    if (this.mode === 'HUBSTUDIO') void this.syncHubstudioPredictionSubscriptions().catch(() => undefined)
+    if (this.mode === 'HUBSTUDIO') {
+      void this.syncHubstudioPredictionSubscriptions().catch(() => undefined)
+      if (!this.hubstudioOrderWarmPromise) {
+        this.hubstudioOrderWarmPromise = this.warmHubstudioOrderPages(selected)
+          .catch(() => undefined)
+          .finally(() => { this.hubstudioOrderWarmPromise = undefined })
+      }
+    }
     return windows
   }
 
@@ -551,6 +566,10 @@ export class MexcBrowserManager {
 
   async waitForFill(match: MexcFillMatch, timeoutMs = 90_000): Promise<import('../../shared/types').Fill | undefined> {
     const deadline = Date.now() + timeoutMs
+    const passiveFill = await this.waitForInterceptedFill(match, Math.min(500, timeoutMs))
+    if (passiveFill) return passiveFill
+    const fallbackDelays = [250, 250, 500, 750, 1_000]
+    let fallbackIndex = 0
     while (Date.now() < deadline) {
       const rows = await this.evaluateMexcPage(async () => {
         const response = await fetch('/api/platform/predict/asset/query/web/summaryLog?comboExclude=false&pageNum=1&pageSize=50', {
@@ -560,10 +579,15 @@ export class MexcBrowserManager {
         const body = await response.json() as { data?: { result?: MexcFillLogRow[] } }
         return body.data?.result ?? []
       })
-      this.applyFeeCalibration(rows as MexcAssetLogRow[], Date.now(), false)
+      const receivedAt = Date.now()
+      this.applyFeeCalibration(rows as MexcAssetLogRow[], receivedAt, false)
+      this.applyInterceptedFillRows(rows, receivedAt)
       const fill = parseMexcFill(rows, match)
       if (fill) return fill
-      await new Promise((resolve) => setTimeout(resolve, 750))
+      const delay = fallbackDelays[Math.min(fallbackIndex, fallbackDelays.length - 1)]
+      fallbackIndex += 1
+      const intercepted = await this.waitForInterceptedFill(match, Math.min(delay, Math.max(0, deadline - Date.now())))
+      if (intercepted) return intercepted
     }
     return undefined
   }
@@ -683,6 +707,54 @@ export class MexcBrowserManager {
     return page
   }
 
+  private marketTargetFromEvent(event: MexcRawEvent, origin: string): { eventId: string; url: string } | undefined {
+    if (!event.id || !event.en) return undefined
+    const slug = event.en
+      .toLowerCase()
+      .replaceAll(',', '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+    return { eventId: String(event.id), url: `${origin}/prediction-markets/up-down/${slug}/${event.id}` }
+  }
+
+  private async warmHubstudioOrderPages(events: MexcRawEvent[]): Promise<void> {
+    const context = this.hubstudioBrowser?.contexts()[0]
+    const monitorPage = this.hubstudioPage
+    if (!context || !monitorPage || monitorPage.isClosed()) return
+    const origin = new URL(monitorPage.url()).origin
+    await Promise.all(events.map(async (event) => {
+      const duration = Number(event.sp) === 300 ? 5 as const : Number(event.sp) === 900 ? 15 as const : undefined
+      const target = this.marketTargetFromEvent(event, origin)
+      if (!duration || !target) return
+      let page = this.hubstudioOrderPages.get(duration)
+      if (!page || page.isClosed()) {
+        page = context.pages().find((candidate) =>
+          candidate !== monitorPage && !candidate.isClosed() &&
+          candidate.url().includes(`/prediction-markets/up-down/btc-${duration}min-`)
+        ) ?? await context.newPage()
+        this.hubstudioOrderPages.set(duration, page)
+        this.instrumentHubstudioPage(page)
+        page.on('close', () => {
+          if (this.hubstudioOrderPages.get(duration) === page) this.hubstudioOrderPages.delete(duration)
+        })
+      }
+      if (!page.url().endsWith(`/${target.eventId}`)) {
+        await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+      }
+      await page.locator('[data-tutorial-id="detail-tutorial-amount"] input, input[placeholder="0"]')
+        .first()
+        .waitFor({ state: 'visible', timeout: 15_000 })
+    }))
+  }
+
+  private hubstudioExecutionPage(durationMinutes?: MarketDuration): Page | undefined {
+    if (durationMinutes === 5 || durationMinutes === 15) {
+      const warmed = this.hubstudioOrderPages.get(durationMinutes)
+      if (warmed && !warmed.isClosed()) return warmed
+    }
+    return this.hubstudioPage && !this.hubstudioPage.isClosed() ? this.hubstudioPage : undefined
+  }
+
   private async evaluateMexcPage<T>(fn: () => Promise<T>): Promise<T>
   private async evaluateMexcPage<T, Argument>(fn: (argument: Argument) => Promise<T>, argument: Argument): Promise<T>
   private async evaluateMexcPage<T, Argument>(
@@ -757,8 +829,11 @@ export class MexcBrowserManager {
         const query = new URL(responseUrl).searchParams
         if (Number(query.get('pageNum') ?? '1') !== 1) return
         const allowUnpairedBuyAsZero = Number(query.get('pageSize') ?? '0') >= 100
-        void response.json().then((body: { data?: { result?: MexcAssetLogRow[] } }) => {
-          this.applyFeeCalibration(body.data?.result ?? [], Date.now(), allowUnpairedBuyAsZero)
+        void response.json().then((body: { data?: { result?: Array<MexcAssetLogRow & MexcFillLogRow> } }) => {
+          const rows = body.data?.result ?? []
+          const receivedAt = Date.now()
+          this.applyFeeCalibration(rows, receivedAt, allowUnpairedBuyAsZero)
+          this.applyInterceptedFillRows(rows, receivedAt)
         }).catch(() => undefined)
       }
       if (!isOrderEndpoint(responseUrl)) return
@@ -779,6 +854,35 @@ export class MexcBrowserManager {
           this.latestOrderCapture.message = `MEXC订单响应不是JSON（HTTP ${response.status()}）`
         }
       })
+    })
+  }
+
+  private applyInterceptedFillRows(rows: MexcFillLogRow[], receivedAt: number): void {
+    this.latestFillRows = { rows, receivedAt }
+    for (const listener of this.fillRowListeners) listener(rows)
+  }
+
+  private async waitForInterceptedFill(match: MexcFillMatch, timeoutMs: number): Promise<import('../../shared/types').Fill | undefined> {
+    const cached = this.latestFillRows
+    if (cached) {
+      const fill = parseMexcFill(cached.rows, match)
+      if (fill) return fill
+    }
+    return await new Promise((resolve) => {
+      let settled = false
+      const finish = (fill?: import('../../shared/types').Fill): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        this.fillRowListeners.delete(listener)
+        resolve(fill)
+      }
+      const listener = (rows: MexcFillLogRow[]): void => {
+        const fill = parseMexcFill(rows, match)
+        if (fill) finish(fill)
+      }
+      const timer = setTimeout(() => finish(), Math.max(0, timeoutMs))
+      this.fillRowListeners.add(listener)
     })
   }
 
@@ -1062,7 +1166,7 @@ export class MexcBrowserManager {
   }
 
   private async prepareHubstudioOrder(request: PrepareOrderRequest): Promise<AutomationResult> {
-    const page = this.hubstudioPage
+    const page = this.hubstudioExecutionPage(request.durationMinutes)
     if (!page || page.isClosed()) return { ok: false, message: 'Hubstudio MEXC页面不可用', matched: {} }
     if (!Number.isFinite(Number(request.amount)) || Number(request.amount) <= 0) {
       return { ok: false, message: 'MEXC下单金额必须是大于0的数字；未操作网页', matched: {} }
@@ -1081,6 +1185,7 @@ export class MexcBrowserManager {
         }
       }
     }
+    const pageReadyAt = Date.now()
     const useAutomaticRecognition = this.elementMode === 'AUTO'
     const selectors = useAutomaticRecognition ? {} : this.selectorStore.HUBSTUDIO
     const automatic = (locators: Locator[]): Locator[] => useAutomaticRecognition ? locators : []
@@ -1115,7 +1220,8 @@ export class MexcBrowserManager {
 
     try {
       await directionButton!.click()
-      await page.waitForTimeout(250)
+      await this.waitForHubstudioOrderPanel(page, selectors.amountInput, selectors.submitButton, request.direction, 'BUY', false, 1_200)
+      const directionReadyAt = Date.now()
 
       // 方向切换可能重绘订单面板，重新解析节点，避免操作失效的旧DOM句柄。
       amountInput = await this.resolveHubstudioLocator(page, selectors.amountInput, automatic([
@@ -1138,37 +1244,34 @@ export class MexcBrowserManager {
       }
 
       await amountInput.fill(request.amount)
-      // React enables Buy asynchronously after validating the controlled input.
-      // Re-resolve the button after each short wait because the order panel can
-      // redraw. We retry observing readiness, but submit exactly once.
-      const readinessDelays = [150, 300, 500, 700]
-      for (const delay of readinessDelays) {
-        await page.waitForTimeout(delay)
-        submitButton = await this.resolveHubstudioLocator(page, selectors.submitButton, automatic([
-          page.getByRole('button', { name: submitPattern }).first()
-        ]))
-        if (!submitButton) continue
-        matched.submitEnabled = await submitButton.isEnabled().catch(() => false)
-        if (matched.submitEnabled) break
-      }
+      await this.waitForHubstudioOrderPanel(page, selectors.amountInput, selectors.submitButton, request.direction, 'BUY', true, 1_200)
+      submitButton = await this.resolveHubstudioLocator(page, selectors.submitButton, automatic([
+        page.getByRole('button', { name: submitPattern }).first()
+      ]))
+      matched.submitEnabled = Boolean(submitButton && await submitButton.isEnabled().catch(() => false))
       matched.submitButton = Boolean(submitButton)
       if (!submitButton) {
         return { ok: false, message: '填入金额后MEXC买入按钮节点消失；未点击', matched }
       }
-      await Promise.all([
-        this.highlightHubstudio(amountInput),
-        this.highlightHubstudio(directionButton!),
-        this.highlightHubstudio(submitButton)
-      ])
       if (request.allowSubmit && !matched.submitEnabled) {
         return {
           ok: false,
-          message: `已填入${request.amount} USDT并等待1.65秒、检查按钮4次，但MEXC买入仍不可用；未点击`,
-          matched
+          pageReadyAt,
+          directionReadyAt,
+          message: `已填入${request.amount} USDT并监听按钮状态，但MEXC买入仍不可用；未点击`, matched
         }
+      }
+      const buttonReadyAt = Date.now()
+      if (!request.allowSubmit) {
+        await Promise.all([
+          this.highlightHubstudio(amountInput),
+          this.highlightHubstudio(directionButton!),
+          this.highlightHubstudio(submitButton)
+        ])
       }
       let orderAccepted = false
       let submittedAt: number | undefined
+      let responseAt: number | undefined
       if (request.allowSubmit) {
         submittedAt = Date.now()
         const orderResponsePromise = page.waitForResponse(
@@ -1177,11 +1280,16 @@ export class MexcBrowserManager {
         ).catch(() => undefined)
         await submitButton.click()
         const orderResponse = await orderResponsePromise
+        responseAt = Date.now()
         if (!orderResponse) {
           return {
             ok: false,
             orderAccepted: false,
+            pageReadyAt,
+            directionReadyAt,
+            buttonReadyAt,
             submittedAt,
+            responseAt,
             submissionUncertain: true,
             message: '已点击MEXC买入，但未捕获到本次下单接口响应；为避免误对冲，未启动成交监听',
             matched
@@ -1207,7 +1315,11 @@ export class MexcBrowserManager {
           return {
             ok: false,
             orderAccepted: false,
+            pageReadyAt,
+            directionReadyAt,
+            buttonReadyAt,
             submittedAt,
+            responseAt,
             submissionUncertain: false,
             message: `MEXC下单接口未确认成功：${reason}；未启动Polymarket对冲`,
             matched
@@ -1218,7 +1330,11 @@ export class MexcBrowserManager {
       return {
         ok: true,
         orderAccepted,
+        pageReadyAt,
+        directionReadyAt,
+        buttonReadyAt,
         submittedAt,
+        responseAt,
         message: request.allowSubmit
           ? 'MEXC下单接口已确认接收，正在等待该笔实际成交'
           : '已在Hubstudio中自动选择涨跌并填入金额，买入按钮已高亮，等待人工确认',
@@ -1234,7 +1350,7 @@ export class MexcBrowserManager {
   }
 
   private async closeHubstudioPosition(request: CloseMexcPositionRequest): Promise<AutomationResult> {
-    const page = this.hubstudioPage
+    const page = this.hubstudioExecutionPage(request.durationMinutes)
     if (!page || page.isClosed()) return { ok: false, message: 'Hubstudio MEXC页面不可用', matched: {} }
     const quantity = Number(request.quantity)
     if (!Number.isFinite(quantity) || quantity <= 0) return { ok: false, message: 'MEXC平仓份额必须大于0', matched: {} }
@@ -1261,9 +1377,19 @@ export class MexcBrowserManager {
         return { ok: false, message: '系统未识别MEXC持仓方向或卖出入口；未执行卖出', matched }
       }
       await directionButton.click()
-      await page.waitForTimeout(180)
-      await sellModeButton.click()
-      await page.waitForTimeout(250)
+      const sellModeCandidate = page.getByRole('button', { name: /^(?:卖出|sell)$/i }).first()
+      const sellModeTabCandidate = page.getByRole('tab', { name: /^(?:卖出|sell)$/i }).first()
+      await Promise.race([
+        sellModeCandidate.waitFor({ state: 'visible', timeout: 1_200 }),
+        sellModeTabCandidate.waitFor({ state: 'visible', timeout: 1_200 })
+      ]).catch(() => undefined)
+      const refreshedSellModeButton = await this.resolveHubstudioLocator(page, undefined, [
+        sellModeCandidate,
+        sellModeTabCandidate
+      ])
+      if (!refreshedSellModeButton) return { ok: false, message: '切换方向后未识别MEXC卖出入口；未执行卖出', matched }
+      await refreshedSellModeButton.click()
+      await this.waitForHubstudioOrderPanel(page, undefined, undefined, request.direction, 'SELL', false, 1_200)
 
       const amountInput = await this.resolveHubstudioLocator(page, undefined, [
         page.locator('[data-tutorial-id="detail-tutorial-amount"] input:visible').first(),
@@ -1281,15 +1407,11 @@ export class MexcBrowserManager {
         return { ok: false, message: '已进入MEXC卖出区，但未识别份额输入框或卖出按钮；未提交', matched }
       }
       await amountInput.fill(request.quantity)
-      for (const delay of [150, 300, 500, 700]) {
-        await page.waitForTimeout(delay)
-        submitButton = await this.resolveHubstudioLocator(page, undefined, [
-          page.getByRole('button', { name: submitPattern }).first()
-        ])
-        if (!submitButton) continue
-        matched.submitEnabled = await submitButton.isEnabled().catch(() => false)
-        if (matched.submitEnabled) break
-      }
+      await this.waitForHubstudioOrderPanel(page, undefined, undefined, request.direction, 'SELL', true, 1_200)
+      submitButton = await this.resolveHubstudioLocator(page, undefined, [
+        page.getByRole('button', { name: submitPattern }).first()
+      ])
+      matched.submitEnabled = Boolean(submitButton && await submitButton.isEnabled().catch(() => false))
       matched.submitButton = Boolean(submitButton)
       if (!submitButton || !matched.submitEnabled) {
         return { ok: false, message: `已填入${request.quantity}份，但MEXC卖出按钮不可用；未点击`, matched }
@@ -1652,6 +1774,10 @@ export class MexcBrowserManager {
     this.hubstudioSocketUrls.clear()
     this.hubstudioPredictionConfirmedAt = 0
     this.hubstudioPredictionSubscriptionKey = ''
+    this.hubstudioOrderPages.clear()
+    this.hubstudioOrderWarmPromise = undefined
+    this.latestFillRows = undefined
+    this.fillRowListeners.clear()
     this.lastHubstudioAccountRefreshAt = 0
     this.hubstudioAccountRefreshing = false
     this.hubstudioPage = undefined
@@ -1704,6 +1830,73 @@ export class MexcBrowserManager {
       }
     }
     return undefined
+  }
+
+  private async waitForHubstudioOrderPanel(
+    page: Page,
+    amountSelector: string | undefined,
+    submitSelector: string | undefined,
+    direction: Direction,
+    action: 'BUY' | 'SELL',
+    requireEnabled: boolean,
+    timeoutMs: number
+  ): Promise<boolean> {
+    return await page.evaluate(({ amountSelector, submitSelector, direction, action, requireEnabled, timeoutMs }) => new Promise<boolean>((resolve) => {
+      const visible = (element: Element | null): element is HTMLElement => {
+        if (!(element instanceof HTMLElement)) return false
+        const style = getComputedStyle(element)
+        const rect = element.getBoundingClientRect()
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0
+      }
+      const query = (selector?: string): Element | null => {
+        if (!selector) return null
+        try { return document.querySelector(selector) } catch { return null }
+      }
+      const compact = (value: string): string => value.toLowerCase().replace(/\s+/g, '')
+      const expected = action === 'BUY'
+        ? direction === 'UP' ? ['买入涨', 'buyup'] : ['买入跌', 'buydown']
+        : direction === 'UP' ? ['卖出涨', 'sellup'] : ['卖出跌', 'selldown']
+      const findSubmit = (): HTMLElement | null => {
+        const calibrated = query(submitSelector)
+        if (visible(calibrated)) return calibrated
+        return Array.from(document.querySelectorAll('button, [role="button"]'))
+          .find((element) => visible(element) && expected.some((label) => compact(element.textContent ?? '').startsWith(label))) as HTMLElement | undefined ?? null
+      }
+      const check = (): boolean => {
+        const calibratedAmount = query(amountSelector)
+        const amount = visible(calibratedAmount)
+          ? calibratedAmount
+          : Array.from(document.querySelectorAll('[data-tutorial-id="detail-tutorial-amount"] input, input[placeholder="0"]')).find(visible)
+        const submit = findSubmit()
+        if (!amount || !submit) return false
+        if (!requireEnabled) return true
+        const nativeDisabled = submit instanceof HTMLButtonElement && submit.disabled
+        return !nativeDisabled && submit.getAttribute('aria-disabled') !== 'true' && !submit.classList.contains('disabled')
+      }
+      let settled = false
+      const finish = (ready: boolean): void => {
+        if (settled) return
+        settled = true
+        observer.disconnect()
+        clearInterval(fallback)
+        clearTimeout(timeout)
+        resolve(ready)
+      }
+      const observer = new MutationObserver(() => {
+        if (check()) finish(true)
+      })
+      observer.observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ['disabled', 'aria-disabled', 'class', 'value']
+      })
+      const fallback = setInterval(() => {
+        if (check()) finish(true)
+      }, 50)
+      const timeout = setTimeout(() => finish(check()), timeoutMs)
+      if (check()) finish(true)
+    }), { amountSelector, submitSelector, direction, action, requireEnabled, timeoutMs })
   }
 
   private async highlightHubstudio(locator: Locator): Promise<void> {

@@ -6,6 +6,9 @@ import { EventStore } from './services/event-store'
 import { MexcBrowserManager } from './services/mexc-browser'
 import { PolymarketCredentialStore } from './services/polymarket-credential-store'
 import { PolymarketLiveBroker } from './services/polymarket-live'
+import { LicenseService } from './services/license-service'
+import { LICENSE_PUBLIC_KEY_PEM } from './license-public-key'
+import type { LicenseSummary } from '../shared/types'
 
 let mainWindow: BrowserWindow | undefined
 
@@ -63,7 +66,8 @@ async function createWindow(): Promise<void> {
 }
 
 app.whenReady().then(async () => {
-  const store = new EventStore(join(app.getPath('userData'), 'data'))
+  const dataDirectory = join(app.getPath('userData'), 'data')
+  const store = new EventStore(dataDirectory)
   const mexcBrowser = new MexcBrowserManager(join(app.getPath('userData'), 'data', 'mexc-selectors.json'))
   const polymarketCredentials = new PolymarketCredentialStore(join(app.getPath('userData'), 'data', 'polymarket-credentials.json'))
   const polymarketLive = new PolymarketLiveBroker(polymarketCredentials)
@@ -75,33 +79,76 @@ app.whenReady().then(async () => {
     app.isPackaged || process.env.ARB_ENABLE_LIVE_EXECUTION === 'true'
   )
   await controller.initialize()
+  const licenseService = new LicenseService(join(dataDirectory, 'license.json'), LICENSE_PUBLIC_KEY_PEM)
+  await licenseService.initialize()
+  controller.setLicenseActive((await licenseService.getSummary()).status === 'ACTIVE')
+
+  const licenseAccessSummary = async (): Promise<LicenseSummary> => {
+    const summary = await licenseService.getSummary()
+    return { ...summary, emergencyOnly: summary.status !== 'ACTIVE' && controller.hasRecoverableExposure() }
+  }
+  const requireActiveLicense = async <T>(operation: () => Promise<T> | T): Promise<T> => {
+    await licenseService.requireActive()
+    return await operation()
+  }
+  const requireActiveOrEmergency = async <T>(operation: () => Promise<T> | T): Promise<T> => {
+    const summary = await licenseService.getSummary()
+    if (summary.status !== 'ACTIVE' && !controller.hasRecoverableExposure()) throw new Error(`授权不可用：${summary.message}`)
+    return await operation()
+  }
 
   controller.setBroadcaster((snapshot) => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('app:snapshot', snapshot)
   })
 
-  ipcMain.handle('app:get-snapshot', () => controller.getSnapshot())
-  ipcMain.handle('app:refresh-opportunities', () => controller.refreshOpportunities())
-  ipcMain.handle('app:execute', (_event, request) => controller.execute(request))
-  ipcMain.handle('app:calculate-execution-plan', (_event, request) => controller.calculateExecutionPlan(request))
-  ipcMain.handle('app:confirm-mexc-fill', (_event, fill) => controller.confirmMexcFill(fill))
-  ipcMain.handle('app:retry-polymarket-hedge', () => controller.retryPolymarketHedge())
-  ipcMain.handle('app:cancel-execution', () => controller.cancelExecution())
-  ipcMain.handle('app:close-order', (_event, request) => controller.closeOrder(request))
-  ipcMain.handle('app:update-settings', (_event, request) => controller.updateSettings(request))
-  ipcMain.handle('mexc:open', () => mexcBrowser.open())
-  ipcMain.handle('mexc:status', () => mexcBrowser.getStatus())
-  ipcMain.handle('mexc:refresh-account', () => mexcBrowser.refreshAccountState())
-  ipcMain.handle('mexc:calibrate', (_event, kind) => mexcBrowser.calibrate(kind))
-  ipcMain.handle('polymarket:credential-summary', () => polymarketCredentials.getSummary())
-  ipcMain.handle('polymarket:test-connection', () => controller.testPolymarketConnection())
-  ipcMain.handle('polymarket:update-credentials', async (_event, request) => {
-    await controller.disarmAutoOpen('Polymarket交易身份已变更，自动开单已停用')
-    return await polymarketLive.configureIdentity(request)
+  ipcMain.handle('license:summary', () => licenseAccessSummary())
+  ipcMain.handle('license:activate', async (_event, activationCode) => {
+    const activated = await licenseService.activate(String(activationCode ?? ''))
+    controller.setLicenseActive(activated.status === 'ACTIVE')
+    return await licenseAccessSummary()
   })
-  ipcMain.handle('polymarket:validate-identity', (_event, tokenId) => polymarketLive.validateIdentity(tokenId))
+  ipcMain.handle('license:deactivate', async () => {
+    await controller.disarmAutoOpen('授权已退出，自动开单已停用')
+    controller.setLicenseActive(false)
+    await licenseService.deactivate()
+    return await licenseAccessSummary()
+  })
+  ipcMain.handle('license:emergency-snapshot', () => controller.getEmergencyAccessSnapshot())
+  ipcMain.handle('app:get-snapshot', () => requireActiveLicense(() => controller.getSnapshot()))
+  ipcMain.handle('app:refresh-opportunities', () => requireActiveLicense(() => controller.refreshOpportunities()))
+  ipcMain.handle('app:execute', (_event, request) => requireActiveLicense(() => controller.execute(request)))
+  ipcMain.handle('app:calculate-execution-plan', (_event, request) => requireActiveLicense(() => controller.calculateExecutionPlan(request)))
+  ipcMain.handle('app:confirm-mexc-fill', (_event, fill) => requireActiveOrEmergency(() => controller.confirmMexcFill(fill)))
+  ipcMain.handle('app:retry-polymarket-hedge', () => requireActiveOrEmergency(() => controller.retryPolymarketHedge()))
+  ipcMain.handle('app:cancel-execution', () => requireActiveOrEmergency(() => controller.cancelExecution()))
+  ipcMain.handle('app:close-order', (_event, request) => requireActiveOrEmergency(() => controller.closeOrder(request)))
+  ipcMain.handle('app:update-settings', (_event, request) => requireActiveLicense(() => controller.updateSettings(request)))
+  ipcMain.handle('mexc:open', () => requireActiveLicense(() => mexcBrowser.open()))
+  ipcMain.handle('mexc:status', () => requireActiveLicense(() => mexcBrowser.getStatus()))
+  ipcMain.handle('mexc:refresh-account', () => requireActiveLicense(() => mexcBrowser.refreshAccountState()))
+  ipcMain.handle('mexc:calibrate', (_event, kind) => requireActiveLicense(() => mexcBrowser.calibrate(kind)))
+  ipcMain.handle('polymarket:credential-summary', () => requireActiveLicense(() => polymarketCredentials.getSummary()))
+  ipcMain.handle('polymarket:test-connection', () => requireActiveLicense(() => controller.testPolymarketConnection()))
+  ipcMain.handle('polymarket:update-credentials', async (_event, request) => {
+    return await requireActiveLicense(async () => {
+      await controller.disarmAutoOpen('Polymarket交易身份已变更，自动开单已停用')
+      return await polymarketLive.configureIdentity(request)
+    })
+  })
+  ipcMain.handle('polymarket:validate-identity', (_event, tokenId) => requireActiveLicense(() => polymarketLive.validateIdentity(tokenId)))
 
   await createWindow()
+  let previousLicenseStatus = (await licenseAccessSummary()).status
+  const licenseTimer = setInterval(async () => {
+    const summary = await licenseAccessSummary()
+    controller.setLicenseActive(summary.status === 'ACTIVE')
+    if (summary.status !== 'ACTIVE') await controller.disarmAutoOpen('授权已到期或失效，自动开单已停用')
+    if (summary.status !== previousLicenseStatus || summary.status !== 'ACTIVE') {
+      previousLicenseStatus = summary.status
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('license:state', summary)
+    }
+  }, 15_000)
+  licenseTimer.unref()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) void createWindow()
   })

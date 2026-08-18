@@ -51,6 +51,8 @@ function allowanceValues(response: BalanceAllowanceResponse): Decimal[] {
 export class PolymarketLiveBroker implements PolymarketBroker {
   private proxyAgent?: HttpsProxyAgent<string>
   private cachedTradingCapacity?: PolymarketTradingCapacity
+  private cachedBalanceAllowance?: BalanceAllowanceResponse
+  private orderBookCache = new Map<string, { checkedAt: number; book: OrderBookSummary }>()
   private proxyUrl = ''
 
   constructor(
@@ -65,6 +67,8 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     this.proxyAgent?.destroy()
     this.proxyAgent = undefined
     this.cachedTradingCapacity = undefined
+    this.cachedBalanceAllowance = undefined
+    this.orderBookCache.clear()
     if (normalized) {
       this.proxyAgent = new HttpsProxyAgent(normalized)
       axios.defaults.httpAgent = this.proxyAgent
@@ -110,11 +114,28 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       apiPassphrase: derived.passphrase
     })
     this.cachedTradingCapacity = undefined
+    this.cachedBalanceAllowance = undefined
+    this.orderBookCache.clear()
     return updated
   }
 
   getCachedTradingCapacity(): PolymarketTradingCapacity | undefined {
     return this.cachedTradingCapacity
+  }
+
+  async prefetchOrderBooks(tokenIds: string[], maximumAgeMs = 20_000): Promise<void> {
+    const missing = [...new Set(tokenIds.filter(Boolean))].filter((tokenId) => {
+      const cached = this.orderBookCache.get(tokenId)
+      return !cached || Date.now() - cached.checkedAt > maximumAgeMs
+    })
+    if (missing.length === 0) return
+    const credentials = await this.credentialStore.getCredentials()
+    const signer = this.createSigner(credentials.signerPrivateKey)
+    const client = this.createAuthenticatedClient(credentials, signer)
+    await Promise.all(missing.map(async (tokenId) => {
+      const book = await client.getOrderBook(tokenId)
+      this.orderBookCache.set(tokenId, { checkedAt: Date.now(), book })
+    }))
   }
 
   async ensureTradingCapacity(maximumAgeMs = 30_000): Promise<PolymarketTradingCapacity> {
@@ -128,6 +149,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }),
       client.getClosedOnlyMode()
     ])
+    this.cachedBalanceAllowance = balance
     const capacity = {
       checkedAt: Date.now(),
       collateralBalance: formatCollateral(balance.balance),
@@ -233,10 +255,20 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     const credentials = await this.credentialStore.getCredentials()
     const signer = this.createSigner(credentials.signerPrivateKey)
     const client = this.createAuthenticatedClient(credentials, signer)
-    const [book, balance] = await Promise.all([
-      client.getOrderBook(order.tokenId),
-      client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })
-    ])
+    const cachedBook = this.orderBookCache.get(order.tokenId)
+    const bookPromise = cachedBook && Date.now() - cachedBook.checkedAt <= 30_000
+      ? Promise.resolve(cachedBook.book)
+      : client.getOrderBook(order.tokenId).then((book) => {
+        this.orderBookCache.set(order.tokenId!, { checkedAt: Date.now(), book })
+        return book
+      })
+    const balancePromise = this.cachedBalanceAllowance && this.cachedTradingCapacity && Date.now() - this.cachedTradingCapacity.checkedAt <= 30_000
+      ? Promise.resolve(this.cachedBalanceAllowance)
+      : client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }).then((balance) => {
+        this.cachedBalanceAllowance = balance
+        return balance
+      })
+    const [book, balance] = await Promise.all([bookPromise, balancePromise])
     const minimumSize = new Decimal(book.min_order_size || 1)
     if (quantity.lt(minimumSize)) {
       throw new Error(`Polymarket当前最小下单量为${minimumSize.toString()}份，MEXC实际成交仅${quantity.toString()}份；未提交第二腿`)

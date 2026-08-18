@@ -36,13 +36,56 @@ body {
   line-height: 1.5;
   overflow-x: hidden;
 }
-button, input { font: inherit; }
+button, input, textarea { font: inherit; }
 button { cursor: pointer; }
-button:focus-visible, input:focus-visible, tr:focus-visible {
+button:focus-visible, input:focus-visible, textarea:focus-visible, tr:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
 button:disabled { cursor: not-allowed; opacity: 0.45; }
+
+.license-shell { min-height: 100vh; display: grid; place-items: center; padding: 32px 20px; background: radial-gradient(circle at 50% 0%, rgba(34,197,94,.1), transparent 32%), linear-gradient(150deg, rgba(2,6,23,.98), rgba(7,16,31,.98)); }
+.license-card { width: min(560px, 100%); padding: 28px; border: 1px solid rgba(148,163,184,.2); border-radius: 18px; background: rgba(7,16,31,.96); box-shadow: 0 26px 90px rgba(0,0,0,.42); }
+.license-brand { display: flex; align-items: center; gap: 11px; }
+.license-brand > span { width: 42px; height: 42px; display: grid; place-items: center; color: #86efac; border: 1px solid rgba(34,197,94,.28); border-radius: 11px; background: var(--green-soft); }
+.license-brand svg { width: 23px; }
+.license-brand div { display: flex; flex-direction: column; }
+.license-brand strong { font-size: 18px; letter-spacing: -.02em; }
+.license-brand small { color: var(--muted); font-size: 10px; }
+.license-heading { margin-top: 26px; }
+.license-heading h1 { max-width: 470px; margin: 12px 0 0; font-size: clamp(24px, 4vw, 34px); line-height: 1.15; letter-spacing: -.035em; }
+.license-heading p { margin: 11px 0 0; color: var(--text-soft); font-size: 12px; line-height: 1.65; }
+.license-status { min-height: 28px; display: inline-flex; align-items: center; gap: 6px; padding: 0 9px; color: #fde68a; border: 1px solid rgba(245,158,11,.24); border-radius: 999px; background: var(--amber-soft); font-size: 10px; font-weight: 750; }
+.license-status svg { width: 14px; }
+.license-status.expired, .license-status.clock_error, .license-status.invalid { color: #fecaca; border-color: rgba(239,68,68,.28); background: var(--red-soft); }
+.machine-code-block { margin-top: 24px; padding: 14px; border: 1px solid var(--border); border-radius: 11px; background: rgba(15,23,42,.55); }
+.machine-code-block > label, .license-code-field { color: var(--text-soft); font-size: 11px; font-weight: 700; }
+.machine-code-block > div { margin-top: 7px; display: grid; grid-template-columns: 1fr 40px; align-items: center; gap: 8px; }
+.machine-code-block code { min-width: 0; overflow: hidden; color: #bbf7d0; font-size: 13px; font-weight: 750; letter-spacing: .055em; text-overflow: ellipsis; white-space: nowrap; }
+.machine-code-block button { width: 40px; height: 40px; display: grid; place-items: center; color: var(--text-soft); border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
+.machine-code-block button:hover { color: var(--text); border-color: #475569; }
+.machine-code-block button svg { width: 16px; }
+.machine-code-block small, .license-safety-note { display: block; margin-top: 7px; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.license-code-field { display: block; margin-top: 18px; }
+.license-code-field textarea { width: 100%; min-height: 94px; margin-top: 7px; resize: vertical; padding: 11px 12px; color: var(--text); border: 1px solid var(--border); border-radius: 10px; background: rgba(2,6,23,.72); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.5; }
+.license-code-field textarea:focus { border-color: var(--green); }
+.license-feedback { min-height: 44px; margin-top: 12px; display: grid; grid-template-columns: 18px 1fr; align-items: center; gap: 8px; padding: 9px 10px; color: var(--text-soft); border: 1px solid var(--border-soft); border-radius: 9px; background: rgba(148,163,184,.05); font-size: 10px; line-height: 1.45; }
+.license-feedback svg { width: 16px; color: var(--blue); }
+.license-feedback.error { color: #fecaca; border-color: rgba(239,68,68,.25); background: var(--red-soft); }
+.license-feedback.error svg { color: #fca5a5; }
+.license-activate { width: 100%; min-height: 46px; margin-top: 14px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; color: #031309; border: 1px solid #4ade80; border-radius: 10px; background: linear-gradient(180deg, #4ade80, #22c55e); font-weight: 800; transition: filter .2s, box-shadow .2s; }
+.license-activate:hover:not(:disabled) { filter: brightness(1.05); box-shadow: 0 10px 28px rgba(34,197,94,.18); }
+.license-activate svg { width: 17px; }
+.emergency-license-card { width: min(720px, 100%); }
+.emergency-loading { display: block; margin: 28px auto 0; color: var(--amber); }
+.emergency-order-list { display: grid; gap: 10px; margin-top: 20px; }
+.emergency-order-card { min-height: 74px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 12px; border: 1px solid rgba(239,68,68,.2); border-radius: 11px; background: rgba(69,10,10,.22); }
+.emergency-order-card > div { min-width: 0; display: flex; flex-direction: column; }
+.emergency-order-card strong { font-size: 12px; }
+.emergency-order-card small { margin-top: 5px; color: #fecaca; font-size: 10px; }
+.emergency-order-card button { min-height: 42px; display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; color: #fff; border: 1px solid rgba(248,113,113,.35); border-radius: 9px; background: rgba(220,38,38,.72); font-size: 10px; font-weight: 750; }
+.emergency-order-card button svg { width: 15px; }
+.emergency-order-card .emergency-manual-note { max-width: 250px; color: #fde68a; line-height: 1.45; text-align: right; }
 
 .app-shell { height: 100vh; min-height: 620px; overflow: hidden; }
 .topbar {
@@ -199,7 +242,9 @@ td small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px
 .execution-pulse svg { width: 18px; }
 .execution-summary { min-width: 0; display: flex; flex-direction: column; font-size: 9px; }
 .execution-bar strong { font-size: 12px; }
-.execution-summary small { max-width: 430px; margin-top: 2px; overflow: hidden; color: #fecaca; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.execution-summary small { max-width: 430px; margin-top: 2px; overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.execution-summary .execution-timings { color: rgba(224,242,254,.72); font-variant-numeric: tabular-nums; }
+.execution-summary .execution-error { color: #fecaca; }
 .execution-progress { height: 4px; overflow: hidden; border-radius: 999px; background: rgba(255,255,255,.1); }
 .execution-progress span { display: block; width: 48%; height: 100%; border-radius: inherit; background: currentColor; animation: progress 1.6s ease-in-out infinite alternate; }
 .execution-bar.done .execution-progress span { width: 100%; animation: none; }
@@ -419,6 +464,11 @@ td small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px
 }
 
 @media (max-width: 560px) {
+  .license-shell { padding: 18px 12px; }
+  .license-card { padding: 20px 16px; }
+  .machine-code-block code { font-size: 10px; letter-spacing: .02em; }
+  .emergency-order-card { grid-template-columns: 1fr; }
+  .emergency-order-card button { width: 100%; justify-content: center; }
   .topbar { height: 64px; padding: 0 12px; }
   .brand span { display: none; }
   .mode-badge { display: none; }

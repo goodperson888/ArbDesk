@@ -12,6 +12,7 @@ import type {
   ExecutionSession,
   ExecutionState,
   ExecutionPlan,
+  EmergencyAccessSnapshot,
   Fill,
   MexcAccountState,
   Opportunity,
@@ -54,7 +55,8 @@ const DEFAULT_SETTINGS: RiskSettings = {
   autoOpenFixedQuantity: '5.00',
   autoOpenMaxQuantityPct: 80,
   maxRecoveryLossUsdt: '2.00',
-  polymarketHedgeRetryCount: 2
+  polymarketHedgeRetryCount: 2,
+  autoOpenStabilityMs: 100
 }
 
 const TEST_TRADE_CAPITAL_FLOOR = new Decimal(5)
@@ -102,6 +104,8 @@ export class AppController {
   private autoOpenLastAttemptAt = 0
   private autoOpenedRounds = new Set<string>()
   private autoOpenLastFingerprint?: string
+  private capacityRefreshTimer?: NodeJS.Timeout
+  private licenseActive = false
 
   constructor(
     private readonly store: EventStore,
@@ -164,10 +168,17 @@ export class AppController {
     })
     await this.store.saveOrderHistory(this.orderHistory)
     this.opportunities = []
+    this.syncCapacityRefreshTimer()
   }
 
   setBroadcaster(broadcast: (snapshot: AppSnapshot) => void): void {
     this.broadcast = broadcast
+  }
+
+  setLicenseActive(active: boolean): void {
+    if (this.licenseActive === active) return
+    this.licenseActive = active
+    this.syncCapacityRefreshTimer()
   }
 
   getSnapshot(): AppSnapshot {
@@ -193,6 +204,28 @@ export class AppController {
       activeSession: this.activeSession,
       recentEvents: this.recentEvents,
       autoOpenState: this.autoOpenState
+    }
+  }
+
+  hasRecoverableExposure(): boolean {
+    if (this.activeSession && !['HEDGED', 'CANCELLED', 'CLOSED'].includes(this.activeSession.state)) return true
+    return this.orderHistory.some((order) =>
+      order.status === 'RECOVERY_REQUIRED' || (
+        !['CLOSED', 'CANCELLED'].includes(order.status) &&
+        (new Decimal(order.mexc.openQuantity || 0).gt(0) || new Decimal(order.polymarket.openQuantity || 0).gt(0))
+      )
+    )
+  }
+
+  getEmergencyAccessSnapshot(): EmergencyAccessSnapshot {
+    return {
+      activeSession: this.activeSession,
+      orders: this.orderHistory.filter((order) =>
+        order.status === 'RECOVERY_REQUIRED' || (
+          !['CLOSED', 'CANCELLED'].includes(order.status) &&
+          (new Decimal(order.mexc.openQuantity || 0).gt(0) || new Decimal(order.polymarket.openQuantity || 0).gt(0))
+        )
+      )
     }
   }
 
@@ -230,7 +263,7 @@ export class AppController {
       'mexcElementMode', 'hubstudioContainerCode', 'polymarketProxyUrl', 'mexcAutomationEnabled',
       'polymarketLiveEnabled', 'allowUnprofitableTestTrade', 'autoOpenQuantityMode',
       'autoOpenFixedQuantity', 'autoOpenMaxQuantityPct', 'maxRecoveryLossUsdt',
-      'polymarketHedgeRetryCount'
+      'polymarketHedgeRetryCount', 'autoOpenStabilityMs'
     ]
     if (
       this.settings.autoOpenEnabled && request.autoOpenEnabled === undefined &&
@@ -276,6 +309,9 @@ export class AppController {
     next.maxRecoveryLossUsdt = maximumRecoveryLoss.toDecimalPlaces(2).toFixed(2)
     if (!Number.isInteger(next.polymarketHedgeRetryCount) || next.polymarketHedgeRetryCount < 0 || next.polymarketHedgeRetryCount > 5) {
       throw new Error('Polymarket自动补单次数须为0至5的整数')
+    }
+    if (!Number.isInteger(next.autoOpenStabilityMs) || next.autoOpenStabilityMs < 0 || next.autoOpenStabilityMs > 1_000) {
+      throw new Error('自动开单稳定时间须为0至1000毫秒的整数')
     }
     if (next.mode !== 'ASSISTED' || !next.mexcAutomationEnabled || !next.polymarketLiveEnabled || next.allowUnprofitableTestTrade) {
       next.autoOpenEnabled = false
@@ -323,6 +359,7 @@ export class AppController {
     this.polymarketData.configureProxy(next.polymarketProxyUrl)
     this.liveBroker?.configureProxy(next.polymarketProxyUrl)
     await this.store.saveSettings(next)
+    this.syncCapacityRefreshTimer()
     if (next.autoOpenEnabled !== previousAutoOpenEnabled) {
       this.setAutoOpenState(next.autoOpenEnabled ? 'MONITORING' : 'OFF', next.autoOpenEnabled ? '自动开单已布防，等待全部条件满足' : '自动开单未启用')
       if (!next.autoOpenEnabled) this.clearAutoOpenCandidate()
@@ -342,6 +379,8 @@ export class AppController {
   }
 
   async execute(request: ExecuteRequest): Promise<ExecutionSession> {
+    const executeRequestedAt = Date.now()
+    let quotesConfirmedAt = executeRequestedAt
     if (this.closingOrderId) throw new Error('平仓流程正在执行，不能同时开新仓')
     if (this.activeSession && !['HEDGED', 'CANCELLED'].includes(this.activeSession.state)) {
       throw new Error('已有执行中的套利组，不能重复开仓')
@@ -356,6 +395,7 @@ export class AppController {
         this.mexcBrowser.confirmMarketQuote?.(opportunity.mexcSymbolId),
         this.polymarketData.confirmOutcomeQuote?.(opportunity.polymarketTokenId)
       ])
+      quotesConfirmedAt = Date.now()
       const mexcWindows = this.mexcBrowser.getLatestWindows?.() ?? this.latestMexcWindows
       const polymarketWindows = this.polymarketData.getLatestWindows?.() ?? this.latestPolymarketWindows
       if (mexcWindows.length > 0 && polymarketWindows.length > 0) {
@@ -367,7 +407,7 @@ export class AppController {
       opportunity = this.opportunities.find((candidate) => candidate.id === request.opportunityId)
     }
     if (!opportunity) throw new Error('机会已失效，请刷新后重试')
-    const executionPlan = await this.calculateExecutionPlanInternal(opportunity, request.quantity, true)
+    const executionPlan = await this.calculateExecutionPlanInternal(opportunity, request.quantity, false)
     this.validateExecution(opportunity, request.quantity, executionPlan)
     this.activeExecutionPlan = executionPlan
 
@@ -378,7 +418,12 @@ export class AppController {
       state: 'IDLE',
       mode: this.settings.mode,
       startedAt: Date.now(),
-      updatedAt: Date.now()
+      updatedAt: Date.now(),
+      timings: {
+        executeRequestedAt,
+        quotesConfirmedAt,
+        planConfirmedAt: Date.now()
+      }
     }
     this.activeOpportunity = opportunity
     const orderRecord: ArbitrageOrderRecord = {
@@ -440,6 +485,14 @@ export class AppController {
       durationMinutes: opportunity.durationMinutes,
       startTime: opportunity.startTime
     })
+    this.activeSession.timings = {
+      ...this.activeSession.timings!,
+      mexcPageReadyAt: result.pageReadyAt,
+      mexcDirectionReadyAt: result.directionReadyAt,
+      mexcButtonReadyAt: result.buttonReadyAt,
+      mexcSubmittedAt: result.submittedAt,
+      mexcAcceptedAt: result.responseAt ?? Date.now()
+    }
     const automaticSubmissionFailed = this.settings.mexcAutomationEnabled && (!result.ok || !result.orderAccepted)
     if (automaticSubmissionFailed) {
       const message = result.ok
@@ -497,6 +550,7 @@ export class AppController {
       filledAt: fill.filledAt ?? Date.now()
     }
     this.activeSession.mexcFill = mexcFill
+    if (this.activeSession.timings) this.activeSession.timings.mexcFillDetectedAt = Date.now()
     const state: ExecutionState = quantity.eq(this.activeSession.requestedQuantity) ? 'MEXC_FILLED' : 'MEXC_PARTIAL'
     await this.transition(state, state === 'MEXC_FILLED' ? '已确认MEXC完全成交' : '已确认MEXC部分成交')
     await this.hedgePolymarket(opportunity, mexcFill)
@@ -808,7 +862,30 @@ export class AppController {
     if (this.settings.mode === 'ASSISTED' && polymarketCapacity && !polymarketCapacity.allowanceReady) {
       return { ...plan, executable: false, blockReason: 'Polymarket授权额度尚未就绪' }
     }
+    if (this.settings.mode === 'ASSISTED' && (accountDataAgeMs === undefined || accountDataAgeMs > 30_000)) {
+      return { ...plan, executable: false, blockReason: '账户余额缓存超过30秒，等待后台轻量刷新' }
+    }
     return plan
+  }
+
+  private syncCapacityRefreshTimer(): void {
+    if (this.capacityRefreshTimer) clearInterval(this.capacityRefreshTimer)
+    this.capacityRefreshTimer = undefined
+    if (!this.licenseActive || !this.settings.polymarketLiveEnabled || !this.liveBroker) return
+    const refresh = (): void => {
+      void Promise.all([
+        this.mexcBrowser.ensureAccountBalance?.(30_000),
+        this.liveBroker?.ensureTradingCapacity(0),
+        this.liveBroker?.prefetchOrderBooks?.(
+          this.opportunities.map((opportunity) => opportunity.polymarketTokenId ?? '')
+        )
+      ])
+        .then(() => this.broadcast(this.getSnapshot()))
+        .catch(() => undefined)
+    }
+    refresh()
+    this.capacityRefreshTimer = setInterval(refresh, 20_000)
+    this.capacityRefreshTimer.unref()
   }
 
   private validateExecution(opportunity: Opportunity, quantityInput: string, executionPlan: ExecutionPlan): void {
@@ -869,6 +946,9 @@ export class AppController {
     }
 
     const targetQuantity = new Decimal(mexcFill.quantity)
+    if (this.activeSession.timings && !this.activeSession.timings.polymarketStartedAt) {
+      this.activeSession.timings.polymarketStartedAt = Date.now()
+    }
     const fills = [...(this.activeSession.polymarketFills ?? (this.activeSession.polymarketFill ? [this.activeSession.polymarketFill] : []))]
     let filledQuantity = Decimal.sum(0, ...fills.map((fill) => new Decimal(fill.quantity || 0)))
     let remainingQuantity = Decimal.max(targetQuantity.minus(filledQuantity), 0)
@@ -934,6 +1014,10 @@ export class AppController {
     if (remainingQuantity.lte('0.000001') && filledQuantity.lte(targetQuantity.add('0.000001'))) {
       this.activeSession.error = undefined
       this.activeSession.remainingHedgeQuantity = '0'
+      if (this.activeSession.timings) {
+        this.activeSession.timings.polymarketCompletedAt = Date.now()
+        this.activeSession.timings.hedgedAt = Date.now()
+      }
       await this.transition('HEDGED', `两腿已按实际成交量对齐；Polymarket共${fills.length}笔FAK成交`)
       return
     }
@@ -1084,6 +1168,11 @@ export class AppController {
       this.latestPolymarketWindows = polymarketWindows
       this.polymarketDataMessage = this.polymarketData.getStatus().message
       this.opportunities = this.combineLiveQuotes(mexcWindows, polymarketWindows)
+      if (this.licenseActive && this.settings.polymarketLiveEnabled) {
+        void this.liveBroker?.prefetchOrderBooks?.(
+          this.opportunities.map((opportunity) => opportunity.polymarketTokenId ?? '')
+        ).catch(() => undefined)
+      }
       this.evaluateAutoOpen()
     } catch (error) {
       this.polymarketDataMessage = this.polymarketData.getStatus().message
@@ -1267,19 +1356,19 @@ export class AppController {
       return
     }
     const fingerprint = this.autoOpportunityFingerprint(candidate)
-    if (fingerprint === this.autoOpenLastFingerprint || Date.now() - this.autoOpenLastAttemptAt < 2_000) {
-      this.setAutoOpenState('COOLDOWN', '上次复核未通过，等待新盘口或2秒退避', candidate.id)
+    if (fingerprint === this.autoOpenLastFingerprint) {
+      this.setAutoOpenState('COOLDOWN', '上次复核未通过，等待新盘口', candidate.id)
       return
     }
     if (this.autoOpenCandidateId === candidate.id && this.autoOpenTimer) return
     this.clearAutoOpenCandidate()
     this.autoOpenCandidateId = candidate.id
-    this.setAutoOpenState('STABILIZING', '全部条件已满足，连续确认500毫秒', candidate.id)
+    this.setAutoOpenState('STABILIZING', `全部条件已满足，连续确认${this.settings.autoOpenStabilityMs}毫秒`, candidate.id)
     this.broadcast(this.getSnapshot())
     this.autoOpenTimer = setTimeout(async () => {
       this.autoOpenTimer = undefined
       await this.triggerAutoOpen(candidate.id, fingerprint)
-    }, 500)
+    }, this.settings.autoOpenStabilityMs)
     this.autoOpenTimer.unref()
   }
 
@@ -1288,7 +1377,7 @@ export class AppController {
     const opportunity = this.opportunities.find((candidate) => candidate.id === opportunityId)
     if (!opportunity || !this.autoOpportunityReady(opportunity)) {
       this.clearAutoOpenCandidate()
-      this.setAutoOpenState('MONITORING', '500毫秒内条件发生变化，已取消本次触发')
+      this.setAutoOpenState('MONITORING', `${this.settings.autoOpenStabilityMs}毫秒内条件发生变化，已取消本次触发`)
       this.broadcast(this.getSnapshot())
       return
     }
@@ -1303,7 +1392,7 @@ export class AppController {
         const maximumPlan = await this.calculateExecutionPlan({
           opportunityId,
           useMaximum: true,
-          refreshStaleAccounts: true
+          refreshStaleAccounts: false
         })
         quantity = new Decimal(maximumPlan.maxExecutableQuantity)
           .mul(this.settings.autoOpenMaxQuantityPct)

@@ -10,11 +10,13 @@ import {
   Check,
   ChevronRight,
   CircleHelp,
+  Copy,
   ExternalLink,
   History,
   Info,
   KeyRound,
   LoaderCircle,
+  LogOut,
   LockKeyhole,
   Network,
   Plus,
@@ -23,6 +25,7 @@ import {
   ScrollText,
   Settings2,
   ShieldAlert,
+  ShieldCheck,
   SlidersHorizontal,
   Trash2,
   Volume2,
@@ -36,6 +39,8 @@ import type {
   ExecutionSession,
   ExecutionState,
   ExecutionPlan,
+  EmergencyAccessSnapshot,
+  LicenseSummary,
   MexcBrowserMode,
   MexcBrowserStatus,
   MexcCalibrationKind,
@@ -136,6 +141,25 @@ function quoteAgeLabel(milliseconds: number): string {
   return `${Math.max(0, milliseconds / 1_000).toFixed(1)}秒`
 }
 
+function executionTimingSummary(session: ExecutionSession): string | undefined {
+  const timings = session.timings
+  if (!timings) return undefined
+  const segments: string[] = []
+  const duration = (start?: number, end?: number): string | undefined =>
+    start && end && end >= start ? `${end - start}ms` : undefined
+  const preflight = duration(timings.executeRequestedAt, timings.planConfirmedAt)
+  const page = duration(timings.planConfirmedAt, timings.mexcButtonReadyAt)
+  const fill = duration(timings.mexcSubmittedAt, timings.mexcFillDetectedAt)
+  const hedge = duration(timings.polymarketStartedAt, timings.polymarketCompletedAt)
+  const total = duration(timings.executeRequestedAt, timings.hedgedAt)
+  if (preflight) segments.push(`复核 ${preflight}`)
+  if (page) segments.push(`页面/按钮 ${page}`)
+  if (fill) segments.push(`MEXC成交 ${fill}`)
+  if (hedge) segments.push(`Poly对冲 ${hedge}`)
+  if (total) segments.push(`总计 ${total}`)
+  return segments.length > 0 ? segments.join(' · ') : undefined
+}
+
 interface ExecutionCheck {
   passed: boolean
   label: string
@@ -178,7 +202,140 @@ function playOpportunityChime(volume: number): void {
   window.setTimeout(() => void context.close(), 650)
 }
 
+function formatLicenseRemaining(seconds?: number): string {
+  if (seconds === undefined) return '—'
+  const days = Math.floor(seconds / 86_400)
+  const hours = Math.floor(seconds % 86_400 / 3_600)
+  return days > 0 ? `${days}天${hours}小时` : `${hours}小时${Math.floor(seconds % 3_600 / 60)}分钟`
+}
+
+function LicenseGate({ summary, onActivated }: { summary: LicenseSummary; onActivated: (summary: LicenseSummary) => void }): JSX.Element {
+  const [activationCode, setActivationCode] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [feedback, setFeedback] = useState<string>()
+
+  async function activate(): Promise<void> {
+    if (!activationCode.trim()) {
+      setFeedback('请粘贴管理员为当前机器码生成的授权码')
+      return
+    }
+    setSubmitting(true)
+    setFeedback(undefined)
+    try {
+      const result = await window.arbApp.activateLicense(activationCode)
+      onActivated(result)
+    } catch (error) {
+      setFeedback(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  async function copyMachineCode(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(summary.machineCode)
+      setFeedback('机器码已复制，请发送给授权管理员')
+    } catch {
+      setFeedback(`请手动复制机器码：${summary.machineCode}`)
+    }
+  }
+
+  return <main className="license-shell">
+    <section className="license-card" aria-labelledby="license-title">
+      <div className="license-brand"><span><ShieldCheck aria-hidden="true" /></span><div><strong>ArbDesk</strong><small>安全授权入口</small></div></div>
+      <div className="license-heading">
+        <span className={`license-status ${summary.status.toLowerCase()}`}><LockKeyhole aria-hidden="true" />{summary.status === 'EXPIRED' ? '授权已到期' : summary.status === 'CLOCK_ERROR' ? '系统时间异常' : '需要授权'}</span>
+        <h1 id="license-title">输入限时授权后进入交易控制台</h1>
+        <p>未验证授权时不会加载行情、账户配置或交易功能。授权码仅适用于当前机器。</p>
+      </div>
+      <div className="machine-code-block">
+        <label>本机机器码</label>
+        <div><code>{summary.machineCode}</code><button onClick={() => void copyMachineCode()} aria-label="复制机器码" title="复制机器码"><Copy aria-hidden="true" /></button></div>
+        <small>把机器码发给管理员，由管理员按授权天数生成激活码。</small>
+      </div>
+      <label className="license-code-field" htmlFor="license-code">授权码
+        <textarea id="license-code" value={activationCode} onChange={(event) => setActivationCode(event.target.value)} placeholder="ARB1..." autoComplete="off" spellCheck={false} />
+      </label>
+      {feedback
+        ? <div className="license-feedback error" role="alert"><AlertTriangle aria-hidden="true" /><span>{feedback}</span></div>
+        : <div className="license-feedback"><Info aria-hidden="true" /><span>{summary.message}</span></div>}
+      <button className="license-activate" onClick={() => void activate()} disabled={submitting || !summary.encryptionAvailable}>
+        {submitting ? <LoaderCircle className="spin" aria-hidden="true" /> : <KeyRound aria-hidden="true" />}
+        {submitting ? '正在验证授权' : '验证并进入软件'}
+      </button>
+      <small className="license-safety-note">授权到期后自动退出交易界面；如果仍有真实敞口，只保留紧急恢复和平仓入口。</small>
+    </section>
+  </main>
+}
+
+function EmergencyLicensePage({ summary, onStateChange }: { summary: LicenseSummary; onStateChange: (summary: LicenseSummary) => void }): JSX.Element {
+  const [snapshot, setSnapshot] = useState<EmergencyAccessSnapshot>()
+  const [busy, setBusy] = useState(false)
+  const [feedback, setFeedback] = useState<string>()
+
+  const refresh = async (): Promise<void> => {
+    const [emergency, nextSummary] = await Promise.all([
+      window.arbApp.getEmergencyAccessSnapshot(),
+      window.arbApp.getLicenseSummary()
+    ])
+    setSnapshot(emergency)
+    onStateChange(nextSummary)
+  }
+  useEffect(() => {
+    void refresh()
+    const timer = window.setInterval(() => void refresh(), 2_000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  async function recover(action: () => Promise<unknown>): Promise<void> {
+    setBusy(true)
+    setFeedback(undefined)
+    try {
+      await action()
+      await refresh()
+    } catch (error) {
+      setFeedback(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <main className="license-shell emergency-license-shell">
+    <section className="license-card emergency-license-card">
+      <div className="license-heading"><span className="license-status expired"><ShieldAlert aria-hidden="true" />授权已退出</span><h1>仅保留紧急持仓处理</h1><p>{summary.message}。为避免隐藏真实敞口，你只能恢复对冲或平仓；处理完成后自动回到授权页面。</p></div>
+      {feedback && <div className="license-feedback error" role="alert"><AlertTriangle aria-hidden="true" /><span>{feedback}</span></div>}
+      {!snapshot ? <LoaderCircle className="spin emergency-loading" aria-label="正在读取持仓" /> : <div className="emergency-order-list">
+        {snapshot.activeSession?.state === 'RECOVERY_REQUIRED' && <button className="license-activate" disabled={busy} onClick={() => void recover(() => window.arbApp.retryPolymarketHedge())}><RotateCcw />重试剩余对冲</button>}
+        {snapshot.orders.map((order) => {
+          const mexcOpen = Number(order.mexc.openQuantity) > 0
+          const polymarketOpen = Number(order.polymarket.openQuantity) > 0
+          const target: CloseTarget | undefined = mexcOpen && polymarketOpen ? 'BOTH' : mexcOpen ? 'MEXC' : polymarketOpen ? 'POLYMARKET' : undefined
+          return <article key={order.id} className="emergency-order-card">
+            <div><strong>{order.durationMinutes}分钟 · MEXC {directionLabel(order.mexc.direction)}</strong><small>状态 {order.status} · MEXC {Number(order.mexc.openQuantity).toFixed(2)}份 · Poly {Number(order.polymarket.openQuantity).toFixed(2)}份</small></div>
+            {target
+              ? <button disabled={busy} onClick={() => void recover(() => window.arbApp.closeOrder({ orderId: order.id, target }))}><LogOut />{target === 'BOTH' ? '平掉两腿' : target === 'MEXC' ? '平掉MEXC' : '平掉Polymarket'}</button>
+              : <small className="emergency-manual-note">成交数量未知，请先在两平台人工核对；重新授权后可进入完整记录处理。</small>}
+          </article>
+        })}
+        {snapshot.orders.length === 0 && <div className="license-feedback"><Check aria-hidden="true" /><span>没有剩余持仓，正在退出到授权页面。</span></div>}
+      </div>}
+    </section>
+  </main>
+}
+
 function App(): JSX.Element {
+  const [license, setLicense] = useState<LicenseSummary>()
+  useEffect(() => {
+    void window.arbApp.getLicenseSummary().then(setLicense)
+    return window.arbApp.onLicenseState(setLicense)
+  }, [])
+  if (!license) return <div className="loading-screen"><LoaderCircle className="spin" /><span>正在验证软件授权</span></div>
+  if (license.status === 'ACTIVE') return <TradingApp />
+  if (license.emergencyOnly) return <EmergencyLicensePage summary={license} onStateChange={setLicense} />
+  return <LicenseGate summary={license} onActivated={setLicense} />
+}
+
+function TradingApp(): JSX.Element {
   const [snapshot, setSnapshot] = useState<AppSnapshot>()
   const [selectedId, setSelectedId] = useState<string>()
   const [quantity, setQuantity] = useState('50')
@@ -214,6 +371,7 @@ function App(): JSX.Element {
   const [soundCooldownDraft, setSoundCooldownDraft] = useState('30')
   const [autoFixedQuantityDraft, setAutoFixedQuantityDraft] = useState('5.00')
   const [autoMaxQuantityPctDraft, setAutoMaxQuantityPctDraft] = useState('80')
+  const [autoStabilityDraft, setAutoStabilityDraft] = useState('100')
   const [maxRecoveryLossDraft, setMaxRecoveryLossDraft] = useState('2.00')
   const [hedgeRetryCountDraft, setHedgeRetryCountDraft] = useState('2')
   const previousCanExecuteRef = useRef(false)
@@ -252,6 +410,7 @@ function App(): JSX.Element {
     setSoundCooldownDraft(String(snapshot?.settings.opportunitySoundCooldownSeconds ?? 30))
     setAutoFixedQuantityDraft(snapshot?.settings.autoOpenFixedQuantity ?? '5.00')
     setAutoMaxQuantityPctDraft(String(snapshot?.settings.autoOpenMaxQuantityPct ?? 80))
+    setAutoStabilityDraft(String(snapshot?.settings.autoOpenStabilityMs ?? 100))
     setMaxRecoveryLossDraft(snapshot?.settings.maxRecoveryLossUsdt ?? '2.00')
     setHedgeRetryCountDraft(String(snapshot?.settings.polymarketHedgeRetryCount ?? 2))
     setSettlementRuleDrafts((snapshot?.settings.settlementDistanceRules ?? defaultSettlementDistanceRules()).map((rule) => ({
@@ -599,6 +758,7 @@ function App(): JSX.Element {
       }
       const fixedQuantity = Number(autoFixedQuantityDraft)
       const maximumPercentage = Number(autoMaxQuantityPctDraft)
+      const stabilityMs = Number(autoStabilityDraft)
       if (!(fixedQuantity > 0)) {
         setMessage('自动开单固定份额须大于0')
         return
@@ -607,16 +767,21 @@ function App(): JSX.Element {
         setMessage('最大可执行量比例须为10至100的整数')
         return
       }
+      if (!Number.isInteger(stabilityMs) || stabilityMs < 0 || stabilityMs > 1_000) {
+        setMessage('自动开单稳定时间须为0至1000毫秒的整数')
+        return
+      }
       const quantityDescription = snapshot.settings.autoOpenQuantityMode === 'FIXED'
         ? `固定${fixedQuantity.toFixed(2)}份`
         : `当前最大可执行量的${maximumPercentage}%`
-      const confirmed = window.confirm(`启用后，机会连续500毫秒满足全部按钮条件就会自动执行${quantityDescription}；每个市场轮次最多一单，异常会自动停用。软件重启后需要重新开启。确认布防？`)
+      const confirmed = window.confirm(`启用后，机会连续${stabilityMs}毫秒满足全部按钮条件就会自动执行${quantityDescription}；每个市场轮次最多一单，异常会自动停用。软件重启后需要重新开启。确认布防？`)
       if (!confirmed) return
     }
     const result = await run(() => window.arbApp.updateSettings(enabling ? {
       autoOpenEnabled: true,
       autoOpenFixedQuantity: Number(autoFixedQuantityDraft).toFixed(2),
-      autoOpenMaxQuantityPct: Number(autoMaxQuantityPctDraft)
+      autoOpenMaxQuantityPct: Number(autoMaxQuantityPctDraft),
+      autoOpenStabilityMs: Number(autoStabilityDraft)
     } : { autoOpenEnabled: false }))
     if (result) setSnapshot({ ...snapshot, settings: result })
   }
@@ -645,6 +810,25 @@ function App(): JSX.Element {
       maxRecoveryLossUsdt: maximumLoss.toFixed(2),
       polymarketHedgeRetryCount: retryCount
     }), '第二腿部分成交与恢复参数已保存')
+    if (result && snapshot) setSnapshot({ ...snapshot, settings: result })
+  }
+
+  async function saveAutoOpenSettings(): Promise<void> {
+    const fixedQuantity = Number(autoFixedQuantityDraft)
+    const maximumPercentage = Number(autoMaxQuantityPctDraft)
+    const stabilityMs = Number(autoStabilityDraft)
+    if (!(fixedQuantity > 0)) return setMessage('自动开单固定份额须大于0')
+    if (!Number.isInteger(maximumPercentage) || maximumPercentage < 10 || maximumPercentage > 100) {
+      return setMessage('最大可执行量比例须为10至100的整数')
+    }
+    if (!Number.isInteger(stabilityMs) || stabilityMs < 0 || stabilityMs > 1_000) {
+      return setMessage('自动开单稳定时间须为0至1000毫秒的整数')
+    }
+    const result = await run(() => window.arbApp.updateSettings({
+      autoOpenFixedQuantity: fixedQuantity.toFixed(2),
+      autoOpenMaxQuantityPct: maximumPercentage,
+      autoOpenStabilityMs: stabilityMs
+    }), '自动开单参数已保存')
     if (result && snapshot) setSnapshot({ ...snapshot, settings: result })
   }
 
@@ -1317,7 +1501,7 @@ function App(): JSX.Element {
                 </label>
               </div>
               <button className="wide-secondary" onClick={() => void saveRecoverySettings()} disabled={busy}><Check />保存恢复参数</button>
-              <div><Bot /><div><h3>自动开单</h3><p>全部按钮条件连续满足500毫秒后触发；期间只读WebSocket缓存，最终仅补充过期数据。每轮最多一单，异常自动停用。</p></div></div>
+              <div><Bot /><div><h3>自动开单</h3><p>全部按钮条件连续满足设定时间后触发；期间只读实时缓存，下单热路径不刷新账户。每轮最多一单，异常自动停用。</p></div></div>
               <div className="segmented-control browser-mode-control">
                 <button className={snapshot.settings.autoOpenQuantityMode === 'FIXED' ? 'active' : ''} onClick={() => void setAutoQuantityMode('FIXED')} disabled={snapshot.settings.autoOpenEnabled}>固定份额</button>
                 <button className={snapshot.settings.autoOpenQuantityMode === 'MAX_PERCENT' ? 'active' : ''} onClick={() => void setAutoQuantityMode('MAX_PERCENT')} disabled={snapshot.settings.autoOpenEnabled}>按最大比例</button>
@@ -1330,6 +1514,11 @@ function App(): JSX.Element {
                   <input id="auto-max-pct" value={autoMaxQuantityPctDraft} onChange={(event) => setAutoMaxQuantityPctDraft(event.target.value)} inputMode="numeric" disabled={snapshot.settings.autoOpenEnabled} />
                   <small>建议80%，允许10%至100%</small>
                 </label>}
+              <label className="settings-field" htmlFor="auto-stability-ms">连续满足时间（毫秒）
+                <input id="auto-stability-ms" type="number" min="0" max="1000" step="50" value={autoStabilityDraft} onChange={(event) => setAutoStabilityDraft(event.target.value)} inputMode="numeric" disabled={snapshot.settings.autoOpenEnabled} />
+                <small>0极速 · 100推荐 · 300稳健 · 500保守；事件监听到按钮可用后立即进入该确认窗口</small>
+              </label>
+              <button className="wide-secondary" onClick={() => void saveAutoOpenSettings()} disabled={busy || snapshot.settings.autoOpenEnabled}><Check />保存自动参数</button>
               <button className={`automation-toggle ${snapshot.settings.autoOpenEnabled ? 'enabled' : ''}`} onClick={() => void toggleAutoOpen()} disabled={busy}>
                 {snapshot.settings.autoOpenEnabled ? <Check /> : <LockKeyhole />}
                 {snapshot.settings.autoOpenEnabled ? '已布防 · 点击停止' : '确认参数并启用自动开单'}
@@ -1505,11 +1694,14 @@ function ExecutionBar({
   const mexcQuantity = Number(session.mexcFill?.quantity ?? 0)
   const polymarketQuantity = Number(session.polymarketFill?.quantity ?? 0)
   const remainingQuantity = Math.max(0, Number(session.remainingHedgeQuantity ?? mexcQuantity - polymarketQuantity))
+  const timingSummary = executionTimingSummary(session)
   return <div className={`execution-bar ${danger ? 'danger' : done ? 'done' : ''}`}>
     <div className="execution-pulse">{done ? <Check /> : danger ? <AlertTriangle /> : <LoaderCircle className="spin" />}</div>
     <div className="execution-summary">
       <span>申请{session.requestedQuantity} · MEXC {mexcQuantity.toFixed(2)} · Poly {polymarketQuantity.toFixed(2)} · 未对冲 {remainingQuantity.toFixed(2)}份</span>
-      <strong>{STATE_LABELS[state]}</strong>{error && <small title={error}>{error}</small>}
+      <strong>{STATE_LABELS[state]}</strong>
+      {timingSummary && <small className="execution-timings" title="本次执行各阶段耗时">{timingSummary}</small>}
+      {error && <small className="execution-error" title={error}>{error}</small>}
     </div>
     <div className="execution-progress"><span /></div>
     {state === 'RECOVERY_REQUIRED' && <div className="execution-recovery-actions">

@@ -174,6 +174,33 @@ describe('PolymarketLiveBroker', () => {
     expect(getClosedOnlyMode).toHaveBeenCalledTimes(1)
   })
 
+  it('prefetches the order book and balance so the hedge hot path does not re-request them', async () => {
+    const getOrderBook = vi.fn(async () => orderBook())
+    const getBalanceAllowance = vi.fn(async () => ({
+      balance: '100000000',
+      allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
+    }))
+    const client = {
+      getOrderBook,
+      getBalanceAllowance,
+      getClosedOnlyMode: vi.fn(async () => ({ closed_only: false })),
+      createOrder: vi.fn(async () => ({ version: 2 })),
+      postOrder: vi.fn(async () => ({
+        success: true, orderID: 'cached-order', status: 'matched', takingAmount: '10', makingAmount: '5.5'
+      }))
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    await Promise.all([
+      broker.ensureTradingCapacity(0),
+      broker.prefetchOrderBooks(['token'])
+    ])
+    await broker.hedge({ tokenId: 'token', direction: 'DOWN', quantity: '10', maximumPrice: '0.57' })
+
+    expect(getOrderBook).toHaveBeenCalledTimes(1)
+    expect(getBalanceAllowance).toHaveBeenCalledTimes(1)
+  })
+
   it('probes read-only balances and recommends the funded signature type', async () => {
     const proxyFunder = '0x1111111111111111111111111111111111111111'
     const proxyCredentials: PolymarketCredentials = {

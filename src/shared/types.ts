@@ -7,6 +7,7 @@ export type MexcCalibrationKind = 'amountInput' | 'upButton' | 'downButton' | 's
 export type MexcBrowserMode = 'EMBEDDED' | 'HUBSTUDIO'
 export type MexcElementMode = 'AUTO' | 'MANUAL'
 export type PolymarketSignatureType = 0 | 1 | 2 | 3
+export type LicenseStatus = 'UNLICENSED' | 'ACTIVE' | 'EXPIRED' | 'INVALID' | 'CLOCK_ERROR' | 'STORAGE_ERROR'
 
 export interface SettlementDistanceRule {
   id: string
@@ -171,7 +172,23 @@ export interface ExecutionSession {
   polymarketFills?: Fill[]
   remainingHedgeQuantity?: string
   hedgeAttempts?: number
+  timings?: ExecutionTimings
   error?: string
+}
+
+export interface ExecutionTimings {
+  executeRequestedAt: number
+  quotesConfirmedAt?: number
+  planConfirmedAt?: number
+  mexcPageReadyAt?: number
+  mexcDirectionReadyAt?: number
+  mexcButtonReadyAt?: number
+  mexcSubmittedAt?: number
+  mexcAcceptedAt?: number
+  mexcFillDetectedAt?: number
+  polymarketStartedAt?: number
+  polymarketCompletedAt?: number
+  hedgedAt?: number
 }
 
 export interface RiskSettings {
@@ -199,6 +216,7 @@ export interface RiskSettings {
   autoOpenMaxQuantityPct: number
   maxRecoveryLossUsdt: string
   polymarketHedgeRetryCount: number
+  autoOpenStabilityMs: number
 }
 
 export interface ExecutionPlan {
@@ -369,7 +387,29 @@ export interface UpdatePolymarketCredentialsRequest {
   apiPassphrase?: string
 }
 
+export interface LicenseSummary {
+  status: LicenseStatus
+  machineCode: string
+  licenseId?: string
+  customer?: string
+  validFrom?: number
+  validUntil?: number
+  remainingSeconds?: number
+  emergencyOnly: boolean
+  encryptionAvailable: boolean
+  message: string
+}
+
+export interface EmergencyAccessSnapshot {
+  activeSession?: ExecutionSession
+  orders: ArbitrageOrderRecord[]
+}
+
 export interface ArbAppApi {
+  getLicenseSummary(): Promise<LicenseSummary>
+  activateLicense(activationCode: string): Promise<LicenseSummary>
+  deactivateLicense(): Promise<LicenseSummary>
+  getEmergencyAccessSnapshot(): Promise<EmergencyAccessSnapshot>
   getSnapshot(): Promise<AppSnapshot>
   refreshOpportunities(): Promise<AppSnapshot>
   testPolymarketConnection(): Promise<AppSnapshot>
@@ -388,4 +428,5 @@ export interface ArbAppApi {
   updatePolymarketCredentials(request: UpdatePolymarketCredentialsRequest): Promise<PolymarketCredentialSummary>
   validatePolymarketIdentity(tokenId?: string): Promise<PolymarketIdentityValidation>
   onSnapshot(listener: (snapshot: AppSnapshot) => void): () => void
+  onLicenseState(listener: (summary: LicenseSummary) => void): () => void
 }
