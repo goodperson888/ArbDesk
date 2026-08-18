@@ -531,14 +531,14 @@ export class AppController {
       return this.activeSession
     }
 
-    await this.mexcBrowser.open()
-    await this.transition('MEXC_SUBMITTING', '已打开MEXC监督窗口，准备网页订单')
+    await this.transition('MEXC_SUBMITTING', '正在打开MEXC监督窗口并准备网页订单')
     const result = await this.mexcBrowser.prepareOrder({
       direction: opportunity.mexcDirection,
       amount: executionPlan.mexcSpend,
       allowSubmit: this.settings.mexcAutomationEnabled,
       durationMinutes: opportunity.durationMinutes,
-      startTime: opportunity.startTime
+      startTime: opportunity.startTime,
+      eventId: opportunity.mexcEventId
     })
     this.activeSession.timings = {
       ...this.activeSession.timings!,
@@ -1060,6 +1060,7 @@ export class AppController {
     )
     const totalAttempts = this.settings.polymarketHedgeRetryCount + 1
     let lastError = ''
+    let forceQuoteRefresh = false
 
     for (let attempt = 0; attempt < totalAttempts && remainingQuantity.gt('0.000001'); attempt += 1) {
       const recoveryMaximumPrice = this.calculateRecoveryMaximumPrice(opportunity, mexcFill, fills, remainingQuantity)
@@ -1074,7 +1075,11 @@ export class AppController {
       this.activeSession.hedgeAttempts = (this.activeSession.hedgeAttempts ?? 0) + 1
       try {
         if (!opportunity.polymarketTokenId) throw new Error('Polymarket对冲缺少token')
-        await this.polymarketData.confirmOutcomeQuote?.(opportunity.polymarketTokenId, 1_000)
+        await this.polymarketData.confirmOutcomeQuote?.(
+          opportunity.polymarketTokenId,
+          forceQuoteRefresh ? -1 : 1_000
+        )
+        forceQuoteRefresh = false
         const currentWindows = this.polymarketData.getLatestWindows?.() ?? this.latestPolymarketWindows
         const liveWindow = currentWindows.find((window) =>
           window.durationMinutes === opportunity.durationMinutes &&
@@ -1122,6 +1127,9 @@ export class AppController {
         }
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error)
+        const quoteMoved = /盘口已变化|no orders found to match|no match is found/i.test(lastError)
+        const priceProtectionTriggered = /价格保护已触发|已超过最高可接受价/i.test(lastError)
+        forceQuoteRefresh = quoteMoved
         console.error(`[Polymarket hedge attempt ${attempt + 1} failed] ${lastError}`)
         await this.recordActiveExecutionEvent('POLY_HEDGING', `Polymarket FAK第${attempt + 1}次未成交：${lastError}`, {
           attempt: attempt + 1,
@@ -1129,7 +1137,7 @@ export class AppController {
           maximumPrice: Decimal.min(maximumPrice, POLYMARKET_MAX_ORDER_PRICE).toFixed(4),
           remainingQuantity: remainingQuantity.toDecimalPlaces(6).toString()
         })
-        if (lastError.startsWith('POLY_SUBMISSION_UNCERTAIN:')) break
+        if (lastError.startsWith('POLY_SUBMISSION_UNCERTAIN:') || priceProtectionTriggered) break
       }
     }
 

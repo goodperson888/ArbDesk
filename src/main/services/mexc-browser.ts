@@ -44,6 +44,7 @@ interface PrepareOrderRequest {
   allowSubmit: boolean
   durationMinutes?: MarketDuration
   startTime?: number
+  eventId?: string
 }
 
 export interface CloseMexcPositionRequest {
@@ -303,6 +304,15 @@ export class MexcBrowserManager {
     const selected = [300, 900]
       .map((seconds) => active.find((event) => event.sp === seconds))
       .filter((event): event is MexcRawEvent => Boolean(event))
+    // Start warming the two execution pages as soon as the active events are
+    // known, while depth/index/fee fallbacks continue in parallel. Previously
+    // page warming only began after every quote request completed, so a click
+    // near a 5m/15m rollover could spend several seconds navigating here.
+    if (this.mode === 'HUBSTUDIO' && !this.hubstudioOrderWarmPromise) {
+      this.hubstudioOrderWarmPromise = this.warmHubstudioOrderPages(selected)
+        .catch(() => undefined)
+        .finally(() => { this.hubstudioOrderWarmPromise = undefined })
+    }
     const symbolIds = [...new Set(selected.flatMap((event) => event.ers ?? []).map((outcome) => String(outcome.si ?? '')).filter(Boolean))]
     const effectiveDepthReceivedAt = (symbolId: string): number => Math.max(
       Number(this.interceptedDepth.get(symbolId)?.receivedAt) || 0,
@@ -403,11 +413,6 @@ export class MexcBrowserManager {
     this.latestWindows = windows
     if (this.mode === 'HUBSTUDIO') {
       void this.syncHubstudioPredictionSubscriptions().catch(() => undefined)
-      if (!this.hubstudioOrderWarmPromise) {
-        this.hubstudioOrderWarmPromise = this.warmHubstudioOrderPages(selected)
-          .catch(() => undefined)
-          .finally(() => { this.hubstudioOrderWarmPromise = undefined })
-      }
     }
     return windows
   }
@@ -592,7 +597,7 @@ export class MexcBrowserManager {
 
   async waitForFill(match: MexcFillMatch, timeoutMs = 90_000): Promise<import('../../shared/types').Fill | undefined> {
     const deadline = Date.now() + timeoutMs
-    const passiveFill = await this.waitForInterceptedFill(match, Math.min(500, timeoutMs))
+    const passiveFill = await this.waitForInterceptedFill(match, Math.min(200, timeoutMs))
     if (passiveFill) return passiveFill
     const fallbackDelays = [250, 250, 500, 750, 1_000]
     let fallbackIndex = 0
@@ -1299,7 +1304,7 @@ export class MexcBrowserManager {
     }
     if (request.durationMinutes && request.startTime) {
       try {
-        await this.ensureHubstudioLiveMarket(page, request.durationMinutes, request.startTime)
+        await this.ensureHubstudioLiveMarket(page, request.durationMinutes, request.startTime, request.eventId)
       } catch (error) {
         return {
           ok: false,
@@ -1576,7 +1581,18 @@ export class MexcBrowserManager {
     }
   }
 
-  private async ensureHubstudioLiveMarket(page: Page, durationMinutes: MarketDuration, startTime: number): Promise<void> {
+  private async ensureHubstudioLiveMarket(
+    page: Page,
+    durationMinutes: MarketDuration,
+    startTime: number,
+    expectedEventId?: string
+  ): Promise<void> {
+    if (expectedEventId && page.url().endsWith(`/${expectedEventId}`)) {
+      await page.locator('[data-tutorial-id="detail-tutorial-amount"] input, input[placeholder="0"]')
+        .first()
+        .waitFor({ state: 'visible', timeout: 15_000 })
+      return
+    }
     const target = await this.resolveLiveMarketTarget(durationMinutes, startTime)
 
     if (!page.url().endsWith(`/${target.eventId}`)) {

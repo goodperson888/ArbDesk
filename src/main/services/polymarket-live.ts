@@ -34,7 +34,6 @@ const POLYGON_RPC = 'https://polygon-rpc.com'
 const TOKEN_SCALE = new Decimal(1_000_000)
 const MIN_MARKETABLE_BUY_AMOUNT = new Decimal(1)
 const CLOB_REQUEST_TIMEOUT_MS = 3_000
-const MAX_PROTECTED_MARKET_BATCH = new Decimal(50)
 
 class RequestTimeoutError extends Error {}
 
@@ -304,19 +303,29 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     const [book, balance] = await Promise.all([bookPromise, balancePromise])
     const metadataAndBalanceCompletedAt = Date.now()
     const minimumSize = new Decimal(order.minimumOrderSize ?? book.min_order_size ?? '1')
-    const executableAsks = (liveLevelsFresh ? order.levels! : book.asks)
+    const availableAsks = (liveLevelsFresh ? order.levels! : book.asks)
       .map((level) => ({ price: new Decimal(level.price || 0), size: new Decimal(level.size || 0) }))
-      .filter((level) => level.price.gt(0) && level.price.lte(maximumPrice) && level.size.gt(0))
+      .filter((level) => level.price.gt(0) && level.price.lt(1) && level.size.gt(0))
       .sort((left, right) => left.price.comparedTo(right.price))
+    const executableAsks = availableAsks.filter((level) => level.price.lte(maximumPrice))
     const bestLevel = executableAsks[0]
     if (!bestLevel) {
+      const liveBestAsk = availableAsks[0]?.price
+      if (liveBestAsk?.gt(maximumPrice)) {
+        throw new Error(
+          `Polymarket价格保护已触发：当前最优卖价${liveBestAsk.toString()}已超过最高可接受价${maximumPrice.toString()}，未继续追价`
+        )
+      }
       throw new Error(`Polymarket当前没有价格不高于${maximumPrice.toString()}的可成交卖盘`)
     }
     let submissionPrice = bestLevel.price
     let submissionQuantity = Decimal.min(quantity, bestLevel.size)
     let levelsUsed = 1
     if (order.mode === 'PROTECTED_MARKET') {
-      const batchTarget = Decimal.min(quantity, MAX_PROTECTED_MARKET_BATCH)
+      // Attempt the full remaining hedge in one FAK. The previous fixed 50-share
+      // batch guaranteed an unnecessary second order for cases such as the 54-share
+      // hedge in the execution log, increasing both latency and tail-risk.
+      const batchTarget = quantity
       let cumulative = new Decimal(0)
       for (const [index, level] of executableAsks.entries()) {
         cumulative = cumulative.add(level.size)
@@ -347,7 +356,17 @@ export class PolymarketLiveBroker implements PolymarketBroker {
         )
       }
     }
-    const spendAmount = submissionPrice.mul(submissionQuantity)
+    // FAK BUY is a market order with a protected limit price. Polymarket requires
+    // the maker (USDC) amount of a market BUY to have at most two decimals. Using
+    // createOrder(size × price) can produce a 4-6 decimal maker amount and the CLOB
+    // rejects it before matching. Commit an exact cent amount through the SDK's
+    // market-order builder instead; flooring keeps the signed order within both the
+    // requested quantity and the configured price protection.
+    const spendAmount = submissionPrice.mul(submissionQuantity).toDecimalPlaces(2, Decimal.ROUND_FLOOR)
+    if (spendAmount.lt(MIN_MARKETABLE_BUY_AMOUNT)) {
+      throw new Error(`Polymarket BUY可提交金额${spendAmount.toFixed(2)}低于1 USDC最小值`)
+    }
+    const signedMaximumQuantity = spendAmount.div(submissionPrice)
     const estimatedFee = this.estimateFeeOnSpend(
       spendAmount,
       submissionPrice,
@@ -358,11 +377,12 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     this.assertBuyingPower(balance, spendAmount.add(estimatedFee), book)
 
     const signingStartedAt = Date.now()
-    const signedOrder = await withTimeout(client.createOrder({
+    const signedOrder = await withTimeout(client.createMarketOrder({
       tokenID: order.tokenId,
       price: submissionPrice.toNumber(),
-      size: submissionQuantity.toNumber(),
+      amount: spendAmount.toNumber(),
       side: Side.BUY,
+      orderType: OrderType.FAK
     }, {
       tickSize: book.tick_size as TickSize,
       negRisk: book.neg_risk
@@ -378,14 +398,19 @@ export class PolymarketLiveBroker implements PolymarketBroker {
         'Polymarket FAK提交'
       )
     } catch (error) {
-      if (!this.isTimeoutLike(error)) throw error
+      if (!this.isTimeoutLike(error)) {
+        if (this.isNoMatchLike(error)) {
+          throw new Error('Polymarket盘口已变化：FAK没有撮合到可用卖盘')
+        }
+        throw error
+      }
       const verificationStartedAt = Date.now()
       const recovered = await this.findRecentTimedOutBuy(
         client,
         order.tokenId,
         startedAt,
         submissionPrice,
-        submissionQuantity,
+        signedMaximumQuantity,
         order.direction
       )
       verificationMs = Date.now() - verificationStartedAt
@@ -405,7 +430,13 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       }
       throw new Error(`POLY_SUBMISSION_UNCERTAIN: Polymarket提交超时，成交查询未发现明确回执；已停止自动重复下单，请核对平台成交记录`)
     }
-    if (!response.success) throw new Error(`Polymarket FAK失败：${response.errorMsg || response.status || '未知原因'}`)
+    if (!response.success) {
+      const reason = response.errorMsg || response.status || '未知原因'
+      if (this.isNoMatchLike(reason)) {
+        throw new Error('Polymarket盘口已变化：FAK没有撮合到可用卖盘')
+      }
+      throw new Error(`Polymarket FAK失败：${reason}`)
+    }
 
     // The order response returns human-readable token/collateral amounts. Balance and
     // allowance responses use 6-decimal integers, but applying that scale here
@@ -425,6 +456,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       executionDetails: {
         quoteSource: liveLevelsFresh ? 'WEBSOCKET' : 'REST',
         levelsUsed,
+        committedSpend: spendAmount.toFixed(2),
         bookAndBalanceMs: metadataAndBalanceCompletedAt - Math.min(bookStartedAt, balanceStartedAt),
         signingMs: signedAt - signingStartedAt,
         submissionMs: Date.now() - signedAt,
@@ -438,6 +470,11 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     if (error instanceof RequestTimeoutError) return true
     const message = error instanceof Error ? error.message : String(error)
     return /timeout|timed out|ECONNABORTED|ETIMEDOUT|超过\d+毫秒/i.test(message)
+  }
+
+  private isNoMatchLike(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error)
+    return /no orders found to match|no match is found|没有撮合到|没有成交任何份额/i.test(message)
   }
 
   private async findRecentTimedOutBuy(

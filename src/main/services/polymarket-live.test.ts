@@ -184,7 +184,7 @@ describe('PolymarketLiveBroker', () => {
       getOrderBook,
       getBalanceAllowance,
       getClosedOnlyMode: vi.fn(async () => ({ closed_only: false })),
-      createOrder: vi.fn(async () => ({ version: 2 })),
+      createMarketOrder: vi.fn(async () => ({ version: 2 })),
       postOrder: vi.fn(async () => ({
         success: true, orderID: 'cached-order', status: 'matched', takingAmount: '10', makingAmount: '5.5'
       }))
@@ -251,10 +251,11 @@ describe('PolymarketLiveBroker', () => {
           '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000'
         }
       })),
-      createOrder: vi.fn(async (order) => {
+      createMarketOrder: vi.fn(async (order) => {
         expect(order).toEqual(expect.objectContaining({
-          size: 10,
+          amount: 5.5,
           price: 0.55,
+          orderType: OrderType.FAK
         }))
         return { version: 2 }
       }),
@@ -275,7 +276,7 @@ describe('PolymarketLiveBroker', () => {
   })
 
   it('returns the actual partial FAK fill instead of treating it as a failed all-or-none hedge', async () => {
-    const createOrder = vi.fn(async () => ({ version: 2 }))
+    const createMarketOrder = vi.fn(async () => ({ version: 2 }))
     const client = {
       getOrderBook: vi.fn(async () => orderBook()),
       getBalanceAllowance: vi.fn(async () => ({
@@ -284,7 +285,7 @@ describe('PolymarketLiveBroker', () => {
           '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000'
         }
       })),
-      createOrder,
+      createMarketOrder,
       postOrder: vi.fn(async () => ({
         success: true,
         errorMsg: '',
@@ -298,13 +299,62 @@ describe('PolymarketLiveBroker', () => {
 
     const fill = await broker.hedge({ tokenId: 'token', direction: 'UP', quantity: '10', maximumPrice: '0.94' })
 
-    expect(createOrder).toHaveBeenCalledWith(expect.objectContaining({ size: 10, price: 0.55 }), expect.anything())
+    expect(createMarketOrder).toHaveBeenCalledWith(expect.objectContaining({ amount: 5.5, price: 0.55 }), expect.anything())
     expect(fill.quantity).toBe('5.265957')
     expect(Number(fill.quantity)).toBeLessThan(10)
   })
 
+  it('signs a four-decimal-price BUY with a maker amount limited to whole cents', async () => {
+    const createMarketOrder = vi.fn(async () => ({ version: 2 }))
+    const client = {
+      getOrderBook: vi.fn(async () => ({
+        ...orderBook(),
+        asks: [{ price: '0.6175', size: '100' }],
+        tick_size: '0.0025'
+      })),
+      getBalanceAllowance: vi.fn(async () => ({
+        balance: '100000000',
+        allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
+      })),
+      createMarketOrder,
+      postOrder: vi.fn(async () => ({
+        success: true, errorMsg: '', orderID: 'cent-maker-order', status: 'matched',
+        takingAmount: '53.991902', makingAmount: '33.34'
+      }))
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    await broker.hedge({ tokenId: 'token', direction: 'UP', quantity: '54', maximumPrice: '0.62' })
+
+    expect(createMarketOrder).toHaveBeenCalledWith(expect.objectContaining({
+      amount: 33.34,
+      price: 0.6175,
+      orderType: OrderType.FAK
+    }), expect.anything())
+  })
+
+  it('reports the live best ask when price protection prevents a stale FAK retry', async () => {
+    const createMarketOrder = vi.fn()
+    const client = {
+      getOrderBook: vi.fn(async () => ({
+        ...orderBook(),
+        asks: [{ price: '0.64', size: '100' }]
+      })),
+      getBalanceAllowance: vi.fn(async () => ({
+        balance: '100000000', allowances: { exchange: '1000000000' }
+      })),
+      createMarketOrder
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    await expect(broker.hedge({
+      tokenId: 'token', direction: 'UP', quantity: '54', maximumPrice: '0.62'
+    })).rejects.toThrow('当前最优卖价0.64已超过最高可接受价0.62')
+    expect(createMarketOrder).not.toHaveBeenCalled()
+  })
+
   it('submits the venue minimum when the best level is smaller and accepts the actual partial fill', async () => {
-    const createOrder = vi.fn(async () => ({ version: 2 }))
+    const createMarketOrder = vi.fn(async () => ({ version: 2 }))
     const postOrder = vi.fn(async () => ({
       success: true, errorMsg: '', orderID: 'small-best-level', status: 'matched',
       takingAmount: '1.77', makingAmount: '0.9735'
@@ -318,7 +368,7 @@ describe('PolymarketLiveBroker', () => {
         balance: '100000000',
         allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
       })),
-      createOrder,
+      createMarketOrder,
       postOrder
     } as unknown as ClobClient
     const broker = new PolymarketLiveBroker(credentialStore(), () => client)
@@ -327,13 +377,13 @@ describe('PolymarketLiveBroker', () => {
       tokenId: 'token', direction: 'DOWN', quantity: '48.29', maximumPrice: '0.57'
     })
 
-    expect(createOrder).toHaveBeenCalledWith(expect.objectContaining({ size: 5, price: 0.55 }), expect.anything())
+    expect(createMarketOrder).toHaveBeenCalledWith(expect.objectContaining({ amount: 2.75, price: 0.55 }), expect.anything())
     expect(postOrder).toHaveBeenCalledWith(expect.anything(), OrderType.FAK, false, true)
     expect(fill).toMatchObject({ quantity: '1.77', averagePrice: '0.55' })
   })
 
   it('uses fresh WebSocket levels and sweeps only to the protected market price', async () => {
-    const createOrder = vi.fn(async () => ({ version: 2 }))
+    const createMarketOrder = vi.fn(async () => ({ version: 2 }))
     const getOrderBook = vi.fn(async () => orderBook())
     const client = {
       getOrderBook,
@@ -341,7 +391,7 @@ describe('PolymarketLiveBroker', () => {
         balance: '100000000',
         allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
       })),
-      createOrder,
+      createMarketOrder,
       postOrder: vi.fn(async () => ({
         success: true, errorMsg: '', orderID: 'protected-market', status: 'matched',
         takingAmount: '9.64', makingAmount: '5.4948'
@@ -355,12 +405,41 @@ describe('PolymarketLiveBroker', () => {
       levels: [{ price: '0.55', size: '4' }, { price: '0.56', size: '4' }, { price: '0.57', size: '100' }]
     })
 
-    expect(createOrder).toHaveBeenCalledWith(expect.objectContaining({ size: 9.64, price: 0.57 }), expect.anything())
+    expect(createMarketOrder).toHaveBeenCalledWith(expect.objectContaining({ amount: 5.49, price: 0.57 }), expect.anything())
     expect(fill.executionDetails).toMatchObject({ quoteSource: 'WEBSOCKET', levelsUsed: 3 })
   })
 
+  it('attempts a 54-share protected hedge in one FAK instead of a fixed 50-share batch', async () => {
+    const createMarketOrder = vi.fn(async () => ({ version: 2 }))
+    const client = {
+      getOrderBook: vi.fn(async () => orderBook()),
+      getBalanceAllowance: vi.fn(async () => ({
+        balance: '100000000',
+        allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
+      })),
+      createMarketOrder,
+      postOrder: vi.fn(async () => ({
+        success: true, errorMsg: '', orderID: 'full-54-order', status: 'matched',
+        takingAmount: '54', makingAmount: '29.7'
+      }))
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    const fill = await broker.hedge({
+      tokenId: 'token', direction: 'DOWN', quantity: '54', maximumPrice: '0.57',
+      mode: 'PROTECTED_MARKET', quoteReceivedAt: Date.now(),
+      levels: [{ price: '0.55', size: '100' }]
+    })
+
+    expect(createMarketOrder).toHaveBeenCalledWith(expect.objectContaining({
+      amount: 29.7,
+      price: 0.55
+    }), expect.anything())
+    expect(fill.quantity).toBe('54')
+  })
+
   it('ignores stale supplied levels and refreshes the REST order book', async () => {
-    const createOrder = vi.fn(async () => ({ version: 2 }))
+    const createMarketOrder = vi.fn(async () => ({ version: 2 }))
     const getOrderBook = vi.fn(async () => orderBook())
     const client = {
       getOrderBook,
@@ -368,7 +447,7 @@ describe('PolymarketLiveBroker', () => {
         balance: '100000000',
         allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
       })),
-      createOrder,
+      createMarketOrder,
       postOrder: vi.fn(async () => ({
         success: true, errorMsg: '', orderID: 'rest-fallback', status: 'matched',
         takingAmount: '5', makingAmount: '2.75'
@@ -382,7 +461,7 @@ describe('PolymarketLiveBroker', () => {
     })
 
     expect(getOrderBook).toHaveBeenCalledOnce()
-    expect(createOrder).toHaveBeenCalledWith(expect.objectContaining({ price: 0.55 }), expect.anything())
+    expect(createMarketOrder).toHaveBeenCalledWith(expect.objectContaining({ amount: 2.75, price: 0.55 }), expect.anything())
     expect(fill.executionDetails).toMatchObject({ quoteSource: 'REST' })
   })
 
@@ -399,7 +478,7 @@ describe('PolymarketLiveBroker', () => {
         balance: '100000000',
         allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
       })),
-      createOrder: vi.fn(async () => ({ version: 2 })),
+      createMarketOrder: vi.fn(async () => ({ version: 2 })),
       postOrder,
       getTrades
     } as unknown as ClobClient
@@ -414,7 +493,7 @@ describe('PolymarketLiveBroker', () => {
   })
 
   it('limits each FAK attempt to the shares available at the current best price level', async () => {
-    const createOrder = vi.fn(async () => ({ version: 2 }))
+    const createMarketOrder = vi.fn(async () => ({ version: 2 }))
     const client = {
       getOrderBook: vi.fn(async () => ({
         ...orderBook(),
@@ -424,7 +503,7 @@ describe('PolymarketLiveBroker', () => {
         balance: '100000000',
         allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
       })),
-      createOrder,
+      createMarketOrder,
       postOrder: vi.fn(async () => ({
         success: true, errorMsg: '', orderID: 'best-level-only', status: 'matched',
         takingAmount: '6', makingAmount: '3.3'
@@ -434,12 +513,12 @@ describe('PolymarketLiveBroker', () => {
 
     const fill = await broker.hedge({ tokenId: 'token', direction: 'DOWN', quantity: '10', maximumPrice: '0.57' })
 
-    expect(createOrder).toHaveBeenCalledWith(expect.objectContaining({ size: 6, price: 0.55 }), expect.anything())
+    expect(createMarketOrder).toHaveBeenCalledWith(expect.objectContaining({ amount: 3.3, price: 0.55 }), expect.anything())
     expect(fill).toMatchObject({ quantity: '6', averagePrice: '0.55', verificationSource: 'PLATFORM_READBACK' })
   })
 
   it('includes the V2 curve fee in the collateral balance check', async () => {
-    const createOrder = vi.fn()
+    const createMarketOrder = vi.fn()
     const client = {
       getOrderBook: vi.fn(async () => orderBook()),
       getBalanceAllowance: vi.fn(async () => ({
@@ -448,7 +527,7 @@ describe('PolymarketLiveBroker', () => {
           '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000'
         }
       })),
-      createOrder
+      createMarketOrder
     } as unknown as ClobClient
     const broker = new PolymarketLiveBroker(credentialStore(), () => client)
 
@@ -456,7 +535,7 @@ describe('PolymarketLiveBroker', () => {
       tokenId: 'token', direction: 'DOWN', quantity: '10', maximumPrice: '0.57',
       feeRate: '0.07', feeExponent: '1'
     })).rejects.toThrow('余额不足')
-    expect(createOrder).not.toHaveBeenCalled()
+    expect(createMarketOrder).not.toHaveBeenCalled()
   })
 
   it('rejects a hedge below the live Polymarket minimum before posting', async () => {

@@ -20,7 +20,11 @@ afterEach(async () => {
   }
 })
 
-async function createAssistedExecutionController(hedge: PolymarketBroker['hedge'], readbackFill?: Fill): Promise<AppController> {
+async function createAssistedExecutionController(
+  hedge: PolymarketBroker['hedge'],
+  readbackFill?: Fill,
+  confirmOutcomeQuote?: PolymarketMarketData['confirmOutcomeQuote']
+): Promise<AppController> {
   const directory = await mkdtemp(join(tmpdir(), 'arbdesk-partial-hedge-test-'))
   temporaryDirectories.push(directory)
   const startTime = Math.ceil(Date.now() / 300_000) * 300_000
@@ -56,6 +60,7 @@ async function createAssistedExecutionController(hedge: PolymarketBroker['hedge'
   const polymarketData = {
     configureProxy: () => undefined,
     getStatus: () => ({ connected: true, message: 'test' }),
+    confirmOutcomeQuote,
     fetchWindows: async () => [{
       durationMinutes: 5, startTime, endTime: startTime + 300_000,
       baselinePrice: '60000', indexPrice: '60030', indexReceivedAt: Date.now(),
@@ -654,6 +659,36 @@ describe('AppController simulation', () => {
     expect(hedge).toHaveBeenCalledOnce()
     expect(session.state).toBe('RECOVERY_REQUIRED')
     expect(session.error).toContain('POLY_SUBMISSION_UNCERTAIN')
+  })
+
+  it('forces a fresh Polymarket book after a FAK no-match before retrying', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const confirmOutcomeQuote = vi.fn(async () => undefined)
+    const hedge = vi.fn(async (order) => {
+      if (hedge.mock.calls.length === 1) {
+        throw new Error('Polymarket盘口已变化：FAK没有撮合到可用卖盘')
+      }
+      return {
+        venue: 'POLYMARKET' as const,
+        direction: order.direction,
+        quantity: order.quantity,
+        averagePrice: '0.52',
+        orderId: 'fresh-book-fill',
+        filledAt: Date.now()
+      }
+    })
+    const controller = await createAssistedExecutionController(hedge, undefined, confirmOutcomeQuote)
+    await controller.updateSettings({ polymarketHedgeRetryCount: 1 })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+
+    const session = await controller.confirmMexcFill({
+      quantity: '10', averagePrice: '0.40', orderId: 'mexc-requote', manualAcknowledged: true
+    })
+
+    expect(hedge).toHaveBeenCalledTimes(2)
+    expect(confirmOutcomeQuote).toHaveBeenLastCalledWith('poly-down', -1)
+    expect(session.state).toBe('HEDGED')
   })
 
   it('does not expose or block on a recovery session after its market has expired', async () => {
