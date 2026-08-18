@@ -178,6 +178,7 @@ td small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px
 .edge-cell { gap: 5px; }
 .edge-cell > svg { width: 12px; flex: 0 0 auto; color: var(--amber); }
 .mono { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+.all-in-cost-cell { color: var(--text); font-size: 14px; font-weight: 800; letter-spacing: -.01em; }
 .countdown { color: var(--text-soft); }
 .positive-value, .negative-value { display: inline-flex; min-width: 57px; padding: 3px 6px; border-radius: 6px; font-weight: 750; font-variant-numeric: tabular-nums; }
 .positive-value { color: #86efac; background: var(--green-soft); }

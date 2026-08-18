@@ -1141,7 +1141,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
             <div className="table-wrap">
               <table>
                 <thead>
-                  <tr><th>周期</th><th>MEXC</th><th>Polymarket</th><th>全部成本</th><th>净边际</th><th title="两边盘口深度允许的对齐数量，不含账户余额和收益门槛">盘口量</th><th>剩余</th></tr>
+                  <tr><th>周期</th><th>MEXC</th><th>Polymarket</th><th>净边际</th><th title="两边盘口深度允许的对齐数量，不含账户余额和收益门槛">盘口量</th><th>剩余</th><th title="每份包含两边价格、手续费和风险缓冲后的总成本">全部成本</th></tr>
                 </thead>
                 <tbody>
                   {snapshot.opportunities.length === 0 && (
@@ -1156,7 +1156,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                         <td><span className="duration-pill">{opportunity.durationMinutes}m</span>{isBest && <span className="best-badge">最佳</span>}</td>
                         <td><span className="quote-inline"><Direction direction={opportunity.mexcDirection} /><span className="mono">{money(opportunity.mexcPrice, 4)}</span></span></td>
                         <td><span className="quote-inline"><Direction direction={opportunity.polymarketDirection} /><span className="mono">{money(opportunity.polymarketPrice, 4)}</span></span></td>
-                        <td className="mono">{opportunity.feeVerificationBlocked ? '—' : money(opportunity.allInCostPerShare, 4)}</td>
                         <td><span className="edge-cell" title={opportunity.feeVerificationBlocked ? '费用待校验' : opportunity.settlementRiskBlocked ? '风控拦截' : positive ? '当前可执行' : '未通过全部执行门槛'}>
                           <span className={positive ? 'positive-value' : 'negative-value'}>
                             {opportunity.feeVerificationBlocked ? '—' : `${positive ? '+' : ''}${money(opportunity.netEdgePerShare, 4)}`}
@@ -1165,6 +1164,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                         </span></td>
                         <td className="mono">{money(opportunity.maxQuantity, 0)}</td>
                         <td className="mono countdown">{secondsRemaining(opportunity.endTime, now)}</td>
+                        <td className="mono all-in-cost-cell">{opportunity.feeVerificationBlocked ? '—' : money(opportunity.allInCostPerShare, 4)}</td>
                       </tr>
                     )
                   })}
@@ -1559,7 +1559,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 {snapshot.settings.mexcAutomationEnabled ? <Check /> : <LockKeyhole />}
                 {snapshot.settings.mexcAutomationEnabled ? '已启用 · 点击关闭' : '确认后启用'}
               </button>
-              <div><ShieldAlert /><div><h3>Polymarket精确份额FAK</h3><p>MEXC成交后按实际份额成交可用盘口，未成交部分自动重新定价补单；更优价格始终允许。</p></div></div>
+              <div><ShieldAlert /><div><h3>Polymarket精确份额FAK</h3><p>最优价档数量足够时一笔买完；仅在该档不足时按剩余份额补单。每笔锁定当前价格与份额，避免更优价格导致买超。</p></div></div>
               <button className={`automation-toggle ${snapshot.settings.polymarketLiveEnabled ? 'enabled' : ''}`} onClick={() => void togglePolymarketLive()}>
                 {snapshot.settings.polymarketLiveEnabled ? <Check /> : <LockKeyhole />}
                 {snapshot.settings.polymarketLiveEnabled ? '真实对冲已启用 · 点击关闭' : '验证后启用真实对冲'}

@@ -513,6 +513,32 @@ describe('AppController simulation', () => {
     expect(order.polymarket.entryFills).toHaveLength(1)
   })
 
+  it('does not expose or block on a recovery session after its market has expired', async () => {
+    vi.useFakeTimers()
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const now = 1_800_000_000_000
+    vi.setSystemTime(now)
+    const controller = await createAssistedExecutionController(async () => {
+      throw new Error('temporary no liquidity')
+    })
+    await controller.updateSettings({ polymarketHedgeRetryCount: 0 })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+    const session = await controller.confirmMexcFill({
+      quantity: '10', averagePrice: '0.40', orderId: 'mexc-fill-expiry', manualAcknowledged: true
+    })
+
+    expect(session.state).toBe('RECOVERY_REQUIRED')
+    expect(controller.getSnapshot().activeSession?.state).toBe('RECOVERY_REQUIRED')
+
+    vi.setSystemTime(opportunity.endTime + 1)
+    const expiredSnapshot = controller.getSnapshot()
+    expect(expiredSnapshot.orderHistory[0]).toMatchObject({ status: 'EXPIRED', executionState: 'RECOVERY_REQUIRED' })
+    expect(expiredSnapshot.activeSession).toBeUndefined()
+    await expect(controller.retryPolymarketHedge()).rejects.toThrow('当前没有可重试')
+    await expect(controller.execute({ opportunityId: 'next-round', quantity: '10' })).rejects.toThrow('机会已失效')
+  })
+
   it('waits 500ms using cached quotes before automatic opening performs lightweight balance checks', async () => {
     vi.useFakeTimers()
     const now = 1_800_000_000_000

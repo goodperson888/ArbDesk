@@ -186,11 +186,12 @@ export class AppController {
   }
 
   getSnapshot(): AppSnapshot {
-    this.normalizeExpiredOrders()
+    const now = Date.now()
+    this.normalizeExpiredOrders(now)
     const mexcStatus = this.mexcBrowser.getStatus()
     const settlementFeedConnected = this.opportunities.some((opportunity) => Boolean(opportunity.polymarketSignal))
     return {
-      generatedAt: Date.now(),
+      generatedAt: now,
       connection: {
         mexc: mexcStatus.open ? 'BROWSER_READY' : 'DISCONNECTED',
         polymarket: this.polymarketData.getStatus().connected ? 'CONNECTED' : 'DISCONNECTED',
@@ -206,7 +207,7 @@ export class AppController {
       settings: this.settings,
       opportunities: this.opportunities,
       orderHistory: this.orderHistory,
-      activeSession: this.activeSession,
+      activeSession: this.activeSessionForSnapshot(now),
       recentEvents: this.recentEvents,
       autoOpenState: this.autoOpenState
     }
@@ -243,7 +244,15 @@ export class AppController {
   private hasActionableActiveSession(now: number): boolean {
     if (!this.activeSession || ['HEDGED', 'CANCELLED', 'CLOSED'].includes(this.activeSession.state)) return false
     const order = this.orderHistory.find((candidate) => candidate.id === this.activeSession?.id)
-    return Boolean(order && order.endTime > now && order.status !== 'EXPIRED')
+    if (!order) return true
+    return order.endTime > now && order.status !== 'EXPIRED'
+  }
+
+  private activeSessionForSnapshot(now: number): ExecutionSession | undefined {
+    if (!this.activeSession) return undefined
+    const order = this.orderHistory.find((candidate) => candidate.id === this.activeSession?.id)
+    if (order && (order.endTime <= now || order.status === 'EXPIRED')) return undefined
+    return this.activeSession
   }
 
   private hasActionableOrderExposure(order: ArbitrageOrderRecord, now: number): boolean {
@@ -407,7 +416,7 @@ export class AppController {
     const triggerSource = request.source ?? (this.settings.allowUnprofitableTestTrade ? 'TEST' : 'MANUAL')
     let quotesConfirmedAt = executeRequestedAt
     if (this.closingOrderId) throw new Error('平仓流程正在执行，不能同时开新仓')
-    if (this.activeSession && !['HEDGED', 'CANCELLED'].includes(this.activeSession.state)) {
+    if (this.hasActionableActiveSession(executeRequestedAt)) {
       throw new Error('已有执行中的套利组，不能重复开仓')
     }
     let opportunity = this.opportunities.find((candidate) => candidate.id === request.opportunityId)
@@ -624,7 +633,11 @@ export class AppController {
   }
 
   async retryPolymarketHedge(): Promise<ExecutionSession> {
-    if (!this.activeSession || this.activeSession.state !== 'RECOVERY_REQUIRED') {
+    if (
+      !this.activeSession ||
+      this.activeSession.state !== 'RECOVERY_REQUIRED' ||
+      !this.hasActionableActiveSession(Date.now())
+    ) {
       throw new Error('当前没有可重试的Polymarket剩余对冲')
     }
     const opportunity = this.activeOpportunity ?? this.opportunities.find((item) => item.id === this.activeSession?.opportunityId)
