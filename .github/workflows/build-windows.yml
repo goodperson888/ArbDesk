@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   windows:
@@ -147,3 +147,23 @@ jobs:
           path: release/*.exe
           if-no-files-found: error
           retention-days: 7
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $tag = "v$version"
+          $exe = (Get-ChildItem -Path release -Filter *.exe -File | Select-Object -First 1).FullName
+          if (-not $exe) { throw "未找到安装包" }
+          $notes = @"
+          ArbDesk $tag
+
+          下载下方附件 ArbDesk-Setup-*.exe 安装即可。
+          "@
+          gh release create $tag $exe --title "ArbDesk $tag" --notes $notes --verify-tag=false 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release upload $tag $exe --clobber
+            gh release edit $tag --notes $notes
+          }
