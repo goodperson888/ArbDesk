@@ -145,6 +145,17 @@ export interface CloseOperation {
   error?: string
 }
 
+export interface HedgeOutcomeSummary {
+  protectedCost: string
+  mexcDirectionPnl: string
+  polymarketDirectionPnl: string
+  worstPnl: string
+  worstReturnPct: string
+  quantityDifference: string
+  safe: boolean
+  meetsProfitTarget: boolean
+}
+
 export interface ArbitrageOrderRecord {
   id: string
   opportunityId: string
@@ -163,6 +174,7 @@ export interface ArbitrageOrderRecord {
   updatedAt: number
   mexc: OrderLegRecord
   polymarket: OrderLegRecord
+  hedgeOutcome?: HedgeOutcomeSummary
   closeOperation?: CloseOperation
 }
 
@@ -189,6 +201,7 @@ export interface ExecutionSession {
   polymarketTargetQuantity?: string
   remainingHedgeQuantity?: string
   excessHedgeQuantity?: string
+  hedgeOutcome?: HedgeOutcomeSummary
   hedgeAttempts?: number
   timings?: ExecutionTimings
   error?: string

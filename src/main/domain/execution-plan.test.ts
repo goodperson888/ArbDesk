@@ -64,6 +64,7 @@ describe('depth execution plan', () => {
     expect(plan.minimumQuantity).toBe('14.29')
     expect(plan.maxAffordableQuantity).toBe('47.29')
     expect(plan.maxExecutableQuantity).toBe('0.00')
+    expect(plan.marketDepthQuantity).toBe('100.00')
     expect(plan.accountBalanceReservePct).toBe('1.00')
     expect(plan.affordableLimitingFactors).toEqual(['MEXC可用余额'])
     expect(plan.limitingFactors).toEqual(['最低条件收益率'])

@@ -15,6 +15,7 @@ import type {
   ExecutionPlan,
   EmergencyAccessSnapshot,
   Fill,
+  HedgeOutcomeSummary,
   MexcAccountState,
   Opportunity,
   RetryPolymarketHedgeRequest,
@@ -323,6 +324,11 @@ export class AppController {
       throw new Error('最低条件收益率须为0至100之间的百分比')
     }
     next.minConditionalReturnPct = minimumReturn.toDecimalPlaces(2).toFixed(2)
+    const maximumHedgeSlippage = new Decimal(next.maxHedgeSlippage)
+    if (!maximumHedgeSlippage.isFinite() || maximumHedgeSlippage.lt(0) || maximumHedgeSlippage.gt('0.5')) {
+      throw new Error('Polymarket最大加价须为0至0.50之间的价格数值')
+    }
+    next.maxHedgeSlippage = maximumHedgeSlippage.toDecimalPlaces(4).toFixed(4)
     if (!Number.isInteger(next.maxQuoteAgeMs) || next.maxQuoteAgeMs < 3_000 || next.maxQuoteAgeMs > 30_000) {
       throw new Error('行情最长未确认时间须为3至30秒的整数')
     }
@@ -349,7 +355,7 @@ export class AppController {
       throw new Error('Polymarket自动补单次数须为0至20的整数')
     }
     if (!['PROTECTED_LIMIT', 'PROTECTED_MARKET'].includes(next.polymarketHedgeMode)) {
-      throw new Error('Polymarket第二腿成交模式无效')
+      throw new Error('Polymarket第二腿对冲速度无效')
     }
     if (Object.values(next.manualExecutionConditions).some((enabled) => typeof enabled !== 'boolean')) {
       throw new Error('手动下单条件开关无效')
@@ -1130,26 +1136,112 @@ export class AppController {
     if (!this.activeSession) throw new Error('执行会话意外丢失')
     const excessQuantity = Decimal.max(filledQuantity.minus(targetQuantity), 0)
     this.activeSession.excessHedgeQuantity = excessQuantity.toDecimalPlaces(6).toString()
-    if (remainingQuantity.lte('0.000001') && excessQuantity.lte('0.000001')) {
+    const outcome = this.calculateHedgeOutcome(opportunity, mexcFill, fills)
+    this.activeSession.hedgeOutcome = outcome
+    const exactlyAligned = remainingQuantity.lte('0.000001') && excessQuantity.lte('0.000001')
+    const safeImbalance = !exactlyAligned && Boolean(outcome?.safe)
+    const safeToComplete = outcome ? outcome.safe : exactlyAligned
+    if (safeToComplete) {
       this.activeSession.error = undefined
-      this.activeSession.remainingHedgeQuantity = '0'
+      if (exactlyAligned) this.activeSession.remainingHedgeQuantity = '0'
       if (this.activeSession.timings) {
         this.activeSession.timings.polymarketCompletedAt = Date.now()
         this.activeSession.timings.hedgedAt = Date.now()
       }
-      await this.transition('HEDGED', `两腿已按实际成交量对齐；Polymarket共${fills.length}笔FAK成交`)
+      const outcomeDetails = outcome ? {
+        protectedCost: outcome.protectedCost,
+        mexcDirectionPnl: outcome.mexcDirectionPnl,
+        polymarketDirectionPnl: outcome.polymarketDirectionPnl,
+        worstPnl: outcome.worstPnl,
+        worstReturnPct: outcome.worstReturnPct,
+        quantityDifference: outcome.quantityDifference,
+        meetsProfitTarget: outcome.meetsProfitTarget
+      } : undefined
+      if (safeImbalance && outcome) {
+        const profitNote = outcome.meetsProfitTarget ? '仍达到利润门槛' : '最低利润低于开仓门槛'
+        await this.transition(
+          'HEDGED',
+          `对冲完成但份额略有偏差：Poly相对MEXC ${new Decimal(outcome.quantityDifference).gte(0) ? '+' : ''}${outcome.quantityDifference}份；正常互斥结算下MEXC方向盈亏${outcome.mexcDirectionPnl} USDT、Polymarket方向盈亏${outcome.polymarketDirectionPnl} USDT，${profitNote}；安全偏差未自动平仓`,
+          outcomeDetails
+        )
+      } else {
+        await this.transition(
+          'HEDGED',
+          `两腿已按实际成交量对齐；Polymarket共${fills.length}笔FAK成交${outcome ? `；正常互斥结算下最低预计盈亏${outcome.worstPnl} USDT${outcome.meetsProfitTarget ? '' : `，收益率${outcome.worstReturnPct}%低于设置门槛`}` : ''}`,
+          outcomeDetails
+        )
+      }
       return
     }
-    const message = excessQuantity.gt('0.000001')
-      ? `Polymarket超额成交${excessQuantity.toDecimalPlaces(6).toString()}份：目标${targetQuantity.toDecimalPlaces(6).toString()}份，实际${filledQuantity.toDecimalPlaces(6).toString()}份；已停止继续买入`
-      : `已对冲${filledQuantity.toDecimalPlaces(6).toString()}份，仍有${remainingQuantity.toDecimalPlaces(6).toString()}份未对冲${lastError ? `：${lastError}` : ''}`
+    const quantityIssue = excessQuantity.gt('0.000001')
+      ? `Polymarket超额成交${excessQuantity.toDecimalPlaces(6).toString()}份：目标${targetQuantity.toDecimalPlaces(6).toString()}份，实际${filledQuantity.toDecimalPlaces(6).toString()}份`
+      : remainingQuantity.gt('0.000001')
+        ? `已对冲${filledQuantity.toDecimalPlaces(6).toString()}份，仍有${remainingQuantity.toDecimalPlaces(6).toString()}份未对冲`
+        : '两腿份额已对齐'
+    const message = outcome && !outcome.safe
+      ? `${quantityIssue}；正常互斥结算下最低预计盈亏${outcome.worstPnl} USDT，存在亏损结果，需要恢复或平仓处理`
+      : `${quantityIssue}${lastError ? `：${lastError}` : ''}`
     this.activeSession.error = message
     this.activeSession.remainingHedgeQuantity = remainingQuantity.toDecimalPlaces(6).toString()
-    await this.transition('RECOVERY_REQUIRED', `Polymarket部分对冲后仍需恢复：${message}`, {
+    await this.transition('RECOVERY_REQUIRED', `实际成交后仍需处理：${message}`, {
       error: message,
       filledQuantity: filledQuantity.toDecimalPlaces(6).toString(),
-      remainingQuantity: remainingQuantity.toDecimalPlaces(6).toString()
+      remainingQuantity: remainingQuantity.toDecimalPlaces(6).toString(),
+      ...(outcome ? {
+        protectedCost: outcome.protectedCost,
+        mexcDirectionPnl: outcome.mexcDirectionPnl,
+        polymarketDirectionPnl: outcome.polymarketDirectionPnl,
+        worstPnl: outcome.worstPnl,
+        worstReturnPct: outcome.worstReturnPct
+      } : {})
     })
+  }
+
+  private calculateHedgeOutcome(
+    opportunity: Opportunity,
+    mexcFill: Fill,
+    polymarketFills: Fill[]
+  ): HedgeOutcomeSummary | undefined {
+    if (
+      opportunity.feeVerificationBlocked ||
+      mexcFill.direction !== opportunity.mexcDirection ||
+      opportunity.mexcDirection === opportunity.polymarketDirection ||
+      polymarketFills.some((fill) => fill.direction !== opportunity.polymarketDirection)
+    ) return undefined
+    const mexcQuantity = new Decimal(mexcFill.quantity || 0)
+    const mexcPrice = new Decimal(mexcFill.averagePrice || 0)
+    const polymarketQuantity = Decimal.sum(0, ...polymarketFills.map((fill) => new Decimal(fill.quantity || 0)))
+    if (mexcQuantity.lte(0) || mexcPrice.lte(0) || polymarketQuantity.lte(0)) return undefined
+    const mexcCost = mexcQuantity.mul(mexcPrice)
+    const mexcFee = mexcCost.mul(opportunity.mexcFeeRate || 0)
+    const polymarketCostAndFees = Decimal.sum(0, ...polymarketFills.map((fill) => {
+      const quantity = new Decimal(fill.quantity || 0)
+      const price = new Decimal(fill.averagePrice || 0)
+      if (quantity.lte(0) || price.lte(0)) return new Decimal(Infinity)
+      return quantity.mul(price.add(polymarketCryptoFeePerShare(
+        price,
+        opportunity.polymarketFeeRate || 0,
+        opportunity.polymarketFeeExponent || 1
+      )))
+    }))
+    if (!polymarketCostAndFees.isFinite()) return undefined
+    const riskReserve = Decimal.max(mexcQuantity, polymarketQuantity).mul(opportunity.riskBufferPerShare || 0)
+    const protectedCost = mexcCost.add(mexcFee).add(polymarketCostAndFees).add(riskReserve)
+    if (protectedCost.lte(0)) return undefined
+    const mexcDirectionPnl = mexcQuantity.minus(protectedCost)
+    const polymarketDirectionPnl = polymarketQuantity.minus(protectedCost)
+    const worstPnl = Decimal.min(mexcDirectionPnl, polymarketDirectionPnl)
+    const worstReturnPct = worstPnl.div(protectedCost).mul(100)
+    return {
+      protectedCost: protectedCost.toFixed(2),
+      mexcDirectionPnl: mexcDirectionPnl.toFixed(2),
+      polymarketDirectionPnl: polymarketDirectionPnl.toFixed(2),
+      worstPnl: worstPnl.toFixed(2),
+      worstReturnPct: worstReturnPct.toFixed(2),
+      quantityDifference: polymarketQuantity.minus(mexcQuantity).toDecimalPlaces(6).toString(),
+      safe: worstPnl.gte(0),
+      meetsProfitTarget: worstReturnPct.gte(this.settings.minConditionalReturnPct)
+    }
   }
 
   private calculatePolymarketTargetQuantity(mexcFill: Fill): Decimal {
@@ -1272,7 +1364,8 @@ export class AppController {
       executionState: session.state,
       updatedAt: session.updatedAt,
       mexc,
-      polymarket
+      polymarket,
+      hedgeOutcome: session.hedgeOutcome ?? current.hedgeOutcome
     }
     this.orderHistory = this.orderHistory.map((order, orderIndex) => orderIndex === index ? updated : order)
     await this.store.saveOrderHistory(this.orderHistory)

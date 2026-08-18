@@ -184,6 +184,7 @@ describe('AppController simulation', () => {
       hubstudioContainerCode: ' 223012801 ',
       maxCapitalPerTrade: '250.5',
       minConditionalReturnPct: '1.234',
+      maxHedgeSlippage: '0.04',
       maxQuoteAgeMs: 9_000
     })
 
@@ -191,12 +192,15 @@ describe('AppController simulation', () => {
     expect(settings.hubstudioContainerCode).toBe('223012801')
     expect(settings.maxCapitalPerTrade).toBe('250.50')
     expect(settings.minConditionalReturnPct).toBe('1.23')
+    expect(settings.maxHedgeSlippage).toBe('0.0400')
     expect(settings.maxQuoteAgeMs).toBe(9_000)
     expect(configurations.at(-1)).toEqual({ mode: 'HUBSTUDIO', hubstudioContainerCode: '223012801', elementMode: 'AUTO' })
     await expect(controller.updateSettings({ maxCapitalPerTrade: '0' })).rejects.toThrow('单笔最大本金')
     await expect(controller.updateSettings({ maxCapitalPerTrade: '1000001' })).rejects.toThrow('单笔最大本金')
     await expect(controller.updateSettings({ minConditionalReturnPct: '-1' })).rejects.toThrow('最低条件收益率')
     await expect(controller.updateSettings({ minConditionalReturnPct: '101' })).rejects.toThrow('最低条件收益率')
+    await expect(controller.updateSettings({ maxHedgeSlippage: '-0.01' })).rejects.toThrow('Polymarket最大加价')
+    await expect(controller.updateSettings({ maxHedgeSlippage: '0.51' })).rejects.toThrow('Polymarket最大加价')
     await expect(controller.updateSettings({ maxQuoteAgeMs: 2_000 })).rejects.toThrow('行情最长未确认时间')
     await expect(controller.updateSettings({ maxQuoteAgeMs: 31_000 })).rejects.toThrow('行情最长未确认时间')
     await expect(controller.updateSettings({ autoOpenStabilityMs: -1 })).rejects.toThrow('自动开单稳定时间')
@@ -424,11 +428,41 @@ describe('AppController simulation', () => {
     })
   })
 
-  it('records an over-target Polymarket fill as recovery instead of successful hedging', async () => {
+  it('accepts an over-target Polymarket fill when both normal settlement outcomes remain profitable', async () => {
     vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
     const controller = await createAssistedExecutionController(async (order) => ({
       venue: 'POLYMARKET', direction: order.direction, quantity: '11',
       averagePrice: '0.50', orderId: 'poly-over-target', filledAt: Date.now(), verificationSource: 'PLATFORM_READBACK'
+    }))
+    await controller.updateSettings({
+      minConditionalReturnPct: '5',
+      manualExecutionConditions: { conditionalReturn: false }
+    })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+
+    const session = await controller.confirmMexcFill({
+      quantity: '10', averagePrice: '0.40', orderId: 'mexc-real-order', manualAcknowledged: true
+    })
+
+    expect(session.state).toBe('HEDGED')
+    expect(session.polymarketTargetQuantity).toBe('10')
+    expect(session.excessHedgeQuantity).toBe('1')
+    expect(session.error).toBeUndefined()
+    expect(session.hedgeOutcome).toMatchObject({ safe: true, meetsProfitTarget: false, quantityDifference: '1' })
+    expect(Number(session.hedgeOutcome?.mexcDirectionPnl)).toBeGreaterThan(0)
+    expect(Number(session.hedgeOutcome?.polymarketDirectionPnl)).toBeGreaterThan(0)
+    const order = controller.getSnapshot().orderHistory[0]
+    expect(order.status).toBe('OPEN')
+    expect(order.polymarket.targetQuantity).toBe('10')
+    expect(order.hedgeOutcome?.safe).toBe(true)
+  })
+
+  it('keeps an unsafe over-target fill in recovery when one normal settlement outcome can lose', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const controller = await createAssistedExecutionController(async (order) => ({
+      venue: 'POLYMARKET', direction: order.direction, quantity: '11',
+      averagePrice: '0.70', orderId: 'poly-unsafe-over-target', filledAt: Date.now(), verificationSource: 'PLATFORM_READBACK'
     }))
     const opportunity = controller.getSnapshot().opportunities[0]
     await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
@@ -438,10 +472,30 @@ describe('AppController simulation', () => {
     })
 
     expect(session.state).toBe('RECOVERY_REQUIRED')
-    expect(session.polymarketTargetQuantity).toBe('10')
-    expect(session.excessHedgeQuantity).toBe('1')
-    expect(session.error).toContain('超额成交1份')
-    expect(controller.getSnapshot().orderHistory[0].polymarket.targetQuantity).toBe('10')
+    expect(session.hedgeOutcome?.safe).toBe(false)
+    expect(Number(session.hedgeOutcome?.worstPnl)).toBeLessThan(0)
+    expect(session.error).toContain('存在亏损结果')
+  })
+
+  it('does not mark equal quantities as safe when actual prices make both normal outcomes lose', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const controller = await createAssistedExecutionController(async (order) => ({
+      venue: 'POLYMARKET', direction: order.direction, quantity: order.quantity,
+      averagePrice: '0.70', orderId: 'poly-expensive-aligned', filledAt: Date.now(), verificationSource: 'PLATFORM_READBACK'
+    }))
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+
+    const session = await controller.confirmMexcFill({
+      quantity: '10', averagePrice: '0.40', orderId: 'mexc-real-order', manualAcknowledged: true
+    })
+
+    expect(session.state).toBe('RECOVERY_REQUIRED')
+    expect(session.excessHedgeQuantity).toBe('0')
+    expect(session.remainingHedgeQuantity).toBe('0')
+    expect(session.hedgeOutcome?.safe).toBe(false)
+    expect(session.error).toContain('两腿份额已对齐')
+    expect(session.error).toContain('存在亏损结果')
   })
 
   it('retries the remaining Polymarket quantity after a partial FAK fill', async () => {
@@ -477,6 +531,26 @@ describe('AppController simulation', () => {
     expect(order.status).toBe('OPEN')
     expect(order.polymarket.entryFills).toHaveLength(2)
     expect(Number(order.polymarket.openQuantity)).toBe(10)
+  })
+
+  it('accepts a small underfill when both normal settlement outcomes still remain profitable', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const controller = await createAssistedExecutionController(async (order) => ({
+      venue: 'POLYMARKET', direction: order.direction, quantity: '9',
+      averagePrice: '0.50', orderId: 'poly-safe-underfill', filledAt: Date.now(), verificationSource: 'PLATFORM_READBACK'
+    }))
+    await controller.updateSettings({ polymarketHedgeRetryCount: 0 })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+
+    const session = await controller.confirmMexcFill({
+      quantity: '10', averagePrice: '0.40', orderId: 'mexc-fill', manualAcknowledged: true
+    })
+
+    expect(session.state).toBe('HEDGED')
+    expect(session.remainingHedgeQuantity).toBe('1')
+    expect(session.hedgeOutcome).toMatchObject({ safe: true, quantityDifference: '-1' })
+    expect(Number(session.hedgeOutcome?.worstPnl)).toBeGreaterThan(0)
   })
 
   it('records the actual fills and remaining exposure when recovery is still required', async () => {
