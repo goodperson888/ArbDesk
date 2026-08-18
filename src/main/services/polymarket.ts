@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { Direction, Fill } from '../../shared/types'
+import type { Direction, Fill, OrderBookLevel, PolymarketHedgeMode } from '../../shared/types'
 
 export interface HedgeOrder {
   tokenId?: string
@@ -8,6 +8,11 @@ export interface HedgeOrder {
   maximumPrice: string
   feeRate?: string
   feeExponent?: string
+  mode?: PolymarketHedgeMode
+  levels?: OrderBookLevel[]
+  quoteReceivedAt?: number
+  minimumOrderSize?: string
+  allowTailOverhedge?: boolean
 }
 
 export interface ClosePositionOrder {

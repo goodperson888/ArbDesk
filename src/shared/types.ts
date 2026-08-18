@@ -8,6 +8,16 @@ export type MexcBrowserMode = 'EMBEDDED' | 'HUBSTUDIO'
 export type MexcElementMode = 'AUTO' | 'MANUAL'
 export type PolymarketSignatureType = 0 | 1 | 2 | 3
 export type LicenseStatus = 'UNLICENSED' | 'ACTIVE' | 'EXPIRED' | 'INVALID' | 'CLOCK_ERROR' | 'STORAGE_ERROR'
+export type PolymarketHedgeMode = 'PROTECTED_LIMIT' | 'PROTECTED_MARKET'
+export type RecoveryHedgeMode = 'PROTECTED' | 'EMERGENCY_MARKET'
+
+export interface ManualExecutionConditions {
+  conditionalReturn: boolean
+  settlementRisk: boolean
+  feeVerification: boolean
+  quoteFreshness: boolean
+  expiryCutoff: boolean
+}
 
 export interface SettlementDistanceRule {
   id: string
@@ -110,6 +120,7 @@ export interface Fill {
   orderId: string
   filledAt: number
   verificationSource?: FillVerificationSource
+  executionDetails?: Record<string, string | number | boolean>
 }
 
 export interface OrderLegRecord {
@@ -201,7 +212,6 @@ export interface ExecutionTimings {
 export interface RiskSettings {
   mode: ExecutionMode
   maxCapitalPerTrade: string
-  minNetEdgePerShare: string
   minConditionalReturnPct: string
   maxQuoteAgeMs: number
   maxHedgeSlippage: string
@@ -223,6 +233,8 @@ export interface RiskSettings {
   autoOpenMaxQuantityPct: number
   maxRecoveryLossUsdt: string
   polymarketHedgeRetryCount: number
+  polymarketHedgeMode: PolymarketHedgeMode
+  manualExecutionConditions: ManualExecutionConditions
   autoOpenStabilityMs: number
 }
 
@@ -304,7 +316,13 @@ export interface CloseOrderRequest {
   target: CloseTarget
 }
 
-export interface UpdateSettingsRequest extends Partial<RiskSettings> {}
+export interface RetryPolymarketHedgeRequest {
+  mode?: RecoveryHedgeMode
+}
+
+export interface UpdateSettingsRequest extends Omit<Partial<RiskSettings>, 'manualExecutionConditions'> {
+  manualExecutionConditions?: Partial<ManualExecutionConditions>
+}
 
 export interface MexcBrowserStatus {
   mode: MexcBrowserMode
@@ -428,7 +446,7 @@ export interface ArbAppApi {
   execute(request: ExecuteRequest): Promise<ExecutionSession>
   calculateExecutionPlan(request: CalculateExecutionPlanRequest): Promise<ExecutionPlan>
   confirmMexcFill(fill: ConfirmMexcFillRequest): Promise<ExecutionSession>
-  retryPolymarketHedge(): Promise<ExecutionSession>
+  retryPolymarketHedge(request?: RetryPolymarketHedgeRequest): Promise<ExecutionSession>
   cancelExecution(): Promise<ExecutionSession | undefined>
   closeOrder(request: CloseOrderRequest): Promise<ArbitrageOrderRecord>
   updateSettings(request: UpdateSettingsRequest): Promise<RiskSettings>

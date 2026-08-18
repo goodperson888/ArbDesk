@@ -10,7 +10,6 @@ const base = {
   polymarketFeeExponent: '1',
   polymarketMinOrderSize: '1',
   riskBufferPerShare: '0.008',
-  minNetEdgePerShare: '0',
   minConditionalReturnPct: '0',
   maxCapital: '100',
   maxHedgeSlippage: '0.03'
@@ -58,7 +57,6 @@ describe('depth execution plan', () => {
       mexcBalance: '48',
       polymarketBalance: '126',
       requireBalances: true,
-      minNetEdgePerShare: '0.01',
       maxHedgeSlippage: '0.06',
       balanceUsageRatio: '0.99'
     })
@@ -68,6 +66,6 @@ describe('depth execution plan', () => {
     expect(plan.maxExecutableQuantity).toBe('0.00')
     expect(plan.accountBalanceReservePct).toBe('1.00')
     expect(plan.affordableLimitingFactors).toEqual(['MEXC可用余额'])
-    expect(plan.limitingFactors).toEqual(expect.arrayContaining(['最低净边际', '最低条件收益率']))
+    expect(plan.limitingFactors).toEqual(['最低条件收益率'])
   })
 })

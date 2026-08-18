@@ -165,7 +165,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('app:execute', (_event, request) => requireActiveLicense(() => controller.execute(request)))
   ipcMain.handle('app:calculate-execution-plan', (_event, request) => requireActiveLicense(() => controller.calculateExecutionPlan(request)))
   ipcMain.handle('app:confirm-mexc-fill', (_event, fill) => requireActiveOrEmergency(() => controller.confirmMexcFill(fill)))
-  ipcMain.handle('app:retry-polymarket-hedge', () => requireActiveOrEmergency(() => controller.retryPolymarketHedge()))
+  ipcMain.handle('app:retry-polymarket-hedge', (_event, request) => requireActiveOrEmergency(() => controller.retryPolymarketHedge(request)))
   ipcMain.handle('app:cancel-execution', () => requireActiveOrEmergency(() => controller.cancelExecution()))
   ipcMain.handle('app:close-order', (_event, request) => requireActiveOrEmergency(() => controller.closeOrder(request)))
   ipcMain.handle('app:update-settings', (_event, request) => requireActiveLicense(() => controller.updateSettings(request)))

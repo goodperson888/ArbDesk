@@ -12,7 +12,6 @@ interface ExecutionPlanInput {
   polymarketFeeExponent: string
   polymarketMinOrderSize: string
   riskBufferPerShare: string
-  minNetEdgePerShare: string
   minConditionalReturnPct: string
   maxCapital: string
   maxHedgeSlippage: string
@@ -112,7 +111,6 @@ export function calculateDepthExecutionPlan(input: ExecutionPlanInput): Executio
   const polymarketFeeExponent = new Decimal(input.polymarketFeeExponent || 1)
   const riskBuffer = new Decimal(input.riskBufferPerShare || 0)
   const maxCapital = new Decimal(input.maxCapital || 0)
-  const minNetEdge = new Decimal(input.minNetEdgePerShare || 0)
   const minReturn = new Decimal(input.minConditionalReturnPct || 0)
   const mexcBalance = input.mexcBalance === undefined ? undefined : new Decimal(input.mexcBalance || 0)
   const polymarketBalance = input.polymarketBalance === undefined ? undefined : new Decimal(input.polymarketBalance || 0)
@@ -136,7 +134,6 @@ export function calculateDepthExecutionPlan(input: ExecutionPlanInput): Executio
     if (input.requireBalances && usablePolymarketBalance === undefined) affordabilityFailures.push('Polymarket余额待刷新')
     if (usableMexcBalance !== undefined && mexc.cost.add(mexcFee).gt(usableMexcBalance)) affordabilityFailures.push('MEXC可用余额')
     if (usablePolymarketBalance !== undefined && polymarket.cost.add(polymarket.polymarketFee).gt(usablePolymarketBalance)) affordabilityFailures.push('Polymarket可用余额')
-    if (netEdge.lt(minNetEdge)) thresholdFailures.push('最低净边际')
     if (conditionalReturn.lt(minReturn)) thresholdFailures.push('最低条件收益率')
     return {
       quantity, mexc, polymarket, mexcFee, capital, profit, netEdge, conditionalReturn,

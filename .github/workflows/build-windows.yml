@@ -21,6 +21,7 @@ jobs:
           cache: npm
 
       - name: Cache Electron downloads
+        id: electron-cache
         uses: actions/cache@v6
         with:
           path: |
@@ -31,21 +32,108 @@ jobs:
             ${{ runner.os }}-electron-
 
       - name: Install dependencies
-        run: npm ci
+        shell: pwsh
+        run: |
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          npm ci --no-audit --no-fund
+          $exitCode = $LASTEXITCODE
+          $timer.Stop()
+          Add-Content -Path $env:GITHUB_ENV -Value "INSTALL_SECONDS=$([math]::Round($timer.Elapsed.TotalSeconds, 2))"
+          Add-Content -Path $env:GITHUB_ENV -Value "INSTALL_RESULT=$(if ($exitCode -eq 0) { 'success' } else { 'failure' })"
+          exit $exitCode
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          npm test
+          $exitCode = $LASTEXITCODE
+          $timer.Stop()
+          Add-Content -Path $env:GITHUB_ENV -Value "TEST_SECONDS=$([math]::Round($timer.Elapsed.TotalSeconds, 2))"
+          Add-Content -Path $env:GITHUB_ENV -Value "TEST_RESULT=$(if ($exitCode -eq 0) { 'success' } else { 'failure' })"
+          exit $exitCode
+
+      - name: Build application
+        shell: pwsh
+        run: |
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          npm run build
+          $exitCode = $LASTEXITCODE
+          $timer.Stop()
+          Add-Content -Path $env:GITHUB_ENV -Value "BUILD_SECONDS=$([math]::Round($timer.Elapsed.TotalSeconds, 2))"
+          Add-Content -Path $env:GITHUB_ENV -Value "BUILD_RESULT=$(if ($exitCode -eq 0) { 'success' } else { 'failure' })"
+          exit $exitCode
 
       - name: Build NSIS installer
         shell: pwsh
         run: |
-          npm run package:win 2>&1 | Tee-Object -FilePath package-win.log
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          npx --no-install electron-builder --win --publish never 2>&1 | Tee-Object -FilePath package-win.log
           $buildExit = $LASTEXITCODE
+          $timer.Stop()
+          Add-Content -Path $env:GITHUB_ENV -Value "PACKAGE_SECONDS=$([math]::Round($timer.Elapsed.TotalSeconds, 2))"
+          Add-Content -Path $env:GITHUB_ENV -Value "PACKAGE_RESULT=$(if ($buildExit -eq 0) { 'success' } else { 'failure' })"
           if ($buildExit -ne 0) {
             $tail = (Get-Content package-win.log -Tail 80) -join '%0A'
             Write-Output "::error title=Windows packaging failed::$tail"
             exit $buildExit
           }
 
+      - name: Write build summary
+        if: always()
+        shell: pwsh
+        run: |
+          function Show-Duration([string]$seconds) {
+            if ([string]::IsNullOrWhiteSpace($seconds)) { return '—' }
+            return ('{0:N2} 秒' -f [double]$seconds)
+          }
+          function Show-Result([string]$result) {
+            if ([string]::IsNullOrWhiteSpace($result)) { return 'skipped' }
+            return $result
+          }
+
+          $installSeconds = $env:INSTALL_SECONDS
+          $testSeconds = $env:TEST_SECONDS
+          $buildSeconds = $env:BUILD_SECONDS
+          $packageSeconds = $env:PACKAGE_SECONDS
+          $totalSeconds = 0.0
+          @($installSeconds, $testSeconds, $buildSeconds, $packageSeconds) | ForEach-Object {
+            if (-not [string]::IsNullOrWhiteSpace($_)) { $totalSeconds += [double]$_ }
+          }
+
+          $exeFiles = @(Get-ChildItem -Path release -Filter *.exe -File -ErrorAction SilentlyContinue)
+          $exeSummary = if ($exeFiles.Count -eq 0) {
+            '未生成'
+          } else {
+            ($exeFiles | ForEach-Object {
+              '{0} — {1:N2} MB ({2:N0} bytes)' -f $_.Name, ($_.Length / 1MB), $_.Length
+            }) -join '<br>'
+          }
+          $cacheHit = '${{ steps.electron-cache.outputs.cache-hit }}'
+          if ([string]::IsNullOrWhiteSpace($cacheHit)) { $cacheHit = 'false' }
+
+          @"
+          ## Windows 构建摘要
+
+          | 阶段 | 结果 | 真实耗时 |
+          | --- | --- | ---: |
+          | 安装依赖 | $(Show-Result $env:INSTALL_RESULT) | $(Show-Duration $installSeconds) |
+          | 自动测试 | $(Show-Result $env:TEST_RESULT) | $(Show-Duration $testSeconds) |
+          | 应用构建 | $(Show-Result $env:BUILD_RESULT) | $(Show-Duration $buildSeconds) |
+          | NSIS 打包 | $(Show-Result $env:PACKAGE_RESULT) | $(Show-Duration $packageSeconds) |
+          | **上述阶段合计** | — | **$(Show-Duration ([string]$totalSeconds))** |
+
+          **最终 EXE：** $exeSummary
+
+          **运行环境：** $env:RUNNER_OS / $env:ImageOS $env:ImageVersion / $env:RUNNER_NAME<br>
+          **Electron 下载缓存命中：** $cacheHit<br>
+          **提交：** ``$env:GITHUB_SHA``
+
+          > 阶段合计不包含 Checkout、Node.js 初始化、缓存恢复和产物上传耗时；这些仍可从 Actions 步骤时间直接查看。
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
       - name: Upload packaging log
-        if: failure()
+        if: failure() && env.PACKAGE_RESULT == 'failure'
         uses: actions/upload-artifact@v7
         with:
           name: ArbDesk-Windows-build-log

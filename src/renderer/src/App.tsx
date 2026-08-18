@@ -41,11 +41,13 @@ import type {
   ExecutionPlan,
   EmergencyAccessSnapshot,
   LicenseSummary,
+  ManualExecutionConditions,
   MexcBrowserMode,
   MexcBrowserStatus,
   MexcCalibrationKind,
   Opportunity,
   PolymarketCredentialSummary,
+  PolymarketHedgeMode,
   PolymarketIdentityValidation,
   PolymarketSignatureType,
   SettlementDistanceRule
@@ -127,14 +129,14 @@ function StatusDot({ status }: { status: string }): JSX.Element {
 
 function opportunityReady(opportunity: Opportunity, snapshot: AppSnapshot, now: number): boolean {
   const minimumQuantity = minimumQuantityForOpportunity(opportunity, snapshot.settings.maxHedgeSlippage)
-  return !opportunity.stale &&
-    !opportunity.feeVerificationBlocked &&
-    !opportunity.settlementRiskBlocked &&
-    Number(opportunity.netEdgePerShare) >= Number(snapshot.settings.minNetEdgePerShare) &&
-    Number(opportunity.conditionalReturnPct) >= Number(snapshot.settings.minConditionalReturnPct) &&
+  const conditions = snapshot.settings.manualExecutionConditions
+  return (!conditions.quoteFreshness || !opportunity.stale) &&
+    (!conditions.feeVerification || !opportunity.feeVerificationBlocked) &&
+    (!conditions.settlementRisk || !opportunity.settlementRiskBlocked) &&
+    (!conditions.conditionalReturn || Number(opportunity.conditionalReturnPct) >= Number(snapshot.settings.minConditionalReturnPct)) &&
     Number(opportunity.maxQuantity) >= minimumQuantity &&
     Number(opportunity.allInCostPerShare) * minimumQuantity <= Number(snapshot.settings.maxCapitalPerTrade) &&
-    (opportunity.endTime - now) / 1_000 > snapshot.settings.stopBeforeExpirySeconds
+    (!conditions.expiryCutoff || (opportunity.endTime - now) / 1_000 > snapshot.settings.stopBeforeExpirySeconds)
 }
 
 function minimumQuantityForOpportunity(opportunity: Opportunity, maxHedgeSlippage: string): number {
@@ -180,23 +182,48 @@ function executionTimingSummary(session: ExecutionSession): string | undefined {
 }
 
 interface ExecutionCheck {
+  id: string
   passed: boolean
   label: string
+  condition?: keyof ManualExecutionConditions
+  enabled?: boolean
+  locked?: boolean
 }
 
-function ExecutionConditionsHelp({ checks }: { checks: ExecutionCheck[] }): JSX.Element {
-  const passed = checks.filter((check) => check.passed).length
+function ExecutionConditionsHelp({
+  checks,
+  busy,
+  onToggle
+}: {
+  checks: ExecutionCheck[]
+  busy: boolean
+  onToggle: (condition: keyof ManualExecutionConditions) => void
+}): JSX.Element {
+  const activeChecks = checks.filter((check) => check.locked || check.enabled !== false)
+  const passed = activeChecks.filter((check) => check.passed).length
+  const ignored = checks.length - activeChecks.length
   return <details className="execution-conditions-help">
-    <summary aria-label="查看下单条件" title="查看下单条件"><CircleHelp aria-hidden="true" /></summary>
+    <summary aria-label="查看和选择手动下单条件" title="查看和选择手动下单条件"><CircleHelp aria-hidden="true" /></summary>
     <div className="execution-conditions-popover">
-      <strong>下单条件 · {passed}/{checks.length}</strong>
+      <strong>手动下单条件 · {passed}/{activeChecks.length}通过{ignored > 0 ? ` · ${ignored}项忽略` : ''}</strong>
       <ul>
-        {checks.map((check) => <li key={check.label} className={check.passed ? 'passed' : 'blocked'}>
-          {check.passed ? <Check aria-hidden="true" /> : <X aria-hidden="true" />}
+        {checks.map((check) => <li key={check.id} className={check.enabled === false && !check.locked ? 'ignored' : check.passed ? 'passed' : 'blocked'}>
+          {check.enabled === false && !check.locked ? <span className="condition-ignored-mark">—</span> : check.passed ? <Check aria-hidden="true" /> : <X aria-hidden="true" />}
           <span>{check.label}</span>
+          {check.locked
+            ? <span className="condition-lock" title="交易或账户硬条件，不能关闭"><LockKeyhole aria-hidden="true" />锁定</span>
+            : check.condition && <button
+              type="button"
+              className={`condition-switch ${check.enabled === false ? '' : 'enabled'}`}
+              role="switch"
+              aria-checked={check.enabled !== false}
+              aria-label={`${check.enabled === false ? '启用' : '忽略'}${check.label}`}
+              disabled={busy}
+              onClick={() => onToggle(check.condition!)}
+            ><span /></button>}
         </li>)}
       </ul>
-      <small>点击开仓后会复核所选两边盘口；超过500毫秒未收到对应盘口时才补充请求，真实下单接口还会校验账户余额。</small>
+      <small>这里只影响手动下单；自动开单始终使用完整严格条件。账户、最小委托、盘口深度、市场身份和执行中订单属于锁定条件。</small>
     </div>
   </details>
 }
@@ -393,7 +420,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [closeIntent, setCloseIntent] = useState<{ order: ArbitrageOrderRecord; target: CloseTarget }>()
   const [dismissedExecutionNoticeKey, setDismissedExecutionNoticeKey] = useState<string>()
   const [maxCapitalDraft, setMaxCapitalDraft] = useState('100.00')
-  const [minNetEdgeDraft, setMinNetEdgeDraft] = useState('0.0100')
   const [minConditionalReturnDraft, setMinConditionalReturnDraft] = useState('0.00')
   const [quoteValidityDraft, setQuoteValidityDraft] = useState('8')
   const [soundEnabledDraft, setSoundEnabledDraft] = useState(true)
@@ -404,7 +430,8 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [autoMaxQuantityPctDraft, setAutoMaxQuantityPctDraft] = useState('80')
   const [autoStabilityDraft, setAutoStabilityDraft] = useState('100')
   const [maxRecoveryLossDraft, setMaxRecoveryLossDraft] = useState('2.00')
-  const [hedgeRetryCountDraft, setHedgeRetryCountDraft] = useState('2')
+  const [hedgeRetryCountDraft, setHedgeRetryCountDraft] = useState('8')
+  const [hedgeModeDraft, setHedgeModeDraft] = useState<PolymarketHedgeMode>('PROTECTED_MARKET')
   const previousCanExecuteRef = useRef(false)
   const soundCooldownRef = useRef(new Map<string, number>())
   const manualSelectionUntilRef = useRef(0)
@@ -433,7 +460,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     setHubstudioCode(snapshot?.settings.hubstudioContainerCode ?? '')
     setPolymarketProxyUrl(snapshot?.settings.polymarketProxyUrl ?? '')
     setMaxCapitalDraft(snapshot?.settings.maxCapitalPerTrade ?? '100.00')
-    setMinNetEdgeDraft(snapshot?.settings.minNetEdgePerShare ?? '0.0100')
     setMinConditionalReturnDraft(snapshot?.settings.minConditionalReturnPct ?? '0.00')
     setQuoteValidityDraft(String((snapshot?.settings.maxQuoteAgeMs ?? 8_000) / 1_000))
     setSoundEnabledDraft(snapshot?.settings.opportunitySoundEnabled ?? true)
@@ -443,7 +469,8 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     setAutoMaxQuantityPctDraft(String(snapshot?.settings.autoOpenMaxQuantityPct ?? 80))
     setAutoStabilityDraft(String(snapshot?.settings.autoOpenStabilityMs ?? 100))
     setMaxRecoveryLossDraft(snapshot?.settings.maxRecoveryLossUsdt ?? '2.00')
-    setHedgeRetryCountDraft(String(snapshot?.settings.polymarketHedgeRetryCount ?? 2))
+    setHedgeRetryCountDraft(String(snapshot?.settings.polymarketHedgeRetryCount ?? 8))
+    setHedgeModeDraft(snapshot?.settings.polymarketHedgeMode ?? 'PROTECTED_MARKET')
     setSettlementRuleDrafts((snapshot?.settings.settlementDistanceRules ?? defaultSettlementDistanceRules()).map((rule) => ({
       id: rule.id,
       remainingSeconds: String(rule.remainingSeconds),
@@ -504,8 +531,8 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     selected?.polymarketAvailableQuantity,
     snapshot?.settings.maxCapitalPerTrade,
     snapshot?.settings.maxHedgeSlippage,
-    snapshot?.settings.minConditionalReturnPct,
-    snapshot?.settings.minNetEdgePerShare
+    snapshot?.settings.manualExecutionConditions,
+    snapshot?.settings.minConditionalReturnPct
   ])
 
   const currentPlan = executionPlan && executionPlan.opportunityId === selected?.id && executionPlan.requestedQuantity === Number(quantity || 0).toFixed(2)
@@ -535,11 +562,12 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     requestedCapital <= dynamicTestCapitalLimit
   )
   const executionSessionIdle = !snapshot?.activeSession || ['HEDGED', 'CANCELLED'].includes(snapshot.activeSession.state)
-  const effectiveNetEdge = currentPlan?.netEdgePerShare ?? selected?.netEdgePerShare ?? '0'
   const effectiveConditionalReturn = currentPlan?.conditionalReturnPct ?? selected?.conditionalReturnPct ?? '0'
-  const netEdgePassed = Boolean(selected && snapshot && Number(effectiveNetEdge) >= Number(snapshot.settings.minNetEdgePerShare))
   const conditionalReturnPassed = Boolean(selected && snapshot && Number(effectiveConditionalReturn) >= Number(snapshot.settings.minConditionalReturnPct))
   const settlementRiskPassed = Boolean(selected && !selected.settlementRiskBlocked)
+  const manualConditions = snapshot?.settings.manualExecutionConditions
+  const manualConditionEnabled = (condition: keyof ManualExecutionConditions): boolean => manualConditions?.[condition] !== false
+  const manualRiskOverrideActive = Boolean(manualConditions && Object.values(manualConditions).some((enabled) => !enabled))
   const canExecute = Boolean(
     selected &&
       Number(quantity) > 0 &&
@@ -547,13 +575,12 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       (!currentPlan || currentPlan.executable) &&
       Number(quantity) <= Number(currentPlan?.maxExecutableQuantity ?? selected.maxQuantity) &&
       requestedCapital <= Number(snapshot?.settings.maxCapitalPerTrade ?? 0) &&
-      !selected.feeVerificationBlocked &&
+      (!manualConditionEnabled('feeVerification') || !selected.feeVerificationBlocked) &&
       (!snapshot?.settings.allowUnprofitableTestTrade || (minimumTestCapital <= 12 && requestedCapital <= dynamicTestCapitalLimit)) &&
-      (Number(effectiveNetEdge) >= Number(snapshot?.settings.minNetEdgePerShare ?? 0) || testOverrideReady) &&
-      (Number(effectiveConditionalReturn) >= Number(snapshot?.settings.minConditionalReturnPct ?? 0) || testOverrideReady) &&
-      (!selected.settlementRiskBlocked || testOverrideReady) &&
-      !selected.stale &&
-      (selected.endTime - now) / 1_000 > Number(snapshot?.settings.stopBeforeExpirySeconds ?? 0) &&
+      (!manualConditionEnabled('conditionalReturn') || Number(effectiveConditionalReturn) >= Number(snapshot?.settings.minConditionalReturnPct ?? 0) || testOverrideReady) &&
+      (!manualConditionEnabled('settlementRisk') || !selected.settlementRiskBlocked || testOverrideReady) &&
+      (!manualConditionEnabled('quoteFreshness') || !selected.stale) &&
+      (!manualConditionEnabled('expiryCutoff') || (selected.endTime - now) / 1_000 > Number(snapshot?.settings.stopBeforeExpirySeconds ?? 0)) &&
       executionSessionIdle &&
       !busy
   )
@@ -571,17 +598,15 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
         ? `输入${Number(quantity).toFixed(2)}份超过当前可执行上限${currentPlan?.maxExecutableQuantity ?? selected.maxQuantity}份`
         : requestedCapital > Number(snapshot?.settings.maxCapitalPerTrade ?? 0)
           ? '预计本金超过单笔上限'
-          : selected.stale
+          : selected.stale && manualConditionEnabled('quoteFreshness')
             ? '行情已过期，等待自动刷新'
-            : (selected.endTime - now) / 1_000 <= Number(snapshot?.settings.stopBeforeExpirySeconds ?? 0)
+            : (selected.endTime - now) / 1_000 <= Number(snapshot?.settings.stopBeforeExpirySeconds ?? 0) && manualConditionEnabled('expiryCutoff')
               ? `距离到期不足${snapshot?.settings.stopBeforeExpirySeconds ?? 0}秒，禁止新开仓`
-            : selected.feeVerificationBlocked
+            : selected.feeVerificationBlocked && manualConditionEnabled('feeVerification')
               ? selected.feeVerificationReason ?? '手续费尚未校验'
-              : selected.settlementRiskBlocked && !testOverrideReady
+              : selected.settlementRiskBlocked && manualConditionEnabled('settlementRisk') && !testOverrideReady
               ? selected.settlementRiskReason ?? '结算信号风控拦截'
-              : Number(effectiveNetEdge) < Number(snapshot?.settings.minNetEdgePerShare ?? 0) && !snapshot?.settings.allowUnprofitableTestTrade
-                ? '净收益低于门槛；可在设置中放开一次小额亏损联调'
-              : Number(effectiveConditionalReturn) < Number(snapshot?.settings.minConditionalReturnPct ?? 0) && !snapshot?.settings.allowUnprofitableTestTrade
+              : Number(effectiveConditionalReturn) < Number(snapshot?.settings.minConditionalReturnPct ?? 0) && manualConditionEnabled('conditionalReturn') && !snapshot?.settings.allowUnprofitableTestTrade
                 ? '条件收益率低于设置门槛'
                 : snapshot?.settings.allowUnprofitableTestTrade && !snapshot.settings.polymarketLiveEnabled
                   ? '小额亏损联调需先验证身份并开启Polymarket真实对冲'
@@ -592,24 +617,25 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                     : undefined
 
   const executionChecks: ExecutionCheck[] = selected && snapshot ? [
-    { passed: Number(quantity) > 0, label: `输入份额 ${Number(quantity || 0).toFixed(2)} > 0` },
-    { passed: Number(quantity) >= minimumAlignedQuantity, label: `最小对齐 ${Number(quantity || 0).toFixed(2)} ≥ ${minimumAlignedQuantity.toFixed(2)}份` },
+    { id: 'quantity-positive', passed: Number(quantity) > 0, label: `输入份额 ${Number(quantity || 0).toFixed(2)} > 0`, locked: true },
+    { id: 'minimum-order', passed: Number(quantity) >= minimumAlignedQuantity, label: `最小对齐 ${Number(quantity || 0).toFixed(2)} ≥ ${minimumAlignedQuantity.toFixed(2)}份`, locked: true },
     ...(currentPlan ? [{
+      id: 'account-affordability',
       passed: Number(quantity) <= Number(currentPlan.maxAffordableQuantity),
-      label: `账户可支付 输入${Number(quantity || 0).toFixed(2)} ≤ ${currentPlan.maxAffordableQuantity}份（余额预留${currentPlan.accountBalanceReservePct}%）`
+      label: `账户可支付 输入${Number(quantity || 0).toFixed(2)} ≤ ${currentPlan.maxAffordableQuantity}份（余额预留${currentPlan.accountBalanceReservePct}%）`,
+      locked: true
     }] : []),
-    { passed: Number(quantity) <= Number(currentPlan?.maxExecutableQuantity ?? selected.maxQuantity), label: `收益可执行上限 输入${Number(quantity || 0).toFixed(2)} ≤ ${currentPlan?.maxExecutableQuantity ?? selected.maxQuantity}份${currentPlan ? `（MEXC ${currentPlan.mexcLevelsUsed}档 / Poly ${currentPlan.polymarketLevelsUsed}档）` : ''}` },
-    { passed: requestedCapital <= Number(snapshot.settings.maxCapitalPerTrade), label: `预计本金 $${requestedCapital.toFixed(2)} ≤ $${Number(snapshot.settings.maxCapitalPerTrade).toFixed(2)}` },
-    { passed: netEdgePassed || testOverrideReady, label: `滑点后净边际 ${money(effectiveNetEdge, 4)} ≥ ${money(snapshot.settings.minNetEdgePerShare, 4)}美元/份${!netEdgePassed && testOverrideReady ? '（小额联调豁免）' : ''}` },
-    { passed: conditionalReturnPassed || testOverrideReady, label: `滑点后条件收益率 ${money(effectiveConditionalReturn, 2)}% ≥ ${money(snapshot.settings.minConditionalReturnPct, 2)}%${!conditionalReturnPassed && testOverrideReady ? '（小额联调豁免）' : ''}` },
-    { passed: !selected.feeVerificationBlocked, label: selected.feeVerificationBlocked ? 'MEXC手续费尚未校验' : 'MEXC手续费已校验' },
-    { passed: settlementRiskPassed || testOverrideReady, label: !settlementRiskPassed && testOverrideReady ? '结算信号门槛（小额联调豁免）' : selected.settlementRiskBlocked ? (selected.settlementRiskReason ?? '结算风控未通过') : '结算方向与动态安全距离通过' },
-    { passed: !selected.stale, label: `行情 MEXC ${quoteAgeLabel(selected.mexcQuoteAgeMs)} / Poly ${quoteAgeLabel(selected.polymarketQuoteAgeMs)} ≤ ${(snapshot.settings.maxQuoteAgeMs / 1_000).toFixed(0)}秒` },
-    { passed: (selected.endTime - now) / 1_000 > snapshot.settings.stopBeforeExpirySeconds, label: `距离到期 ${secondsRemaining(selected.endTime, now)}，开仓截止前仍有效` },
+    { id: 'depth-limit', passed: Number(quantity) <= Number(currentPlan?.maxExecutableQuantity ?? selected.maxQuantity), label: `收益可执行上限 输入${Number(quantity || 0).toFixed(2)} ≤ ${currentPlan?.maxExecutableQuantity ?? selected.maxQuantity}份${currentPlan ? `（MEXC ${currentPlan.mexcLevelsUsed}档 / Poly ${currentPlan.polymarketLevelsUsed}档）` : ''}`, locked: true },
+    { id: 'capital-limit', passed: requestedCapital <= Number(snapshot.settings.maxCapitalPerTrade), label: `预计本金 $${requestedCapital.toFixed(2)} ≤ $${Number(snapshot.settings.maxCapitalPerTrade).toFixed(2)}`, locked: true },
+    { id: 'conditional-return', passed: conditionalReturnPassed || testOverrideReady, label: `滑点后条件收益率 ${money(effectiveConditionalReturn, 2)}% ≥ ${money(snapshot.settings.minConditionalReturnPct, 2)}%${!conditionalReturnPassed && testOverrideReady ? '（小额联调豁免）' : ''}`, condition: 'conditionalReturn', enabled: snapshot.settings.manualExecutionConditions.conditionalReturn },
+    { id: 'fee-verification', passed: !selected.feeVerificationBlocked, label: selected.feeVerificationBlocked ? 'MEXC手续费尚未校验' : 'MEXC手续费已校验', condition: 'feeVerification', enabled: snapshot.settings.manualExecutionConditions.feeVerification },
+    { id: 'settlement-risk', passed: settlementRiskPassed || testOverrideReady, label: !settlementRiskPassed && testOverrideReady ? '结算信号门槛（小额联调豁免）' : selected.settlementRiskBlocked ? (selected.settlementRiskReason ?? '结算风控未通过') : '结算方向与动态安全距离通过', condition: 'settlementRisk', enabled: snapshot.settings.manualExecutionConditions.settlementRisk },
+    { id: 'quote-freshness', passed: !selected.stale, label: `行情 MEXC ${quoteAgeLabel(selected.mexcQuoteAgeMs)} / Poly ${quoteAgeLabel(selected.polymarketQuoteAgeMs)} ≤ ${(snapshot.settings.maxQuoteAgeMs / 1_000).toFixed(0)}秒`, condition: 'quoteFreshness', enabled: snapshot.settings.manualExecutionConditions.quoteFreshness },
+    { id: 'expiry-cutoff', passed: (selected.endTime - now) / 1_000 > snapshot.settings.stopBeforeExpirySeconds, label: `距离到期 ${secondsRemaining(selected.endTime, now)}，开仓截止前仍有效`, condition: 'expiryCutoff', enabled: snapshot.settings.manualExecutionConditions.expiryCutoff },
     ...(snapshot.settings.allowUnprofitableTestTrade
-      ? [{ passed: testOverrideReady, label: `小额联调限制：人工监督、Poly真实对冲、本金≤${dynamicTestCapitalLimit.toFixed(2)} USDT且硬上限12 USDT` }]
+      ? [{ id: 'test-trade-limit', passed: testOverrideReady, label: `小额联调限制：人工监督、Poly真实对冲、本金≤${dynamicTestCapitalLimit.toFixed(2)} USDT且硬上限12 USDT`, locked: true }]
       : []),
-    { passed: executionSessionIdle && !busy, label: executionSessionIdle ? (busy ? '当前操作正在执行' : '当前无执行中操作') : `已有执行中套利组（${snapshot.activeSession?.state ?? '未知状态'}）` }
+    { id: 'execution-idle', passed: executionSessionIdle && !busy, label: executionSessionIdle ? (busy ? '当前操作正在执行' : '当前无执行中操作') : `已有执行中套利组（${snapshot.activeSession?.state ?? '未知状态'}）`, locked: true }
   ] : []
 
   useEffect(() => {
@@ -682,6 +708,22 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   async function execute(): Promise<void> {
     if (!selected) return
     await run(() => window.arbApp.execute({ opportunityId: selected.id, quantity }), '执行流程已更新')
+  }
+
+  async function toggleManualExecutionCondition(condition: keyof ManualExecutionConditions): Promise<void> {
+    if (!snapshot) return
+    const current = snapshot.settings.manualExecutionConditions[condition]
+    if (current) {
+      const confirmed = window.confirm('关闭后，该项只在手动下单时被忽略；自动开单仍会严格检查。账户余额、最小委托、盘口深度和执行中订单等硬条件不能关闭。确认忽略此条件？')
+      if (!confirmed) return
+    }
+    const result = await run(() => window.arbApp.updateSettings({
+      manualExecutionConditions: {
+        ...snapshot.settings.manualExecutionConditions,
+        [condition]: !current
+      }
+    }), current ? '已忽略一项手动下单条件' : '已恢复手动下单条件')
+    if (result) setSnapshot({ ...snapshot, settings: result })
   }
 
   async function confirmFill(): Promise<void> {
@@ -849,13 +891,14 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       setMessage('恢复对冲最大可接受亏损须为0至10,000 USDT')
       return
     }
-    if (!Number.isInteger(retryCount) || retryCount < 0 || retryCount > 5) {
-      setMessage('Polymarket自动补单次数须为0至5的整数')
+    if (!Number.isInteger(retryCount) || retryCount < 0 || retryCount > 20) {
+      setMessage('Polymarket自动补单次数须为0至20的整数')
       return
     }
     const result = await run(() => window.arbApp.updateSettings({
       maxRecoveryLossUsdt: maximumLoss.toFixed(2),
-      polymarketHedgeRetryCount: retryCount
+      polymarketHedgeRetryCount: retryCount,
+      polymarketHedgeMode: hedgeModeDraft
     }), '第二腿部分成交与恢复参数已保存')
     if (result && snapshot) setSnapshot({ ...snapshot, settings: result })
   }
@@ -883,7 +926,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     if (!snapshot) return
     const enabling = !snapshot.settings.allowUnprofitableTestTrade
     if (enabling) {
-      const confirmed = window.confirm('仅供跑通链路：放开一次净收益和结算信号门槛。通常限制5 USDT；若平台最小可成交份额需要更多本金，会按实时价格放宽，但绝不超过12 USDT。行情过期与临近结算仍会拦截。确认启用？')
+      const confirmed = window.confirm('仅供跑通链路：放开一次条件收益率和结算信号门槛。通常限制5 USDT；若平台最小可成交份额需要更多本金，会按实时价格放宽，但绝不超过12 USDT。行情过期与临近结算仍会拦截。确认启用？')
       if (!confirmed) return
     }
     const result = await run(() => window.arbApp.updateSettings({ allowUnprofitableTestTrade: enabling }))
@@ -990,11 +1033,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       setMessage('单笔最大本金须为大于0且不超过1,000,000 USDT的数值')
       return
     }
-    const edge = Number(minNetEdgeDraft)
-    if (!Number.isFinite(edge) || edge < 0 || edge >= 1) {
-      setMessage('最低净边际须为0至1之间的美元/份数值')
-      return
-    }
     const conditionalReturn = Number(minConditionalReturnDraft)
     if (!Number.isFinite(conditionalReturn) || conditionalReturn < 0 || conditionalReturn > 100) {
       setMessage('最低条件收益率须为0至100之间的百分比')
@@ -1012,7 +1050,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     }
     const result = await run(() => window.arbApp.updateSettings({
       maxCapitalPerTrade: maxCapital.toFixed(2),
-      minNetEdgePerShare: edge.toFixed(4),
       minConditionalReturnPct: conditionalReturn.toFixed(2),
       maxQuoteAgeMs: quoteValiditySeconds * 1_000,
       opportunitySoundEnabled: soundEnabledDraft,
@@ -1189,15 +1226,16 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
               </div>
 
               <div className="execute-action-row">
-                <button className="execute-button" onClick={() => void execute()} disabled={!canExecute} title="点击后先复核所选两边盘口；确认MEXC实际成交后才会提交Polymarket对冲">
+                <button className={`execute-button ${manualRiskOverrideActive ? 'risk-override' : ''}`} onClick={() => void execute()} disabled={!canExecute} title="点击后先复核所选两边盘口；确认MEXC实际成交后才会提交Polymarket对冲">
                   {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <ArrowRight aria-hidden="true" />}
+                  {manualRiskOverrideActive ? '风险执行 · ' : ''}
                   {snapshot.settings.mode === 'SIMULATION'
                     ? '模拟执行两腿'
                     : snapshot.settings.mexcAutomationEnabled
                       ? '执行MEXC第一腿'
                       : '准备MEXC第一腿'}
                 </button>
-                <ExecutionConditionsHelp checks={executionChecks} />
+                <ExecutionConditionsHelp checks={executionChecks} busy={busy} onToggle={(condition) => void toggleManualExecutionCondition(condition)} />
               </div>
               {snapshot.settings.autoOpenEnabled && <div className={`browser-status-detail auto-open-status ${snapshot.autoOpenState.status.toLowerCase()}`} role="status" aria-live="polite"><span>AUTO</span><p>{snapshot.autoOpenState.message}</p></div>}
               {currentPlan && <div className="capacity-summary" title={`账户余额计算已预留${currentPlan.accountBalanceReservePct}%安全垫`}>
@@ -1206,7 +1244,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
               </div>}
               {!canExecute && executeBlockReason && <p className="execution-note"><AlertTriangle aria-hidden="true" />禁用原因：{executeBlockReason}</p>}
 
-              {(selected.feeVerificationBlocked || selected.settlementRiskBlocked || selected.stale || Number(selected.netEdgePerShare) < Number(snapshot.settings.minNetEdgePerShare)) && selected.riskFlags.length > 0 && (
+              {(selected.feeVerificationBlocked || selected.settlementRiskBlocked || selected.stale || Number(selected.conditionalReturnPct) < Number(snapshot.settings.minConditionalReturnPct)) && selected.riskFlags.length > 0 && (
                 <div className="inline-warning"><AlertTriangle aria-hidden="true" /><span>{selected.riskFlags[0]}</span></div>
               )}
 
@@ -1250,11 +1288,20 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       {active && executionNoticeKey !== dismissedExecutionNoticeKey && <ExecutionBar
         session={active}
         busy={busy}
-        onRetry={() => void run(async () => {
-          const result = await window.arbApp.retryPolymarketHedge()
+        onRetryProtected={() => void run(async () => {
+          const result = await window.arbApp.retryPolymarketHedge({ mode: 'PROTECTED' })
           if (result.state !== 'HEDGED') throw new Error(result.error ?? '仍有未对冲份额，请继续恢复或平仓处理')
           return result
         }, 'Polymarket剩余敞口恢复完成')}
+        onRetryEmergency={() => {
+          const confirmed = window.confirm('市价恢复会在最大可接受亏损保护范围内跨多档快速成交，可能使用比正常对冲更差的价格。确认用于减少当前裸露敞口？')
+          if (!confirmed) return
+          void run(async () => {
+            const result = await window.arbApp.retryPolymarketHedge({ mode: 'EMERGENCY_MARKET' })
+            if (result.state !== 'HEDGED') throw new Error(result.error ?? '市价恢复后仍有未对冲份额，请继续恢复或平仓处理')
+            return result
+          }, 'Polymarket市价恢复完成')
+        }}
         onOpenHistory={() => setHistoryOpen(true)}
         onDismiss={() => setDismissedExecutionNoticeKey(executionNoticeKey)}
       />}
@@ -1326,9 +1373,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
               <div className="decision-field-grid">
                 <label className="settings-field" htmlFor="max-capital">单笔最大本金（USDT）
                   <input id="max-capital" value={maxCapitalDraft} onChange={(event) => setMaxCapitalDraft(event.target.value)} inputMode="decimal" />
-                </label>
-                <label className="settings-field" htmlFor="min-net-edge">最低净边际（美元/份）
-                  <input id="min-net-edge" value={minNetEdgeDraft} onChange={(event) => setMinNetEdgeDraft(event.target.value)} inputMode="decimal" />
                 </label>
                 <label className="settings-field" htmlFor="min-conditional-return">最低条件收益率（%）
                   <input id="min-conditional-return" value={minConditionalReturnDraft} onChange={(event) => setMinConditionalReturnDraft(event.target.value)} inputMode="decimal" />
@@ -1549,7 +1593,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
             </details>
             </>}
             {settingsView === 'LIVE' && <section className="settings-section danger-zone settings-subpage-section">
-              <div><ShieldAlert /><div><h3>一次性最小实盘联调</h3><p>绕过一次净收益与结算信号门槛；通常不超过5 USDT。若最小可成交份额需要更多本金，会按实时最小本金放宽，绝对上限12 USDT，使用后自动关闭。</p></div></div>
+              <div><ShieldAlert /><div><h3>一次性最小实盘联调</h3><p>绕过一次条件收益率与结算信号门槛；通常不超过5 USDT。若最小可成交份额需要更多本金，会按实时最小本金放宽，绝对上限12 USDT，使用后自动关闭。</p></div></div>
               <button className={`automation-toggle ${snapshot.settings.allowUnprofitableTestTrade ? 'enabled' : ''}`} onClick={() => void toggleUnprofitableTestTrade()}>
                 {snapshot.settings.allowUnprofitableTestTrade ? <Check /> : <LockKeyhole />}
                 {snapshot.settings.allowUnprofitableTestTrade ? '本次已放开 · 点击关闭' : '确认后放开一次'}
@@ -1559,18 +1603,22 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 {snapshot.settings.mexcAutomationEnabled ? <Check /> : <LockKeyhole />}
                 {snapshot.settings.mexcAutomationEnabled ? '已启用 · 点击关闭' : '确认后启用'}
               </button>
-              <div><ShieldAlert /><div><h3>Polymarket精确份额FAK</h3><p>最优价档数量足够时一笔买完；仅在该档不足时按剩余份额补单。每笔锁定当前价格与份额，避免更优价格导致买超。</p></div></div>
+              <div><ShieldAlert /><div><h3>Polymarket受保护成交</h3><p>热路径直接读取WebSocket实时盘口并使用FAK，允许部分成交；受保护市价会在收益/恢复保护价以内扫多档，不会无限价追单。</p></div></div>
               <button className={`automation-toggle ${snapshot.settings.polymarketLiveEnabled ? 'enabled' : ''}`} onClick={() => void togglePolymarketLive()}>
                 {snapshot.settings.polymarketLiveEnabled ? <Check /> : <LockKeyhole />}
                 {snapshot.settings.polymarketLiveEnabled ? '真实对冲已启用 · 点击关闭' : '验证后启用真实对冲'}
               </button>
+              <div className="segmented-control browser-mode-control" aria-label="Polymarket第二腿成交方式">
+                <button className={hedgeModeDraft === 'PROTECTED_LIMIT' ? 'active' : ''} onClick={() => setHedgeModeDraft('PROTECTED_LIMIT')}>受保护限价</button>
+                <button className={hedgeModeDraft === 'PROTECTED_MARKET' ? 'active' : ''} onClick={() => setHedgeModeDraft('PROTECTED_MARKET')}>受保护市价（推荐）</button>
+              </div>
               <div><ShieldAlert /><div><h3>第二腿恢复保护</h3><p>首轮按正常利润保护价FAK；剩余敞口可在整组最终亏损不超过设置值时自动补单。仍无法成交时可从执行条重试，或在订单历史平掉MEXC。</p></div></div>
               <div className="decision-field-grid">
                 <label className="settings-field" htmlFor="recovery-max-loss">恢复最多接受亏损（USDT）
                   <input id="recovery-max-loss" value={maxRecoveryLossDraft} onChange={(event) => setMaxRecoveryLossDraft(event.target.value)} inputMode="decimal" />
                 </label>
                 <label className="settings-field" htmlFor="hedge-retry-count">自动补单次数
-                  <input id="hedge-retry-count" type="number" min="0" max="5" step="1" value={hedgeRetryCountDraft} onChange={(event) => setHedgeRetryCountDraft(event.target.value)} inputMode="numeric" />
+                  <input id="hedge-retry-count" type="number" min="0" max="20" step="1" value={hedgeRetryCountDraft} onChange={(event) => setHedgeRetryCountDraft(event.target.value)} inputMode="numeric" />
                 </label>
               </div>
               <button className="wide-secondary" onClick={() => void saveRecoverySettings()} disabled={busy}><Check />保存恢复参数</button>
@@ -1753,13 +1801,15 @@ function CloseConfirmModal({
 function ExecutionBar({
   session,
   busy,
-  onRetry,
+  onRetryProtected,
+  onRetryEmergency,
   onOpenHistory,
   onDismiss
 }: {
   session: ExecutionSession
   busy: boolean
-  onRetry: () => void
+  onRetryProtected: () => void
+  onRetryEmergency: () => void
   onOpenHistory: () => void
   onDismiss: () => void
 }): JSX.Element {
@@ -1782,7 +1832,8 @@ function ExecutionBar({
     </div>
     <div className="execution-progress"><span /></div>
     {state === 'RECOVERY_REQUIRED' && <div className="execution-recovery-actions">
-      <button onClick={onRetry} disabled={busy || remainingQuantity <= 0}>{busy ? '处理中' : '重试对冲'}</button>
+      <button onClick={onRetryProtected} disabled={busy || remainingQuantity <= 0}>{busy ? '处理中' : '保护补单'}</button>
+      <button onClick={onRetryEmergency} disabled={busy || remainingQuantity <= 0}>市价恢复</button>
       <button onClick={onOpenHistory} disabled={busy}>平仓处理</button>
     </div>}
     <button className="execution-close" onClick={onDismiss} aria-label="关闭执行状态提示" title="关闭提示"><X /></button>

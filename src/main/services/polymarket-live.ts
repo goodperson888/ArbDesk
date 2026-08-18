@@ -13,6 +13,8 @@ import {
   type ApiKeyCreds,
   type BalanceAllowanceResponse,
   type OrderBookSummary,
+  type OrderResponse,
+  type Trade,
   type TickSize
 } from '@polymarket/clob-client-v2'
 import { createWalletClient, http, type WalletClient } from 'viem'
@@ -31,6 +33,25 @@ const CLOB_API = 'https://clob.polymarket.com'
 const POLYGON_RPC = 'https://polygon-rpc.com'
 const TOKEN_SCALE = new Decimal(1_000_000)
 const MIN_MARKETABLE_BUY_AMOUNT = new Decimal(1)
+const CLOB_REQUEST_TIMEOUT_MS = 3_000
+const MAX_PROTECTED_MARKET_BATCH = new Decimal(50)
+
+class RequestTimeoutError extends Error {}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new RequestTimeoutError(`${label}超过${timeoutMs}毫秒`)), timeoutMs)
+        timer.unref()
+      })
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
 
 export interface PolymarketTradingCapacity {
   checkedAt: number
@@ -62,6 +83,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
 
   configureProxy(proxyUrl: string): void {
     const normalized = proxyUrl.trim()
+    axios.defaults.timeout = CLOB_REQUEST_TIMEOUT_MS
     if (normalized === this.proxyUrl) return
     this.proxyUrl = normalized
     this.proxyAgent?.destroy()
@@ -252,28 +274,37 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       throw new Error('Polymarket 对冲最高价格必须在0和1之间')
     }
 
+    const startedAt = Date.now()
     const credentials = await this.credentialStore.getCredentials()
     const signer = this.createSigner(credentials.signerPrivateKey)
     const client = this.createAuthenticatedClient(credentials, signer)
     const cachedBook = this.orderBookCache.get(order.tokenId)
-    const bookPromise = cachedBook && Date.now() - cachedBook.checkedAt <= 30_000
+    const liveLevelsFresh = Boolean(
+      order.levels?.length && order.quoteReceivedAt && Date.now() - order.quoteReceivedAt <= 1_500
+    )
+    const cachedBookFresh = Boolean(cachedBook && Date.now() - cachedBook.checkedAt <= 1_500)
+    const bookStartedAt = Date.now()
+    const bookPromise = cachedBook && (liveLevelsFresh || cachedBookFresh)
       ? Promise.resolve(cachedBook.book)
-      : client.getOrderBook(order.tokenId).then((book) => {
+      : withTimeout(client.getOrderBook(order.tokenId), CLOB_REQUEST_TIMEOUT_MS, 'Polymarket盘口元数据读取').then((book) => {
         this.orderBookCache.set(order.tokenId!, { checkedAt: Date.now(), book })
         return book
       })
+    const balanceStartedAt = Date.now()
     const balancePromise = this.cachedBalanceAllowance && this.cachedTradingCapacity && Date.now() - this.cachedTradingCapacity.checkedAt <= 30_000
       ? Promise.resolve(this.cachedBalanceAllowance)
-      : client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }).then((balance) => {
+      : withTimeout(
+        client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }),
+        CLOB_REQUEST_TIMEOUT_MS,
+        'Polymarket余额读取'
+      ).then((balance) => {
         this.cachedBalanceAllowance = balance
         return balance
       })
     const [book, balance] = await Promise.all([bookPromise, balancePromise])
-    const minimumSize = new Decimal(book.min_order_size || 1)
-    if (quantity.lt(minimumSize)) {
-      throw new Error(`Polymarket当前最小下单量为${minimumSize.toString()}份，MEXC实际成交仅${quantity.toString()}份；未提交第二腿`)
-    }
-    const executableAsks = book.asks
+    const metadataAndBalanceCompletedAt = Date.now()
+    const minimumSize = new Decimal(order.minimumOrderSize ?? book.min_order_size ?? '1')
+    const executableAsks = (liveLevelsFresh ? order.levels! : book.asks)
       .map((level) => ({ price: new Decimal(level.price || 0), size: new Decimal(level.size || 0) }))
       .filter((level) => level.price.gt(0) && level.price.lte(maximumPrice) && level.size.gt(0))
       .sort((left, right) => left.price.comparedTo(right.price))
@@ -281,19 +312,42 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     if (!bestLevel) {
       throw new Error(`Polymarket当前没有价格不高于${maximumPrice.toString()}的可成交卖盘`)
     }
-    // A BUY signed at the recovery price can consume the full collateral budget at
-    // a better price and receive more shares than requested. Submit only against the
-    // current best level, at that level's price, then let the controller recompute the
-    // remaining target before another FAK attempt.
-    const submissionQuantity = Decimal.min(quantity, bestLevel.size).toDecimalPlaces(2, Decimal.ROUND_FLOOR)
-    if (submissionQuantity.lt(minimumSize)) {
-      throw new Error(`Polymarket最优档仅${submissionQuantity.toString()}份，低于当前最小下单量${minimumSize.toString()}份；等待盘口补充后重试`)
+    let submissionPrice = bestLevel.price
+    let submissionQuantity = Decimal.min(quantity, bestLevel.size)
+    let levelsUsed = 1
+    if (order.mode === 'PROTECTED_MARKET') {
+      const batchTarget = Decimal.min(quantity, MAX_PROTECTED_MARKET_BATCH)
+      let cumulative = new Decimal(0)
+      for (const [index, level] of executableAsks.entries()) {
+        cumulative = cumulative.add(level.size)
+        submissionPrice = level.price
+        levelsUsed = index + 1
+        if (cumulative.gte(batchTarget)) break
+      }
+      // BUY orders commit collateral at the signed limit price. Scale the signed
+      // share amount so a fill at today's best ask cannot exceed the remaining target.
+      const priceImprovementSafeQuantity = batchTarget.mul(bestLevel.price).div(submissionPrice)
+      submissionQuantity = Decimal.min(priceImprovementSafeQuantity, cumulative)
     }
-    const submissionPrice = bestLevel.price
+    submissionQuantity = submissionQuantity.toDecimalPlaces(2, Decimal.ROUND_FLOOR)
+    const minimumByNotional = MIN_MARKETABLE_BUY_AMOUNT.div(submissionPrice).toDecimalPlaces(2, Decimal.ROUND_CEIL)
+    const minimumSubmission = Decimal.max(minimumSize, minimumByNotional)
+    if (submissionQuantity.lt(minimumSubmission)) {
+      const partialFillCannotOverrunTarget = bestLevel.size.lte(quantity)
+      if (quantity.gte(minimumSubmission) || partialFillCannotOverrunTarget || order.allowTailOverhedge) {
+        submissionQuantity = minimumSubmission
+        submissionPrice = bestLevel.price
+        levelsUsed = 1
+      } else {
+        const minimumReason = minimumByNotional.gt(minimumSize)
+          ? `Polymarket BUY至少需要1抵押资产（按当前价格需提交${minimumByNotional.toString()}份）`
+          : `Polymarket最小下单量为${minimumSize.toString()}份`
+        throw new Error(
+          `${minimumReason}；剩余目标${quantity.toString()}份、当前最优档${bestLevel.size.toString()}份，自动买满会造成更大的反向敞口`
+        )
+      }
+    }
     const spendAmount = submissionPrice.mul(submissionQuantity)
-    if (spendAmount.lt(MIN_MARKETABLE_BUY_AMOUNT)) {
-      throw new Error(`Polymarket可立即成交的BUY至少需要1抵押资产；当前最优档${submissionQuantity.toString()}份按${submissionPrice.toString()}仅为${spendAmount.toFixed(2)}。第一腿成交量不足，未提交第二腿`)
-    }
     const estimatedFee = this.estimateFeeOnSpend(
       spendAmount,
       submissionPrice,
@@ -303,7 +357,8 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     )
     this.assertBuyingPower(balance, spendAmount.add(estimatedFee), book)
 
-    const signedOrder = await client.createOrder({
+    const signingStartedAt = Date.now()
+    const signedOrder = await withTimeout(client.createOrder({
       tokenID: order.tokenId,
       price: submissionPrice.toNumber(),
       size: submissionQuantity.toNumber(),
@@ -311,9 +366,45 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     }, {
       tickSize: book.tick_size as TickSize,
       negRisk: book.neg_risk
-    })
-    this.orderBookCache.delete(order.tokenId)
-    const response = await client.postOrder(signedOrder, OrderType.FAK)
+    }), CLOB_REQUEST_TIMEOUT_MS, 'Polymarket订单签名')
+    const signedAt = Date.now()
+    if (!liveLevelsFresh) this.orderBookCache.delete(order.tokenId)
+    let response: OrderResponse
+    let verificationMs = 0
+    try {
+      response = await withTimeout(
+        client.postOrder(signedOrder, OrderType.FAK, false, true),
+        CLOB_REQUEST_TIMEOUT_MS + 500,
+        'Polymarket FAK提交'
+      )
+    } catch (error) {
+      if (!this.isTimeoutLike(error)) throw error
+      const verificationStartedAt = Date.now()
+      const recovered = await this.findRecentTimedOutBuy(
+        client,
+        order.tokenId,
+        startedAt,
+        submissionPrice,
+        submissionQuantity,
+        order.direction
+      )
+      verificationMs = Date.now() - verificationStartedAt
+      if (recovered) {
+        return {
+          ...recovered,
+          executionDetails: {
+            quoteSource: liveLevelsFresh ? 'WEBSOCKET' : 'REST',
+            levelsUsed,
+            bookAndBalanceMs: metadataAndBalanceCompletedAt - Math.min(bookStartedAt, balanceStartedAt),
+            signingMs: signedAt - signingStartedAt,
+            submissionMs: Date.now() - signedAt,
+            timeoutVerificationMs: verificationMs,
+            timeoutRecovered: true
+          }
+        }
+      }
+      throw new Error(`POLY_SUBMISSION_UNCERTAIN: Polymarket提交超时，成交查询未发现明确回执；已停止自动重复下单，请核对平台成交记录`)
+    }
     if (!response.success) throw new Error(`Polymarket FAK失败：${response.errorMsg || response.status || '未知原因'}`)
 
     // The order response returns human-readable token/collateral amounts. Balance and
@@ -330,8 +421,87 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       averagePrice: spent.div(filledQuantity).toDecimalPlaces(6).toString(),
       orderId: response.orderID,
       filledAt: Date.now(),
-      verificationSource: 'PLATFORM_READBACK'
+      verificationSource: 'PLATFORM_READBACK',
+      executionDetails: {
+        quoteSource: liveLevelsFresh ? 'WEBSOCKET' : 'REST',
+        levelsUsed,
+        bookAndBalanceMs: metadataAndBalanceCompletedAt - Math.min(bookStartedAt, balanceStartedAt),
+        signingMs: signedAt - signingStartedAt,
+        submissionMs: Date.now() - signedAt,
+        timeoutVerificationMs: verificationMs,
+        timeoutRecovered: false
+      }
     }
+  }
+
+  private isTimeoutLike(error: unknown): boolean {
+    if (error instanceof RequestTimeoutError) return true
+    const message = error instanceof Error ? error.message : String(error)
+    return /timeout|timed out|ECONNABORTED|ETIMEDOUT|超过\d+毫秒/i.test(message)
+  }
+
+  private async findRecentTimedOutBuy(
+    client: ClobClient,
+    tokenId: string,
+    startedAt: number,
+    maximumPrice: Decimal,
+    expectedQuantity: Decimal,
+    direction: HedgeOrder['direction']
+  ): Promise<Fill | undefined> {
+    let lastError: unknown
+    for (const delay of [250, 1_000]) {
+      await new Promise((resolve) => setTimeout(resolve, delay))
+      try {
+        const trades = await withTimeout(
+          client.getTrades({ asset_id: tokenId, after: new Date(startedAt - 1_000).toISOString() }, true),
+          CLOB_REQUEST_TIMEOUT_MS,
+          'Polymarket超时成交核验'
+        )
+        const matching = trades.filter((trade) => this.matchesTimedOutBuy(trade, tokenId, startedAt, maximumPrice))
+        if (matching.length === 0) continue
+        const grouped = new Map<string, Trade[]>()
+        for (const trade of matching) {
+          const key = trade.taker_order_id || trade.id
+          grouped.set(key, [...(grouped.get(key) ?? []), trade])
+        }
+        const candidate = [...grouped.entries()]
+          .map(([orderId, orderTrades]) => {
+            const quantity = Decimal.sum(0, ...orderTrades.map((trade) => new Decimal(trade.size || 0)))
+            const spend = Decimal.sum(0, ...orderTrades.map((trade) => new Decimal(trade.size || 0).mul(trade.price || 0)))
+            const latest = Math.max(...orderTrades.map((trade) => Date.parse(trade.match_time) || startedAt))
+            return { orderId, quantity, spend, latest }
+          })
+          .filter((candidate) => candidate.quantity.gt(0) && candidate.quantity.lte(expectedQuantity.mul('1.05')))
+          .sort((left, right) => right.latest - left.latest)[0]
+        if (!candidate) continue
+        return {
+          venue: 'POLYMARKET',
+          direction,
+          quantity: candidate.quantity.toDecimalPlaces(6).toString(),
+          averagePrice: candidate.spend.div(candidate.quantity).toDecimalPlaces(6).toString(),
+          orderId: candidate.orderId,
+          filledAt: candidate.latest,
+          verificationSource: 'PLATFORM_READBACK'
+        }
+      } catch (error) {
+        lastError = error
+      }
+    }
+    if (lastError) throw new Error(`POLY_SUBMISSION_UNCERTAIN: Polymarket提交超时且成交核验失败：${lastError instanceof Error ? lastError.message : String(lastError)}`)
+    return undefined
+  }
+
+  private matchesTimedOutBuy(
+    trade: Trade,
+    tokenId: string,
+    startedAt: number,
+    maximumPrice: Decimal
+  ): boolean {
+    const matchedAt = Date.parse(trade.match_time)
+    return trade.asset_id === tokenId &&
+      String(trade.side).toUpperCase() === 'BUY' &&
+      Number.isFinite(matchedAt) && matchedAt >= startedAt - 1_000 &&
+      new Decimal(trade.price || 0).lte(maximumPrice)
   }
 
   async closePosition(order: ClosePositionOrder): Promise<Fill> {
@@ -407,7 +577,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       signatureType: credentials.signatureType as SignatureTypeV2,
       funderAddress: credentials.funderAddress,
       useServerTime: true,
-      retryOnError: true,
+      retryOnError: false,
       throwOnError: true
     })
   }

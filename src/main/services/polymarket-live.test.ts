@@ -303,6 +303,116 @@ describe('PolymarketLiveBroker', () => {
     expect(Number(fill.quantity)).toBeLessThan(10)
   })
 
+  it('submits the venue minimum when the best level is smaller and accepts the actual partial fill', async () => {
+    const createOrder = vi.fn(async () => ({ version: 2 }))
+    const postOrder = vi.fn(async () => ({
+      success: true, errorMsg: '', orderID: 'small-best-level', status: 'matched',
+      takingAmount: '1.77', makingAmount: '0.9735'
+    }))
+    const client = {
+      getOrderBook: vi.fn(async () => ({
+        ...orderBook(),
+        asks: [{ price: '0.55', size: '1.77' }, { price: '0.56', size: '100' }]
+      })),
+      getBalanceAllowance: vi.fn(async () => ({
+        balance: '100000000',
+        allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
+      })),
+      createOrder,
+      postOrder
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    const fill = await broker.hedge({
+      tokenId: 'token', direction: 'DOWN', quantity: '48.29', maximumPrice: '0.57'
+    })
+
+    expect(createOrder).toHaveBeenCalledWith(expect.objectContaining({ size: 5, price: 0.55 }), expect.anything())
+    expect(postOrder).toHaveBeenCalledWith(expect.anything(), OrderType.FAK, false, true)
+    expect(fill).toMatchObject({ quantity: '1.77', averagePrice: '0.55' })
+  })
+
+  it('uses fresh WebSocket levels and sweeps only to the protected market price', async () => {
+    const createOrder = vi.fn(async () => ({ version: 2 }))
+    const getOrderBook = vi.fn(async () => orderBook())
+    const client = {
+      getOrderBook,
+      getBalanceAllowance: vi.fn(async () => ({
+        balance: '100000000',
+        allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
+      })),
+      createOrder,
+      postOrder: vi.fn(async () => ({
+        success: true, errorMsg: '', orderID: 'protected-market', status: 'matched',
+        takingAmount: '9.64', makingAmount: '5.4948'
+      }))
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    const fill = await broker.hedge({
+      tokenId: 'token', direction: 'DOWN', quantity: '10', maximumPrice: '0.57',
+      mode: 'PROTECTED_MARKET', quoteReceivedAt: Date.now(),
+      levels: [{ price: '0.55', size: '4' }, { price: '0.56', size: '4' }, { price: '0.57', size: '100' }]
+    })
+
+    expect(createOrder).toHaveBeenCalledWith(expect.objectContaining({ size: 9.64, price: 0.57 }), expect.anything())
+    expect(fill.executionDetails).toMatchObject({ quoteSource: 'WEBSOCKET', levelsUsed: 3 })
+  })
+
+  it('ignores stale supplied levels and refreshes the REST order book', async () => {
+    const createOrder = vi.fn(async () => ({ version: 2 }))
+    const getOrderBook = vi.fn(async () => orderBook())
+    const client = {
+      getOrderBook,
+      getBalanceAllowance: vi.fn(async () => ({
+        balance: '100000000',
+        allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
+      })),
+      createOrder,
+      postOrder: vi.fn(async () => ({
+        success: true, errorMsg: '', orderID: 'rest-fallback', status: 'matched',
+        takingAmount: '5', makingAmount: '2.75'
+      }))
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    const fill = await broker.hedge({
+      tokenId: 'token', direction: 'DOWN', quantity: '5', maximumPrice: '0.57',
+      quoteReceivedAt: Date.now() - 5_000, levels: [{ price: '0.40', size: '100' }]
+    })
+
+    expect(getOrderBook).toHaveBeenCalledOnce()
+    expect(createOrder).toHaveBeenCalledWith(expect.objectContaining({ price: 0.55 }), expect.anything())
+    expect(fill.executionDetails).toMatchObject({ quoteSource: 'REST' })
+  })
+
+  it('recovers a timed-out submission from recent authenticated trades instead of reposting', async () => {
+    const matchedAt = new Date().toISOString()
+    const postOrder = vi.fn(async () => { throw new Error('request timeout') })
+    const getTrades = vi.fn(async () => [{
+      id: 'trade-1', taker_order_id: 'timed-out-order', asset_id: 'token', side: 'BUY',
+      size: '5', price: '0.55', match_time: matchedAt
+    }])
+    const client = {
+      getOrderBook: vi.fn(async () => orderBook()),
+      getBalanceAllowance: vi.fn(async () => ({
+        balance: '100000000',
+        allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
+      })),
+      createOrder: vi.fn(async () => ({ version: 2 })),
+      postOrder,
+      getTrades
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    const fill = await broker.hedge({ tokenId: 'token', direction: 'DOWN', quantity: '5', maximumPrice: '0.57' })
+
+    expect(postOrder).toHaveBeenCalledOnce()
+    expect(getTrades).toHaveBeenCalledOnce()
+    expect(fill).toMatchObject({ orderId: 'timed-out-order', quantity: '5', averagePrice: '0.55' })
+    expect(fill.executionDetails).toMatchObject({ timeoutRecovered: true })
+  })
+
   it('limits each FAK attempt to the shares available at the current best price level', async () => {
     const createOrder = vi.fn(async () => ({ version: 2 }))
     const client = {

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AppController } from './app-controller'
-import type { ArbitrageOrderRecord, Fill, MexcAccountState } from '../shared/types'
+import type { ArbitrageOrderRecord, Fill, MexcAccountState, Opportunity } from '../shared/types'
 import { EventStore } from './services/event-store'
 import type { MexcBrowserManager } from './services/mexc-browser'
 import type { PolymarketBroker } from './services/polymarket'
@@ -513,6 +513,75 @@ describe('AppController simulation', () => {
     expect(order.polymarket.entryFills).toHaveLength(1)
   })
 
+  it('allows a disabled manual profit condition while automatic opening remains strict', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const controller = await createAssistedExecutionController(async (order) => ({
+      venue: 'POLYMARKET', direction: order.direction, quantity: order.quantity,
+      averagePrice: '0.50', orderId: 'manual-condition-order', filledAt: Date.now()
+    }))
+    await controller.updateSettings({
+      minConditionalReturnPct: '100',
+      manualExecutionConditions: { conditionalReturn: false }
+    })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    const manualPlan = await controller.calculateExecutionPlan({ opportunityId: opportunity.id, quantity: '10' })
+    const autoReady = (controller as unknown as { autoOpportunityReady(opportunity: Opportunity): boolean })
+      .autoOpportunityReady(opportunity)
+
+    expect(manualPlan.executable).toBe(true)
+    expect(autoReady).toBe(false)
+  })
+
+  it('uses protected limit for normal recovery and protected market for emergency recovery', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    let allowFill = false
+    const hedge = vi.fn(async (order) => {
+      if (!allowFill) throw new Error('temporary no liquidity')
+      return {
+        venue: 'POLYMARKET' as const, direction: order.direction, quantity: order.quantity,
+        averagePrice: '0.52', orderId: 'recovery-mode-order', filledAt: Date.now()
+      }
+    })
+    const controller = await createAssistedExecutionController(hedge)
+    await controller.updateSettings({ polymarketHedgeRetryCount: 0, polymarketHedgeMode: 'PROTECTED_MARKET' })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+    await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-recovery-mode', manualAcknowledged: true })
+    allowFill = true
+
+    await controller.retryPolymarketHedge({ mode: 'PROTECTED' })
+    expect(hedge.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({ mode: 'PROTECTED_LIMIT' }))
+
+    const secondController = await createAssistedExecutionController(hedge)
+    await secondController.updateSettings({ polymarketHedgeRetryCount: 0, polymarketHedgeMode: 'PROTECTED_LIMIT' })
+    const secondOpportunity = secondController.getSnapshot().opportunities[0]
+    allowFill = false
+    await secondController.execute({ opportunityId: secondOpportunity.id, quantity: '10' })
+    await secondController.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-emergency-mode', manualAcknowledged: true })
+    allowFill = true
+    await secondController.retryPolymarketHedge({ mode: 'EMERGENCY_MARKET' })
+    expect(hedge.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({ mode: 'PROTECTED_MARKET' }))
+  })
+
+  it('does not automatically repost after an uncertain Polymarket submission', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const hedge = vi.fn(async () => {
+      throw new Error('POLY_SUBMISSION_UNCERTAIN: timeout readback is ambiguous')
+    })
+    const controller = await createAssistedExecutionController(hedge)
+    await controller.updateSettings({ polymarketHedgeRetryCount: 20 })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+
+    const session = await controller.confirmMexcFill({
+      quantity: '10', averagePrice: '0.40', orderId: 'mexc-uncertain', manualAcknowledged: true
+    })
+
+    expect(hedge).toHaveBeenCalledOnce()
+    expect(session.state).toBe('RECOVERY_REQUIRED')
+    expect(session.error).toContain('POLY_SUBMISSION_UNCERTAIN')
+  })
+
   it('does not expose or block on a recovery session after its market has expired', async () => {
     vi.useFakeTimers()
     vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
@@ -608,7 +677,7 @@ describe('AppController simulation', () => {
     controller.setLicenseActive(true)
     await controller.updateSettings({
       mode: 'ASSISTED', mexcAutomationEnabled: true, polymarketLiveEnabled: true,
-      minNetEdgePerShare: '0', minConditionalReturnPct: '0', autoOpenEnabled: true,
+      minConditionalReturnPct: '0', autoOpenEnabled: true,
       autoOpenQuantityMode: 'FIXED', autoOpenFixedQuantity: '5', autoOpenStabilityMs: 500
     })
     await vi.waitFor(() => expect(ensurePolyCapacity).toHaveBeenCalledTimes(1))

@@ -17,10 +17,11 @@ import type {
   Fill,
   MexcAccountState,
   Opportunity,
+  RetryPolymarketHedgeRequest,
   RiskSettings,
   UpdateSettingsRequest
 } from '../shared/types'
-import { defaultSettlementDistanceRules } from '../shared/defaults'
+import { defaultManualExecutionConditions, defaultSettlementDistanceRules } from '../shared/defaults'
 import { assertTransition } from './domain/execution-machine'
 import { calculateOpportunity, polymarketCryptoFeePerShare } from './domain/opportunity'
 import { calculateDepthExecutionPlan } from './domain/execution-plan'
@@ -35,7 +36,6 @@ import type { MexcWindowQuote } from './services/mexc-browser'
 const DEFAULT_SETTINGS: RiskSettings = {
   mode: 'SIMULATION',
   maxCapitalPerTrade: '100',
-  minNetEdgePerShare: '0.0100',
   minConditionalReturnPct: '0.00',
   maxQuoteAgeMs: 8_000,
   maxHedgeSlippage: '0.0300',
@@ -56,7 +56,9 @@ const DEFAULT_SETTINGS: RiskSettings = {
   autoOpenFixedQuantity: '5.00',
   autoOpenMaxQuantityPct: 80,
   maxRecoveryLossUsdt: '2.00',
-  polymarketHedgeRetryCount: 2,
+  polymarketHedgeRetryCount: 8,
+  polymarketHedgeMode: 'PROTECTED_MARKET',
+  manualExecutionConditions: defaultManualExecutionConditions(),
   autoOpenStabilityMs: 100
 }
 
@@ -124,6 +126,7 @@ export class AppController {
   async initialize(): Promise<void> {
     await this.store.initialize()
     this.settings = await this.store.loadSettings(DEFAULT_SETTINGS)
+    this.settings.manualExecutionConditions = defaultManualExecutionConditions(this.settings.manualExecutionConditions)
     this.settings.autoOpenEnabled = false
     try {
       this.settings = {
@@ -289,14 +292,21 @@ export class AppController {
 
   async updateSettings(request: UpdateSettingsRequest): Promise<RiskSettings> {
     const previousAutoOpenEnabled = this.settings.autoOpenEnabled
-    const next = { ...this.settings, ...request }
+    const next = {
+      ...this.settings,
+      ...request,
+      manualExecutionConditions: defaultManualExecutionConditions({
+        ...this.settings.manualExecutionConditions,
+        ...request.manualExecutionConditions
+      })
+    }
     const autoSensitiveSettings: Array<keyof RiskSettings> = [
-      'mode', 'maxCapitalPerTrade', 'minNetEdgePerShare', 'minConditionalReturnPct', 'maxQuoteAgeMs',
+      'mode', 'maxCapitalPerTrade', 'minConditionalReturnPct', 'maxQuoteAgeMs',
       'maxHedgeSlippage', 'stopBeforeExpirySeconds', 'settlementDistanceRules', 'mexcBrowserMode',
       'mexcElementMode', 'hubstudioContainerCode', 'polymarketProxyUrl', 'mexcAutomationEnabled',
       'polymarketLiveEnabled', 'allowUnprofitableTestTrade', 'autoOpenQuantityMode',
       'autoOpenFixedQuantity', 'autoOpenMaxQuantityPct', 'maxRecoveryLossUsdt',
-      'polymarketHedgeRetryCount', 'autoOpenStabilityMs'
+      'polymarketHedgeRetryCount', 'polymarketHedgeMode', 'autoOpenStabilityMs'
     ]
     if (
       this.settings.autoOpenEnabled && request.autoOpenEnabled === undefined &&
@@ -308,11 +318,6 @@ export class AppController {
       throw new Error('单笔最大本金须为大于0且不超过1,000,000 USDT的数值')
     }
     next.maxCapitalPerTrade = maximumCapital.toDecimalPlaces(2).toFixed(2)
-    const minimumEdge = new Decimal(next.minNetEdgePerShare)
-    if (!minimumEdge.isFinite() || minimumEdge.lt(0) || minimumEdge.gte(1)) {
-      throw new Error('最低净边际须为0至1之间的美元/份数值')
-    }
-    next.minNetEdgePerShare = minimumEdge.toDecimalPlaces(4).toFixed(4)
     const minimumReturn = new Decimal(next.minConditionalReturnPct)
     if (!minimumReturn.isFinite() || minimumReturn.lt(0) || minimumReturn.gt(100)) {
       throw new Error('最低条件收益率须为0至100之间的百分比')
@@ -340,8 +345,14 @@ export class AppController {
       throw new Error('恢复对冲最大可接受亏损须为0至10,000 USDT')
     }
     next.maxRecoveryLossUsdt = maximumRecoveryLoss.toDecimalPlaces(2).toFixed(2)
-    if (!Number.isInteger(next.polymarketHedgeRetryCount) || next.polymarketHedgeRetryCount < 0 || next.polymarketHedgeRetryCount > 5) {
-      throw new Error('Polymarket自动补单次数须为0至5的整数')
+    if (!Number.isInteger(next.polymarketHedgeRetryCount) || next.polymarketHedgeRetryCount < 0 || next.polymarketHedgeRetryCount > 20) {
+      throw new Error('Polymarket自动补单次数须为0至20的整数')
+    }
+    if (!['PROTECTED_LIMIT', 'PROTECTED_MARKET'].includes(next.polymarketHedgeMode)) {
+      throw new Error('Polymarket第二腿成交模式无效')
+    }
+    if (Object.values(next.manualExecutionConditions).some((enabled) => typeof enabled !== 'boolean')) {
+      throw new Error('手动下单条件开关无效')
     }
     if (!Number.isInteger(next.autoOpenStabilityMs) || next.autoOpenStabilityMs < 0 || next.autoOpenStabilityMs > 1_000) {
       throw new Error('自动开单稳定时间须为0至1000毫秒的整数')
@@ -425,10 +436,12 @@ export class AppController {
       opportunity = this.opportunities.find((candidate) => candidate.id === request.opportunityId)
     } else {
       if (!opportunity.polymarketTokenId) throw new Error('Polymarket所选盘口缺少token，无法复核')
-      await Promise.all([
-        this.mexcBrowser.confirmMarketQuote?.(opportunity.mexcSymbolId),
-        this.polymarketData.confirmOutcomeQuote?.(opportunity.polymarketTokenId)
-      ])
+      if (this.executionConditionEnabled('quoteFreshness', triggerSource)) {
+        await Promise.all([
+          this.mexcBrowser.confirmMarketQuote?.(opportunity.mexcSymbolId),
+          this.polymarketData.confirmOutcomeQuote?.(opportunity.polymarketTokenId)
+        ])
+      }
       quotesConfirmedAt = Date.now()
       const mexcWindows = this.mexcBrowser.getLatestWindows?.() ?? this.latestMexcWindows
       const polymarketWindows = this.polymarketData.getLatestWindows?.() ?? this.latestPolymarketWindows
@@ -441,8 +454,8 @@ export class AppController {
       opportunity = this.opportunities.find((candidate) => candidate.id === request.opportunityId)
     }
     if (!opportunity) throw new Error('机会已失效，请刷新后重试')
-    const executionPlan = await this.calculateExecutionPlanInternal(opportunity, request.quantity, false)
-    this.validateExecution(opportunity, request.quantity, executionPlan)
+    const executionPlan = await this.calculateExecutionPlanInternal(opportunity, request.quantity, false, triggerSource)
+    this.validateExecution(opportunity, request.quantity, executionPlan, triggerSource)
     this.activeExecutionPlan = executionPlan
 
     this.activeSession = {
@@ -632,7 +645,7 @@ export class AppController {
     return this.activeSession
   }
 
-  async retryPolymarketHedge(): Promise<ExecutionSession> {
+  async retryPolymarketHedge(request: RetryPolymarketHedgeRequest = {}): Promise<ExecutionSession> {
     if (
       !this.activeSession ||
       this.activeSession.state !== 'RECOVERY_REQUIRED' ||
@@ -643,7 +656,12 @@ export class AppController {
     const opportunity = this.activeOpportunity ?? this.opportunities.find((item) => item.id === this.activeSession?.opportunityId)
     if (!opportunity || !this.activeSession.mexcFill) throw new Error('恢复所需的原机会或MEXC成交记录已经丢失')
     this.activeSession.error = undefined
-    await this.hedgePolymarket(opportunity, this.activeSession.mexcFill, true)
+    const hedgeMode = request.mode === 'EMERGENCY_MARKET'
+      ? 'PROTECTED_MARKET'
+      : request.mode === 'PROTECTED'
+        ? 'PROTECTED_LIMIT'
+        : this.settings.polymarketHedgeMode
+    await this.hedgePolymarket(opportunity, this.activeSession.mexcFill, true, hedgeMode)
     return this.activeSession
   }
 
@@ -843,7 +861,8 @@ export class AppController {
   private async calculateExecutionPlanInternal(
     opportunity: Opportunity,
     quantity: string | undefined,
-    refreshStaleAccounts: boolean
+    refreshStaleAccounts: boolean,
+    source: 'MANUAL' | 'AUTO' | 'TEST' = 'MANUAL'
   ): Promise<ExecutionPlan> {
     let mexcAccount = this.mexcBrowser.getCachedAccountState?.()
     let polymarketCapacity = this.liveBroker?.getCachedTradingCapacity?.()
@@ -858,7 +877,7 @@ export class AppController {
         throw new Error(`轻量账户余额复核失败：${message}`)
       }
     }
-    return this.buildExecutionPlan(opportunity, quantity, mexcAccount, polymarketCapacity, this.settings.mode === 'ASSISTED')
+    return this.buildExecutionPlan(opportunity, quantity, mexcAccount, polymarketCapacity, this.settings.mode === 'ASSISTED', source)
   }
 
   private buildExecutionPlan(
@@ -866,7 +885,8 @@ export class AppController {
     quantity: string | undefined,
     mexcAccount: MexcAccountState | undefined,
     polymarketCapacity: PolymarketTradingCapacity | undefined,
-    requireBalances: boolean
+    requireBalances: boolean,
+    source: 'MANUAL' | 'AUTO' | 'TEST' = 'MANUAL'
   ): ExecutionPlan {
     const mexcWindow = this.latestMexcWindows.find((window) => window.eventId === opportunity.mexcEventId)
     const mexcOutcome = mexcWindow?.outcomes[opportunity.mexcDirection]
@@ -898,8 +918,7 @@ export class AppController {
       polymarketFeeExponent: opportunity.polymarketFeeExponent,
       polymarketMinOrderSize: opportunity.polymarketMinOrderSize,
       riskBufferPerShare: opportunity.riskBufferPerShare,
-      minNetEdgePerShare: this.settings.minNetEdgePerShare,
-      minConditionalReturnPct: this.settings.minConditionalReturnPct,
+      minConditionalReturnPct: this.executionConditionEnabled('conditionalReturn', source) ? this.settings.minConditionalReturnPct : '-100000',
       maxCapital: this.settings.maxCapitalPerTrade,
       maxHedgeSlippage: this.settings.maxHedgeSlippage,
       mexcBalance: this.settings.mode === 'ASSISTED' ? mexcAccount?.availableUsdt : undefined,
@@ -940,7 +959,19 @@ export class AppController {
     this.capacityRefreshTimer.unref()
   }
 
-  private validateExecution(opportunity: Opportunity, quantityInput: string, executionPlan: ExecutionPlan): void {
+  private executionConditionEnabled(
+    condition: keyof RiskSettings['manualExecutionConditions'],
+    source: 'MANUAL' | 'AUTO' | 'TEST'
+  ): boolean {
+    return source === 'AUTO' || this.settings.manualExecutionConditions[condition]
+  }
+
+  private validateExecution(
+    opportunity: Opportunity,
+    quantityInput: string,
+    executionPlan: ExecutionPlan,
+    source: 'MANUAL' | 'AUTO' | 'TEST'
+  ): void {
     const quantity = new Decimal(quantityInput)
     if (!quantity.isFinite() || quantity.lte(0)) throw new Error('数量必须大于0')
     const minimumQuantity = new Decimal(executionPlan.minimumQuantity)
@@ -948,18 +979,20 @@ export class AppController {
       throw new Error(`最小对齐份额为${minimumQuantity.toFixed(2)}份（Polymarket至少${opportunity.polymarketMinOrderSize}份且BUY金额至少1，MEXC本金至少1 USDT）`)
     }
     if (!executionPlan.executable) throw new Error(`当前数量不可执行：${executionPlan.blockReason ?? '深度或账户条件不足'}`)
-    if (opportunity.stale) throw new Error('行情已过期，请刷新')
-    if (opportunity.feeVerificationBlocked) {
+    if (opportunity.stale && this.executionConditionEnabled('quoteFreshness', source)) throw new Error('行情已过期，请刷新')
+    if (opportunity.feeVerificationBlocked && this.executionConditionEnabled('feeVerification', source)) {
       throw new Error(`手续费校验未通过：${opportunity.feeVerificationReason ?? '缺少可验证费率'}`)
     }
-    if (opportunity.settlementRiskBlocked && !this.settings.allowUnprofitableTestTrade) {
+    if (
+      opportunity.settlementRiskBlocked &&
+      this.executionConditionEnabled('settlementRisk', source) &&
+      !this.settings.allowUnprofitableTestTrade
+    ) {
       throw new Error(`结算源风控拦截：${opportunity.settlementRiskReason ?? '实时信号不满足条件'}`)
     }
     const capital = new Decimal(executionPlan.capitalRequired)
-    const belowEdge = new Decimal(executionPlan.netEdgePerShare).lt(this.settings.minNetEdgePerShare)
-    if (belowEdge && !this.settings.allowUnprofitableTestTrade) throw new Error('净收益低于风控阈值')
     const belowReturn = new Decimal(executionPlan.conditionalReturnPct).lt(this.settings.minConditionalReturnPct)
-    if (belowReturn && !this.settings.allowUnprofitableTestTrade) throw new Error('条件收益率低于风控阈值')
+    if (belowReturn && this.executionConditionEnabled('conditionalReturn', source) && !this.settings.allowUnprofitableTestTrade) throw new Error('条件收益率低于风控阈值')
     if (this.settings.allowUnprofitableTestTrade) {
       if (this.settings.mode !== 'ASSISTED') throw new Error('小额亏损联调只允许在人工监督模式执行')
       if (!this.settings.polymarketLiveEnabled) throw new Error('请先通过身份验证并开启Polymarket真实对冲，再进行小额亏损联调')
@@ -975,12 +1008,20 @@ export class AppController {
     if (capital.gt(this.settings.maxCapitalPerTrade)) {
       throw new Error('预计本金超过单笔限额')
     }
-    if ((opportunity.endTime - Date.now()) / 1_000 <= this.settings.stopBeforeExpirySeconds) {
+    if (
+      this.executionConditionEnabled('expiryCutoff', source) &&
+      (opportunity.endTime - Date.now()) / 1_000 <= this.settings.stopBeforeExpirySeconds
+    ) {
       throw new Error('距离到期过近，禁止新开仓')
     }
   }
 
-  private async hedgePolymarket(opportunity: Opportunity, mexcFill: Fill, recoveryMode = false): Promise<void> {
+  private async hedgePolymarket(
+    opportunity: Opportunity,
+    mexcFill: Fill,
+    recoveryMode = false,
+    hedgeMode = this.settings.polymarketHedgeMode
+  ): Promise<void> {
     if (!this.activeSession) throw new Error('执行会话意外丢失')
     const targetQuantity = this.calculatePolymarketTargetQuantity(mexcFill)
     this.activeSession.polymarketTargetQuantity = targetQuantity.toDecimalPlaces(6).toString()
@@ -1021,16 +1062,34 @@ export class AppController {
         lastError = `恢复损失上限${this.settings.maxRecoveryLossUsdt} USDT内没有可接受的Polymarket价格`
         break
       }
-      if (attempt > 0 || recoveryMode) await new Promise((resolve) => setTimeout(resolve, 150))
+      if (attempt > 0 || recoveryMode) {
+        await new Promise((resolve) => setTimeout(resolve, hedgeMode === 'PROTECTED_MARKET' ? 75 : 150))
+      }
       this.activeSession.hedgeAttempts = (this.activeSession.hedgeAttempts ?? 0) + 1
       try {
+        if (!opportunity.polymarketTokenId) throw new Error('Polymarket对冲缺少token')
+        await this.polymarketData.confirmOutcomeQuote?.(opportunity.polymarketTokenId, 1_000)
+        const currentWindows = this.polymarketData.getLatestWindows?.() ?? this.latestPolymarketWindows
+        const liveWindow = currentWindows.find((window) =>
+          window.durationMinutes === opportunity.durationMinutes &&
+          window.startTime === opportunity.startTime &&
+          window.endTime === opportunity.endTime
+        )
+        const liveOutcome = liveWindow?.outcomes[opportunity.polymarketDirection]
+        const minimumOrderSize = new Decimal(liveOutcome?.minOrderSize ?? opportunity.polymarketMinOrderSize ?? '1')
+        const tailOverhedge = Decimal.max(minimumOrderSize.minus(remainingQuantity), 0)
         const fill = await broker.hedge({
           tokenId: opportunity.polymarketTokenId,
           direction: opportunity.polymarketDirection,
           quantity: remainingQuantity.toDecimalPlaces(6).toString(),
           maximumPrice: Decimal.min(maximumPrice, POLYMARKET_MAX_ORDER_PRICE).toFixed(4),
           feeRate: opportunity.polymarketFeeRate,
-          feeExponent: opportunity.polymarketFeeExponent
+          feeExponent: opportunity.polymarketFeeExponent,
+          mode: hedgeMode,
+          levels: liveOutcome?.levels,
+          quoteReceivedAt: liveOutcome?.receivedAt,
+          minimumOrderSize: minimumOrderSize.toString(),
+          allowTailOverhedge: recoveryMode && tailOverhedge.gt(0) && tailOverhedge.lt(remainingQuantity)
         })
         fills.push(fill)
         filledQuantity = Decimal.sum(0, ...fills.map((item) => new Decimal(item.quantity || 0)))
@@ -1044,9 +1103,11 @@ export class AppController {
           `Polymarket FAK第${attempt + 1}次成交${fill.quantity}份 @ ${fill.averagePrice}；累计${filledQuantity.toDecimalPlaces(6).toString()}份，剩余${remainingQuantity.toDecimalPlaces(6).toString()}份`,
           {
             attempt: attempt + 1,
+            hedgeMode,
             maximumPrice: Decimal.min(maximumPrice, POLYMARKET_MAX_ORDER_PRICE).toFixed(4),
             filledQuantity: fill.quantity,
-            remainingQuantity: remainingQuantity.toDecimalPlaces(6).toString()
+            remainingQuantity: remainingQuantity.toDecimalPlaces(6).toString(),
+            ...fill.executionDetails
           }
         )
         if (filledQuantity.gt(targetQuantity.add('0.000001'))) {
@@ -1058,9 +1119,11 @@ export class AppController {
         console.error(`[Polymarket hedge attempt ${attempt + 1} failed] ${lastError}`)
         await this.recordActiveExecutionEvent('POLY_HEDGING', `Polymarket FAK第${attempt + 1}次未成交：${lastError}`, {
           attempt: attempt + 1,
+          hedgeMode,
           maximumPrice: Decimal.min(maximumPrice, POLYMARKET_MAX_ORDER_PRICE).toFixed(4),
           remainingQuantity: remainingQuantity.toDecimalPlaces(6).toString()
         })
+        if (lastError.startsWith('POLY_SUBMISSION_UNCERTAIN:')) break
       }
     }
 
@@ -1390,7 +1453,7 @@ export class AppController {
   private autoOpportunityReady(opportunity: Opportunity): boolean {
     const mexcAccount = this.mexcBrowser.getCachedAccountState?.()
     const polymarketCapacity = this.liveBroker?.getCachedTradingCapacity?.()
-    const maximumPlan = this.buildExecutionPlan(opportunity, undefined, mexcAccount, polymarketCapacity, false)
+    const maximumPlan = this.buildExecutionPlan(opportunity, undefined, mexcAccount, polymarketCapacity, false, 'AUTO')
     const plannedQuantity = this.settings.autoOpenQuantityMode === 'FIXED'
       ? new Decimal(this.settings.autoOpenFixedQuantity)
       : new Decimal(maximumPlan.maxExecutableQuantity)
@@ -1398,7 +1461,7 @@ export class AppController {
         .div(100)
         .toDecimalPlaces(2, Decimal.ROUND_FLOOR)
     const plannedPlan = this.settings.autoOpenQuantityMode === 'FIXED'
-      ? this.buildExecutionPlan(opportunity, plannedQuantity.toFixed(2), mexcAccount, polymarketCapacity, false)
+      ? this.buildExecutionPlan(opportunity, plannedQuantity.toFixed(2), mexcAccount, polymarketCapacity, false, 'AUTO')
       : maximumPlan
     return !opportunity.stale &&
       !opportunity.feeVerificationBlocked &&

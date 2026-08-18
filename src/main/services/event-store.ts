@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { ArbitrageOrderRecord, ExecutionEvent, RiskSettings } from '../../shared/types'
+import { defaultManualExecutionConditions } from '../../shared/defaults'
 
 export class EventStore {
   private readonly eventsPath: string
@@ -39,7 +40,14 @@ export class EventStore {
   async loadSettings(defaults: RiskSettings): Promise<RiskSettings> {
     try {
       const content = await readFile(this.settingsPath, 'utf8')
-      return { ...defaults, ...(JSON.parse(content) as Partial<RiskSettings>) }
+      const stored = JSON.parse(content) as Partial<RiskSettings>
+      const current = { ...stored } as Partial<RiskSettings> & Record<string, unknown>
+      delete current.minNetEdgePerShare
+      return {
+        ...defaults,
+        ...current,
+        manualExecutionConditions: defaultManualExecutionConditions(stored.manualExecutionConditions)
+      }
     } catch {
       return defaults
     }
