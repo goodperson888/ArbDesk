@@ -33,6 +33,7 @@ import type {
   AppSnapshot,
   CloseTarget,
   Direction,
+  ExecutionSession,
   ExecutionState,
   ExecutionPlan,
   MexcBrowserMode,
@@ -213,6 +214,8 @@ function App(): JSX.Element {
   const [soundCooldownDraft, setSoundCooldownDraft] = useState('30')
   const [autoFixedQuantityDraft, setAutoFixedQuantityDraft] = useState('5.00')
   const [autoMaxQuantityPctDraft, setAutoMaxQuantityPctDraft] = useState('80')
+  const [maxRecoveryLossDraft, setMaxRecoveryLossDraft] = useState('2.00')
+  const [hedgeRetryCountDraft, setHedgeRetryCountDraft] = useState('2')
   const previousCanExecuteRef = useRef(false)
   const soundCooldownRef = useRef(new Map<string, number>())
   const manualSelectionUntilRef = useRef(0)
@@ -249,6 +252,8 @@ function App(): JSX.Element {
     setSoundCooldownDraft(String(snapshot?.settings.opportunitySoundCooldownSeconds ?? 30))
     setAutoFixedQuantityDraft(snapshot?.settings.autoOpenFixedQuantity ?? '5.00')
     setAutoMaxQuantityPctDraft(String(snapshot?.settings.autoOpenMaxQuantityPct ?? 80))
+    setMaxRecoveryLossDraft(snapshot?.settings.maxRecoveryLossUsdt ?? '2.00')
+    setHedgeRetryCountDraft(String(snapshot?.settings.polymarketHedgeRetryCount ?? 2))
     setSettlementRuleDrafts((snapshot?.settings.settlementDistanceRules ?? defaultSettlementDistanceRules()).map((rule) => ({
       id: rule.id,
       remainingSeconds: String(rule.remainingSeconds),
@@ -389,7 +394,7 @@ function App(): JSX.Element {
               : Number(effectiveConditionalReturn) < Number(snapshot?.settings.minConditionalReturnPct ?? 0) && !snapshot?.settings.allowUnprofitableTestTrade
                 ? '条件收益率低于设置门槛'
                 : snapshot?.settings.allowUnprofitableTestTrade && !snapshot.settings.polymarketLiveEnabled
-                  ? '小额亏损联调需先验证身份并开启Polymarket真实FOK'
+                  ? '小额亏损联调需先验证身份并开启Polymarket真实对冲'
                   : snapshot?.settings.allowUnprofitableTestTrade && minimumTestCapital > 12
                     ? `当前最小验证单预计需要${minimumTestCapital.toFixed(2)}，超过12 USDT硬上限`
                   : snapshot?.settings.allowUnprofitableTestTrade && requestedCapital > dynamicTestCapitalLimit
@@ -412,7 +417,7 @@ function App(): JSX.Element {
     { passed: !selected.stale, label: `行情 MEXC ${quoteAgeLabel(selected.mexcQuoteAgeMs)} / Poly ${quoteAgeLabel(selected.polymarketQuoteAgeMs)} ≤ ${(snapshot.settings.maxQuoteAgeMs / 1_000).toFixed(0)}秒` },
     { passed: (selected.endTime - now) / 1_000 > snapshot.settings.stopBeforeExpirySeconds, label: `距离到期 ${secondsRemaining(selected.endTime, now)}，开仓截止前仍有效` },
     ...(snapshot.settings.allowUnprofitableTestTrade
-      ? [{ passed: testOverrideReady, label: `小额联调限制：人工监督、Poly真实FOK、本金≤${dynamicTestCapitalLimit.toFixed(2)} USDT且硬上限12 USDT` }]
+      ? [{ passed: testOverrideReady, label: `小额联调限制：人工监督、Poly真实对冲、本金≤${dynamicTestCapitalLimit.toFixed(2)} USDT且硬上限12 USDT` }]
       : []),
     { passed: executionSessionIdle && !busy, label: executionSessionIdle ? (busy ? '当前操作正在执行' : '当前无执行中操作') : `已有执行中套利组（${snapshot.activeSession?.state ?? '未知状态'}）` }
   ] : []
@@ -577,7 +582,7 @@ function App(): JSX.Element {
         setMessage('请先执行“不下单验证”，并处理余额或授权问题')
         return
       }
-      const confirmed = window.confirm('启用后，确认MEXC实际成交会立即提交Polymarket FOK真实对冲订单。确认启用？')
+      const confirmed = window.confirm('启用后，确认MEXC实际成交会立即提交Polymarket精确份额FAK真实对冲；可部分成交并自动补齐剩余敞口。确认启用？')
       if (!confirmed) return
     }
     const result = await run(() => window.arbApp.updateSettings({ polymarketLiveEnabled: enabling }))
@@ -589,7 +594,7 @@ function App(): JSX.Element {
     const enabling = !snapshot.settings.autoOpenEnabled
     if (enabling) {
       if (!snapshot.settings.mexcAutomationEnabled || !snapshot.settings.polymarketLiveEnabled) {
-        setMessage('请先启用MEXC自动点击和Polymarket真实FOK')
+        setMessage('请先启用MEXC自动点击和Polymarket真实对冲')
         return
       }
       const fixedQuantity = Number(autoFixedQuantityDraft)
@@ -623,6 +628,24 @@ function App(): JSX.Element {
       autoOpenEnabled: false
     }))
     if (result) setSnapshot({ ...snapshot, settings: result })
+  }
+
+  async function saveRecoverySettings(): Promise<void> {
+    const maximumLoss = Number(maxRecoveryLossDraft)
+    const retryCount = Number(hedgeRetryCountDraft)
+    if (!Number.isFinite(maximumLoss) || maximumLoss < 0 || maximumLoss > 10_000) {
+      setMessage('恢复对冲最大可接受亏损须为0至10,000 USDT')
+      return
+    }
+    if (!Number.isInteger(retryCount) || retryCount < 0 || retryCount > 5) {
+      setMessage('Polymarket自动补单次数须为0至5的整数')
+      return
+    }
+    const result = await run(() => window.arbApp.updateSettings({
+      maxRecoveryLossUsdt: maximumLoss.toFixed(2),
+      polymarketHedgeRetryCount: retryCount
+    }), '第二腿部分成交与恢复参数已保存')
+    if (result && snapshot) setSnapshot({ ...snapshot, settings: result })
   }
 
   async function toggleUnprofitableTestTrade(): Promise<void> {
@@ -993,9 +1016,14 @@ function App(): JSX.Element {
       </main>
 
       {active && executionNoticeKey !== dismissedExecutionNoticeKey && <ExecutionBar
-        state={active.state}
-        quantity={active.requestedQuantity}
-        error={active.error}
+        session={active}
+        busy={busy}
+        onRetry={() => void run(async () => {
+          const result = await window.arbApp.retryPolymarketHedge()
+          if (result.state !== 'HEDGED') throw new Error(result.error ?? '仍有未对冲份额，请继续恢复或平仓处理')
+          return result
+        }, 'Polymarket剩余敞口恢复完成')}
+        onOpenHistory={() => setHistoryOpen(true)}
         onDismiss={() => setDismissedExecutionNoticeKey(executionNoticeKey)}
       />}
 
@@ -1085,7 +1113,7 @@ function App(): JSX.Element {
                 <div><strong>风控规则</strong><span>动态安全距离 · {snapshot.settings.settlementDistanceRules.length}个节点</span><small>控制临近结算时允许开仓的最小价格距离</small></div><ChevronRight />
               </button>
               <button className="settings-menu-card" onClick={() => setSettingsView('LIVE')}>
-                <div><strong>实盘控制</strong><span>{snapshot.settings.autoOpenEnabled ? '自动开单已布防' : snapshot.settings.mexcAutomationEnabled ? 'MEXC自动点击已开' : '自动执行已关'} · {snapshot.settings.polymarketLiveEnabled ? '真实对冲已开' : '真实对冲已关'}</span><small>管理自动点击、真实FOK、自动开单与一次性小额联调</small></div><ChevronRight />
+                <div><strong>实盘控制</strong><span>{snapshot.settings.autoOpenEnabled ? '自动开单已布防' : snapshot.settings.mexcAutomationEnabled ? 'MEXC自动点击已开' : '自动执行已关'} · {snapshot.settings.polymarketLiveEnabled ? '真实对冲已开' : '真实对冲已关'}</span><small>管理自动点击、真实FAK、自动开单与一次性小额联调</small></div><ChevronRight />
               </button>
               <button className="settings-menu-card" onClick={() => setSettingsView('ACCOUNT')}>
                 <div><strong>账户与环境</strong><span>{snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? 'Hubstudio' : '内嵌MEXC'} · {polymarketCredentials?.configured ? 'Polymarket已配置' : 'Polymarket未配置'}</span><small>低频配置：浏览器环境、网络、校准和交易身份</small></div><ChevronRight />
@@ -1274,11 +1302,21 @@ function App(): JSX.Element {
                 {snapshot.settings.mexcAutomationEnabled ? <Check /> : <LockKeyhole />}
                 {snapshot.settings.mexcAutomationEnabled ? '已启用 · 点击关闭' : '确认后启用'}
               </button>
-              <div><ShieldAlert /><div><h3>Polymarket真实FOK</h3><p>MEXC成交确认后按实际数量立即对冲；必须先通过不下单验证。</p></div></div>
+              <div><ShieldAlert /><div><h3>Polymarket精确份额FAK</h3><p>MEXC成交后按实际份额成交可用盘口，未成交部分自动重新定价补单；更优价格始终允许。</p></div></div>
               <button className={`automation-toggle ${snapshot.settings.polymarketLiveEnabled ? 'enabled' : ''}`} onClick={() => void togglePolymarketLive()}>
                 {snapshot.settings.polymarketLiveEnabled ? <Check /> : <LockKeyhole />}
                 {snapshot.settings.polymarketLiveEnabled ? '真实对冲已启用 · 点击关闭' : '验证后启用真实对冲'}
               </button>
+              <div><ShieldAlert /><div><h3>第二腿恢复保护</h3><p>首轮按正常利润保护价FAK；剩余敞口可在整组最终亏损不超过设置值时自动补单。仍无法成交时可从执行条重试，或在订单历史平掉MEXC。</p></div></div>
+              <div className="decision-field-grid">
+                <label className="settings-field" htmlFor="recovery-max-loss">恢复最多接受亏损（USDT）
+                  <input id="recovery-max-loss" value={maxRecoveryLossDraft} onChange={(event) => setMaxRecoveryLossDraft(event.target.value)} inputMode="decimal" />
+                </label>
+                <label className="settings-field" htmlFor="hedge-retry-count">自动补单次数
+                  <input id="hedge-retry-count" type="number" min="0" max="5" step="1" value={hedgeRetryCountDraft} onChange={(event) => setHedgeRetryCountDraft(event.target.value)} inputMode="numeric" />
+                </label>
+              </div>
+              <button className="wide-secondary" onClick={() => void saveRecoverySettings()} disabled={busy}><Check />保存恢复参数</button>
               <div><Bot /><div><h3>自动开单</h3><p>全部按钮条件连续满足500毫秒后触发；期间只读WebSocket缓存，最终仅补充过期数据。每轮最多一单，异常自动停用。</p></div></div>
               <div className="segmented-control browser-mode-control">
                 <button className={snapshot.settings.autoOpenQuantityMode === 'FIXED' ? 'active' : ''} onClick={() => void setAutoQuantityMode('FIXED')} disabled={snapshot.settings.autoOpenEnabled}>固定份额</button>
@@ -1448,13 +1486,36 @@ function CloseConfirmModal({
   )
 }
 
-function ExecutionBar({ state, quantity, error, onDismiss }: { state: ExecutionState; quantity: string; error?: string; onDismiss: () => void }): JSX.Element {
+function ExecutionBar({
+  session,
+  busy,
+  onRetry,
+  onOpenHistory,
+  onDismiss
+}: {
+  session: ExecutionSession
+  busy: boolean
+  onRetry: () => void
+  onOpenHistory: () => void
+  onDismiss: () => void
+}): JSX.Element {
+  const { state, error } = session
   const danger = state === 'RECOVERY_REQUIRED' || state === 'UNHEDGED' || Boolean(error)
   const done = state === 'HEDGED' || state === 'CLOSED'
+  const mexcQuantity = Number(session.mexcFill?.quantity ?? 0)
+  const polymarketQuantity = Number(session.polymarketFill?.quantity ?? 0)
+  const remainingQuantity = Math.max(0, Number(session.remainingHedgeQuantity ?? mexcQuantity - polymarketQuantity))
   return <div className={`execution-bar ${danger ? 'danger' : done ? 'done' : ''}`}>
     <div className="execution-pulse">{done ? <Check /> : danger ? <AlertTriangle /> : <LoaderCircle className="spin" />}</div>
-    <div className="execution-summary"><span>当前执行组 · {quantity}份</span><strong>{STATE_LABELS[state]}</strong>{error && <small title={error}>{error}</small>}</div>
+    <div className="execution-summary">
+      <span>申请{session.requestedQuantity} · MEXC {mexcQuantity.toFixed(2)} · Poly {polymarketQuantity.toFixed(2)} · 未对冲 {remainingQuantity.toFixed(2)}份</span>
+      <strong>{STATE_LABELS[state]}</strong>{error && <small title={error}>{error}</small>}
+    </div>
     <div className="execution-progress"><span /></div>
+    {state === 'RECOVERY_REQUIRED' && <div className="execution-recovery-actions">
+      <button onClick={onRetry} disabled={busy || remainingQuantity <= 0}>{busy ? '处理中' : '重试对冲'}</button>
+      <button onClick={onOpenHistory} disabled={busy}>平仓处理</button>
+    </div>}
     <button className="execution-close" onClick={onDismiss} aria-label="关闭执行状态提示" title="关闭提示"><X /></button>
   </div>
 }

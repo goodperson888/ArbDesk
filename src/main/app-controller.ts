@@ -20,7 +20,7 @@ import type {
 } from '../shared/types'
 import { defaultSettlementDistanceRules } from '../shared/defaults'
 import { assertTransition } from './domain/execution-machine'
-import { calculateOpportunity } from './domain/opportunity'
+import { calculateOpportunity, polymarketCryptoFeePerShare } from './domain/opportunity'
 import { calculateDepthExecutionPlan } from './domain/execution-plan'
 import { normalizeSettlementDistanceRules } from './domain/settlement-distance'
 import { EventStore } from './services/event-store'
@@ -52,7 +52,9 @@ const DEFAULT_SETTINGS: RiskSettings = {
   autoOpenEnabled: false,
   autoOpenQuantityMode: 'FIXED',
   autoOpenFixedQuantity: '5.00',
-  autoOpenMaxQuantityPct: 80
+  autoOpenMaxQuantityPct: 80,
+  maxRecoveryLossUsdt: '2.00',
+  polymarketHedgeRetryCount: 2
 }
 
 const TEST_TRADE_CAPITAL_FLOOR = new Decimal(5)
@@ -60,6 +62,21 @@ const TEST_TRADE_CAPITAL_HARD_LIMIT = new Decimal(12)
 const MEXC_MIN_NOTIONAL = new Decimal(1)
 const POLYMARKET_MIN_BUY_AMOUNT = new Decimal(1)
 const POLYMARKET_MAX_ORDER_PRICE = new Decimal('0.99')
+
+function aggregateFills(fills: Fill[], direction: Direction): Fill | undefined {
+  if (fills.length === 0) return undefined
+  const quantity = Decimal.sum(0, ...fills.map((fill) => new Decimal(fill.quantity || 0)))
+  if (quantity.lte(0)) return undefined
+  const cost = Decimal.sum(0, ...fills.map((fill) => new Decimal(fill.quantity || 0).mul(fill.averagePrice || 0)))
+  return {
+    venue: 'POLYMARKET',
+    direction,
+    quantity: quantity.toDecimalPlaces(6).toString(),
+    averagePrice: cost.div(quantity).toDecimalPlaces(6).toString(),
+    orderId: fills.map((fill) => fill.orderId).join(','),
+    filledAt: Math.max(...fills.map((fill) => fill.filledAt))
+  }
+}
 
 export class AppController {
   private settings: RiskSettings = DEFAULT_SETTINGS
@@ -212,7 +229,8 @@ export class AppController {
       'maxHedgeSlippage', 'stopBeforeExpirySeconds', 'settlementDistanceRules', 'mexcBrowserMode',
       'mexcElementMode', 'hubstudioContainerCode', 'polymarketProxyUrl', 'mexcAutomationEnabled',
       'polymarketLiveEnabled', 'allowUnprofitableTestTrade', 'autoOpenQuantityMode',
-      'autoOpenFixedQuantity', 'autoOpenMaxQuantityPct'
+      'autoOpenFixedQuantity', 'autoOpenMaxQuantityPct', 'maxRecoveryLossUsdt',
+      'polymarketHedgeRetryCount'
     ]
     if (
       this.settings.autoOpenEnabled && request.autoOpenEnabled === undefined &&
@@ -250,6 +268,14 @@ export class AppController {
     next.autoOpenFixedQuantity = autoFixedQuantity.toDecimalPlaces(2).toFixed(2)
     if (!Number.isInteger(next.autoOpenMaxQuantityPct) || next.autoOpenMaxQuantityPct < 10 || next.autoOpenMaxQuantityPct > 100) {
       throw new Error('自动开单最大量比例须为10至100的整数百分比')
+    }
+    const maximumRecoveryLoss = new Decimal(next.maxRecoveryLossUsdt)
+    if (!maximumRecoveryLoss.isFinite() || maximumRecoveryLoss.lt(0) || maximumRecoveryLoss.gt(10_000)) {
+      throw new Error('恢复对冲最大可接受亏损须为0至10,000 USDT')
+    }
+    next.maxRecoveryLossUsdt = maximumRecoveryLoss.toDecimalPlaces(2).toFixed(2)
+    if (!Number.isInteger(next.polymarketHedgeRetryCount) || next.polymarketHedgeRetryCount < 0 || next.polymarketHedgeRetryCount > 5) {
+      throw new Error('Polymarket自动补单次数须为0至5的整数')
     }
     if (next.mode !== 'ASSISTED' || !next.mexcAutomationEnabled || !next.polymarketLiveEnabled || next.allowUnprofitableTestTrade) {
       next.autoOpenEnabled = false
@@ -505,14 +531,26 @@ export class AppController {
     return this.activeSession
   }
 
+  async retryPolymarketHedge(): Promise<ExecutionSession> {
+    if (!this.activeSession || this.activeSession.state !== 'RECOVERY_REQUIRED') {
+      throw new Error('当前没有可重试的Polymarket剩余对冲')
+    }
+    const opportunity = this.activeOpportunity ?? this.opportunities.find((item) => item.id === this.activeSession?.opportunityId)
+    if (!opportunity || !this.activeSession.mexcFill) throw new Error('恢复所需的原机会或MEXC成交记录已经丢失')
+    this.activeSession.error = undefined
+    await this.hedgePolymarket(opportunity, this.activeSession.mexcFill, true)
+    return this.activeSession
+  }
+
   async closeOrder(request: CloseOrderRequest): Promise<ArbitrageOrderRecord> {
     if (this.closingOrderId) throw new Error('已有平仓流程正在执行，请等待完成或进入恢复状态')
     if (!['MEXC', 'POLYMARKET', 'BOTH'].includes(request.target)) throw new Error('平仓目标无效')
-    if (this.activeSession && !['HEDGED', 'CANCELLED'].includes(this.activeSession.state)) {
-      throw new Error('当前仍有开仓或对冲流程，不能同时执行平仓')
-    }
     const order = this.orderHistory.find((candidate) => candidate.id === request.orderId)
     if (!order) throw new Error('未找到对应套利订单')
+    if (
+      this.activeSession && !['HEDGED', 'CANCELLED'].includes(this.activeSession.state) &&
+      !(this.activeSession.state === 'RECOVERY_REQUIRED' && this.activeSession.id === order.id)
+    ) throw new Error('当前仍有开仓或对冲流程，不能同时执行平仓')
     if (order.status === 'CLOSED' || order.status === 'CANCELLED') throw new Error('该订单已经没有可平持仓')
     if (Date.now() >= order.endTime) throw new Error('该市场已经到期，不能提交中途平仓')
     const closeMexc = request.target === 'MEXC' || request.target === 'BOTH'
@@ -795,7 +833,7 @@ export class AppController {
     if (belowReturn && !this.settings.allowUnprofitableTestTrade) throw new Error('条件收益率低于风控阈值')
     if (this.settings.allowUnprofitableTestTrade) {
       if (this.settings.mode !== 'ASSISTED') throw new Error('小额亏损联调只允许在人工监督模式执行')
-      if (!this.settings.polymarketLiveEnabled) throw new Error('请先通过身份验证并开启Polymarket真实FOK，再进行小额亏损联调')
+      if (!this.settings.polymarketLiveEnabled) throw new Error('请先通过身份验证并开启Polymarket真实对冲，再进行小额亏损联调')
       const minimumCapital = capital.div(quantity).mul(minimumQuantity)
       if (minimumCapital.gt(TEST_TRADE_CAPITAL_HARD_LIMIT)) {
         throw new Error(`当前最小可成交验证单预计需要${minimumCapital.toFixed(2)}，超过12 USDT验证硬上限`)
@@ -813,38 +851,141 @@ export class AppController {
     }
   }
 
-  private async hedgePolymarket(opportunity: Opportunity, mexcFill: Fill): Promise<void> {
-    await this.transition('POLY_HEDGING', `按MEXC实际成交 ${mexcFill.quantity} 份执行Polymarket对冲`)
-    try {
-      const broker = this.settings.mode === 'SIMULATION'
-        ? this.simulatedBroker
-        : this.settings.polymarketLiveEnabled
-          ? this.liveBroker
-          : undefined
-      if (!broker) throw new Error('Polymarket真实对冲未启用；没有提交订单')
-      const maximumPrice = Decimal.min(
-        new Decimal(opportunity.polymarketPrice).add(this.settings.maxHedgeSlippage),
-        new Decimal(this.activeExecutionPlan?.polymarketMaximumPrice ?? POLYMARKET_MAX_ORDER_PRICE),
-        POLYMARKET_MAX_ORDER_PRICE
-      )
-        .toFixed(4)
-      const fill = await broker.hedge({
-        tokenId: opportunity.polymarketTokenId,
-        direction: opportunity.polymarketDirection,
-        quantity: mexcFill.quantity,
-        maximumPrice,
-        feeRate: opportunity.polymarketFeeRate,
-        feeExponent: opportunity.polymarketFeeExponent
-      })
-      if (!this.activeSession) throw new Error('执行会话意外丢失')
-      this.activeSession.polymarketFill = fill
-      await this.transition('HEDGED', '两腿数量已对齐；结算规则仍属于条件型')
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      console.error(`[Polymarket hedge failed] ${message}`)
-      if (this.activeSession) this.activeSession.error = message
-      await this.transition('RECOVERY_REQUIRED', `Polymarket对冲失败：${message}`, { error: message })
+  private async hedgePolymarket(opportunity: Opportunity, mexcFill: Fill, recoveryMode = false): Promise<void> {
+    if (!this.activeSession) throw new Error('执行会话意外丢失')
+    if (this.activeSession.state !== 'POLY_HEDGING') {
+      await this.transition('POLY_HEDGING', `${recoveryMode ? '恢复' : '开始'}按MEXC实际成交 ${mexcFill.quantity} 份执行Polymarket精确份额FAK对冲`)
     }
+    const broker = this.settings.mode === 'SIMULATION'
+      ? this.simulatedBroker
+      : this.settings.polymarketLiveEnabled
+        ? this.liveBroker
+        : undefined
+    if (!broker) {
+      const message = 'Polymarket真实对冲未启用；没有提交订单'
+      this.activeSession.error = message
+      await this.transition('RECOVERY_REQUIRED', message, { error: message })
+      return
+    }
+
+    const targetQuantity = new Decimal(mexcFill.quantity)
+    const fills = [...(this.activeSession.polymarketFills ?? (this.activeSession.polymarketFill ? [this.activeSession.polymarketFill] : []))]
+    let filledQuantity = Decimal.sum(0, ...fills.map((fill) => new Decimal(fill.quantity || 0)))
+    let remainingQuantity = Decimal.max(targetQuantity.minus(filledQuantity), 0)
+    const normalMaximumPrice = Decimal.min(
+      new Decimal(opportunity.polymarketPrice).add(this.settings.maxHedgeSlippage),
+      new Decimal(this.activeExecutionPlan?.polymarketMaximumPrice ?? POLYMARKET_MAX_ORDER_PRICE),
+      POLYMARKET_MAX_ORDER_PRICE
+    )
+    const totalAttempts = this.settings.polymarketHedgeRetryCount + 1
+    let lastError = ''
+
+    for (let attempt = 0; attempt < totalAttempts && remainingQuantity.gt('0.000001'); attempt += 1) {
+      const recoveryMaximumPrice = this.calculateRecoveryMaximumPrice(opportunity, mexcFill, fills, remainingQuantity)
+      const maximumPrice = recoveryMode || attempt > 0 ? recoveryMaximumPrice : normalMaximumPrice
+      if (maximumPrice.lte(0)) {
+        lastError = `恢复损失上限${this.settings.maxRecoveryLossUsdt} USDT内没有可接受的Polymarket价格`
+        break
+      }
+      if (attempt > 0 || recoveryMode) await new Promise((resolve) => setTimeout(resolve, 150))
+      this.activeSession.hedgeAttempts = (this.activeSession.hedgeAttempts ?? 0) + 1
+      try {
+        const fill = await broker.hedge({
+          tokenId: opportunity.polymarketTokenId,
+          direction: opportunity.polymarketDirection,
+          quantity: remainingQuantity.toDecimalPlaces(6).toString(),
+          maximumPrice: Decimal.min(maximumPrice, POLYMARKET_MAX_ORDER_PRICE).toFixed(4),
+          feeRate: opportunity.polymarketFeeRate,
+          feeExponent: opportunity.polymarketFeeExponent
+        })
+        fills.push(fill)
+        filledQuantity = Decimal.sum(0, ...fills.map((item) => new Decimal(item.quantity || 0)))
+        remainingQuantity = Decimal.max(targetQuantity.minus(filledQuantity), 0)
+        this.activeSession.polymarketFills = fills
+        this.activeSession.polymarketFill = aggregateFills(fills, opportunity.polymarketDirection)
+        this.activeSession.remainingHedgeQuantity = remainingQuantity.toDecimalPlaces(6).toString()
+        await this.syncActiveOrderRecord()
+        await this.recordActiveExecutionEvent(
+          'POLY_HEDGING',
+          `Polymarket FAK第${attempt + 1}次成交${fill.quantity}份 @ ${fill.averagePrice}；累计${filledQuantity.toDecimalPlaces(6).toString()}份，剩余${remainingQuantity.toDecimalPlaces(6).toString()}份`,
+          {
+            attempt: attempt + 1,
+            maximumPrice: Decimal.min(maximumPrice, POLYMARKET_MAX_ORDER_PRICE).toFixed(4),
+            filledQuantity: fill.quantity,
+            remainingQuantity: remainingQuantity.toDecimalPlaces(6).toString()
+          }
+        )
+        if (filledQuantity.gt(targetQuantity.add('0.000001'))) {
+          lastError = `Polymarket出现超额对冲：目标${targetQuantity.toString()}份，实际${filledQuantity.toString()}份`
+          break
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error)
+        console.error(`[Polymarket hedge attempt ${attempt + 1} failed] ${lastError}`)
+        await this.recordActiveExecutionEvent('POLY_HEDGING', `Polymarket FAK第${attempt + 1}次未成交：${lastError}`, {
+          attempt: attempt + 1,
+          maximumPrice: Decimal.min(maximumPrice, POLYMARKET_MAX_ORDER_PRICE).toFixed(4),
+          remainingQuantity: remainingQuantity.toDecimalPlaces(6).toString()
+        })
+      }
+    }
+
+    if (!this.activeSession) throw new Error('执行会话意外丢失')
+    if (remainingQuantity.lte('0.000001') && filledQuantity.lte(targetQuantity.add('0.000001'))) {
+      this.activeSession.error = undefined
+      this.activeSession.remainingHedgeQuantity = '0'
+      await this.transition('HEDGED', `两腿已按实际成交量对齐；Polymarket共${fills.length}笔FAK成交`)
+      return
+    }
+    const message = `已对冲${filledQuantity.toDecimalPlaces(6).toString()}份，仍有${remainingQuantity.toDecimalPlaces(6).toString()}份未对冲${lastError ? `：${lastError}` : ''}`
+    this.activeSession.error = message
+    this.activeSession.remainingHedgeQuantity = remainingQuantity.toDecimalPlaces(6).toString()
+    await this.transition('RECOVERY_REQUIRED', `Polymarket部分对冲后仍需恢复：${message}`, {
+      error: message,
+      filledQuantity: filledQuantity.toDecimalPlaces(6).toString(),
+      remainingQuantity: remainingQuantity.toDecimalPlaces(6).toString()
+    })
+  }
+
+  private calculateRecoveryMaximumPrice(
+    opportunity: Opportunity,
+    mexcFill: Fill,
+    polymarketFills: Fill[],
+    remainingQuantity: Decimal
+  ): Decimal {
+    if (remainingQuantity.lte(0)) return new Decimal(0)
+    const targetQuantity = new Decimal(mexcFill.quantity)
+    const mexcCost = targetQuantity.mul(mexcFill.averagePrice).mul(new Decimal(1).add(opportunity.mexcFeeRate))
+    const existingPolymarketCost = Decimal.sum(0, ...polymarketFills.map((fill) => {
+      const quantity = new Decimal(fill.quantity || 0)
+      const price = new Decimal(fill.averagePrice || 0)
+      return quantity.mul(price.add(polymarketCryptoFeePerShare(
+        price,
+        new Decimal(opportunity.polymarketFeeRate || 0),
+        new Decimal(opportunity.polymarketFeeExponent || 1)
+      )))
+    }))
+    const riskBuffer = targetQuantity.mul(opportunity.riskBufferPerShare)
+    const availableForRemaining = targetQuantity
+      .add(this.settings.maxRecoveryLossUsdt)
+      .minus(mexcCost)
+      .minus(existingPolymarketCost)
+      .minus(riskBuffer)
+    if (availableForRemaining.lte(0)) return new Decimal(0)
+    const feeRate = new Decimal(opportunity.polymarketFeeRate || 0)
+    const feeExponent = new Decimal(opportunity.polymarketFeeExponent || 1)
+    const affordable = (price: Decimal): boolean => remainingQuantity
+      .mul(price.add(polymarketCryptoFeePerShare(price, feeRate, feeExponent)))
+      .lte(availableForRemaining)
+    let low = new Decimal('0.01')
+    let high = POLYMARKET_MAX_ORDER_PRICE
+    if (!affordable(low)) return new Decimal(0)
+    for (let index = 0; index < 48; index += 1) {
+      const middle = low.add(high).div(2)
+      if (affordable(middle)) low = middle
+      else high = middle
+    }
+    return low.toDecimalPlaces(4, Decimal.ROUND_FLOOR)
   }
 
   private async transition(
@@ -857,10 +998,19 @@ export class AppController {
     this.activeSession.state = next
     this.activeSession.updatedAt = Date.now()
     await this.syncActiveOrderRecord()
+    await this.recordActiveExecutionEvent(next, message, details)
+  }
+
+  private async recordActiveExecutionEvent(
+    state: ExecutionState,
+    message: string,
+    details?: Record<string, string | number | boolean>
+  ): Promise<void> {
+    if (!this.activeSession) throw new Error('没有活动执行会话')
     const event: ExecutionEvent = {
       id: randomUUID(),
       sessionId: this.activeSession.id,
-      state: next,
+      state,
       timestamp: Date.now(),
       message,
       details
@@ -879,8 +1029,13 @@ export class AppController {
     const mexc = session.mexcFill && !current.mexc.entryFill
       ? { ...current.mexc, entryFill: session.mexcFill, openQuantity: session.mexcFill.quantity }
       : current.mexc
-    const polymarket = session.polymarketFill && !current.polymarket.entryFill
-      ? { ...current.polymarket, entryFill: session.polymarketFill, openQuantity: session.polymarketFill.quantity }
+    const polymarket = session.polymarketFill
+      ? {
+        ...current.polymarket,
+        entryFill: session.polymarketFill,
+        entryFills: session.polymarketFills ?? [session.polymarketFill],
+        openQuantity: session.polymarketFill.quantity
+      }
       : current.polymarket
     const status = session.state === 'HEDGED'
       ? 'OPEN' as const

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AppController } from './app-controller'
 import { EventStore } from './services/event-store'
 import type { MexcBrowserManager } from './services/mexc-browser'
+import type { PolymarketBroker } from './services/polymarket'
 import type { PolymarketMarketData } from './services/polymarket-market-data'
 import type { PolymarketLiveBroker } from './services/polymarket-live'
 
@@ -17,6 +18,64 @@ afterEach(async () => {
     await rm(directory, { recursive: true })
   }
 })
+
+async function createAssistedExecutionController(hedge: PolymarketBroker['hedge']): Promise<AppController> {
+  const directory = await mkdtemp(join(tmpdir(), 'arbdesk-partial-hedge-test-'))
+  temporaryDirectories.push(directory)
+  const startTime = Math.ceil(Date.now() / 300_000) * 300_000
+  const mexcBrowser = {
+    configure: () => undefined,
+    getCalibration: () => ({ amountInput: false, upButton: false, downButton: false, submitButton: false }),
+    getStatus: () => ({
+      mode: 'HUBSTUDIO', open: true, authenticated: true, automationAvailable: true, monitoring: true,
+      calibrated: { amountInput: false, upButton: false, downButton: false, submitButton: false }, message: 'test'
+    }),
+    getCachedAccountState: () => ({
+      checkedAt: Date.now(), reachable: true, authenticated: true, availableUsdt: '100',
+      positionCount: 0, openOrderCount: 0, historyCount: 0,
+      positionFields: [], openOrderFields: [], historyFields: [], fillReadbackReady: true, message: 'test'
+    }),
+    ensureAccountBalance: async () => ({
+      checkedAt: Date.now(), reachable: true, authenticated: true, availableUsdt: '100',
+      positionCount: 0, openOrderCount: 0, historyCount: 0,
+      positionFields: [], openOrderFields: [], historyFields: [], fillReadbackReady: true, message: 'test'
+    }),
+    fetchActiveBtcWindows: async () => [{
+      eventId: 'mexc-partial-test', durationMinutes: 5, startTime, endTime: startTime + 300_000,
+      baselinePrice: '60000', indexPrice: '60030', indexReceivedAt: Date.now(), feeRate: '0.015', feeRateSource: 'HISTORY',
+      outcomes: {
+        UP: { direction: 'UP', symbolId: 'up', bestAsk: '0.40', askSize: '100', levels: [], receivedAt: Date.now() },
+        DOWN: { direction: 'DOWN', symbolId: 'down', bestAsk: '0.60', askSize: '100', levels: [], receivedAt: Date.now() }
+      }
+    }],
+    open: async () => undefined,
+    prepareOrder: async () => ({ ok: true, orderAccepted: false, message: 'prepared', matched: {} })
+  } as unknown as MexcBrowserManager
+  const polymarketData = {
+    configureProxy: () => undefined,
+    getStatus: () => ({ connected: true, message: 'test' }),
+    fetchWindows: async () => [{
+      durationMinutes: 5, startTime, endTime: startTime + 300_000,
+      baselinePrice: '60000', indexPrice: '60030', indexReceivedAt: Date.now(),
+      outcomes: {
+        UP: { direction: 'UP', tokenId: 'poly-up', bestAsk: '0.55', askSize: '100', levels: [], receivedAt: Date.now(), feeRate: '0.07' },
+        DOWN: { direction: 'DOWN', tokenId: 'poly-down', bestAsk: '0.50', askSize: '100', levels: [], receivedAt: Date.now(), feeRate: '0.07' }
+      }
+    }]
+  } as unknown as PolymarketMarketData
+  const liveBroker = {
+    configureProxy: () => undefined,
+    isConfigured: async () => true,
+    getCachedTradingCapacity: () => ({ checkedAt: Date.now(), collateralBalance: '100', allowanceReady: true, closedOnly: false }),
+    ensureTradingCapacity: async () => ({ checkedAt: Date.now(), collateralBalance: '100', allowanceReady: true, closedOnly: false }),
+    hedge
+  } as unknown as PolymarketLiveBroker
+  const controller = new AppController(new EventStore(directory), mexcBrowser, polymarketData, liveBroker)
+  await controller.initialize()
+  await controller.updateSettings({ mode: 'ASSISTED', polymarketLiveEnabled: true })
+  await controller.refreshOpportunities()
+  return controller
+}
 
 describe('AppController simulation', () => {
   it('never hedges before a MEXC fill and finishes with aligned quantities', async () => {
@@ -82,13 +141,13 @@ describe('AppController simulation', () => {
     expect(confirmPolymarketQuote).toHaveBeenCalledWith('poly-down')
     expect(session.state).toBe('HEDGED')
     expect(session.mexcFill?.quantity).toBe('5.00')
-    expect(session.polymarketFill?.quantity).toBe('5.00')
+    expect(Number(session.polymarketFill?.quantity)).toBe(5)
     const events = controller.getSnapshot().recentEvents.map((event) => event.state).reverse()
-    expect(events).toEqual(['MEXC_OPENING', 'MEXC_SUBMITTING', 'MEXC_FILLED', 'POLY_HEDGING', 'HEDGED'])
+    expect(events).toEqual(['MEXC_OPENING', 'MEXC_SUBMITTING', 'MEXC_FILLED', 'POLY_HEDGING', 'POLY_HEDGING', 'HEDGED'])
     const openOrder = controller.getSnapshot().orderHistory[0]
     expect(openOrder).toMatchObject({ status: 'OPEN' })
     expect(openOrder.mexc.openQuantity).toBe('5.00')
-    expect(openOrder.polymarket.openQuantity).toBe('5.00')
+    expect(Number(openOrder.polymarket.openQuantity)).toBe(5)
 
     const closedOrder = await controller.closeOrder({ orderId: openOrder.id, target: 'BOTH' })
     expect(closedOrder.status).toBe('CLOSED')
@@ -279,10 +338,79 @@ describe('AppController simulation', () => {
     const session = await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-fill' })
 
     expect(hedge).toHaveBeenCalledWith(expect.objectContaining({
-      tokenId: 'poly-down', direction: 'DOWN', quantity: '10.00', maximumPrice: '0.5000'
+      tokenId: 'poly-down', direction: 'DOWN', quantity: '10', maximumPrice: '0.5000'
     }))
     expect(session.state).toBe('HEDGED')
     expect(session.polymarketFill?.orderId).toBe('poly-live-order')
+  })
+
+  it('retries the remaining Polymarket quantity after a partial FAK fill', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    let attempt = 0
+    const hedge = vi.fn(async (order) => {
+      attempt += 1
+      return {
+        venue: 'POLYMARKET' as const,
+        direction: order.direction,
+        quantity: attempt === 1 ? '4' : order.quantity,
+        averagePrice: attempt === 1 ? '0.50' : '0.51',
+        orderId: `poly-partial-${attempt}`,
+        filledAt: Date.now()
+      }
+    })
+    const controller = await createAssistedExecutionController(hedge)
+    await controller.updateSettings({ polymarketHedgeRetryCount: 1 })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+
+    const session = await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-fill' })
+
+    expect(hedge).toHaveBeenCalledTimes(2)
+    expect(Number(hedge.mock.calls[0][0].quantity)).toBe(10)
+    expect(Number(hedge.mock.calls[1][0].quantity)).toBe(6)
+    expect(session.state).toBe('HEDGED')
+    expect(session.polymarketFills).toHaveLength(2)
+    expect(Number(session.polymarketFill?.quantity)).toBe(10)
+    expect(Number(session.polymarketFill?.averagePrice)).toBeCloseTo(0.506, 6)
+    expect(Number(session.remainingHedgeQuantity)).toBe(0)
+    const order = controller.getSnapshot().orderHistory[0]
+    expect(order.status).toBe('OPEN')
+    expect(order.polymarket.entryFills).toHaveLength(2)
+    expect(Number(order.polymarket.openQuantity)).toBe(10)
+  })
+
+  it('records the actual fills and remaining exposure when recovery is still required', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    let attempt = 0
+    const hedge = vi.fn(async (order) => {
+      attempt += 1
+      if (attempt > 1) throw new Error('temporary no liquidity')
+      return {
+        venue: 'POLYMARKET' as const,
+        direction: order.direction,
+        quantity: '4',
+        averagePrice: '0.50',
+        orderId: 'poly-partial-only',
+        filledAt: Date.now()
+      }
+    })
+    const controller = await createAssistedExecutionController(hedge)
+    await controller.updateSettings({ polymarketHedgeRetryCount: 1 })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+
+    const session = await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-fill' })
+
+    expect(session.state).toBe('RECOVERY_REQUIRED')
+    expect(Number(session.mexcFill?.quantity)).toBe(10)
+    expect(Number(session.polymarketFill?.quantity)).toBe(4)
+    expect(Number(session.remainingHedgeQuantity)).toBe(6)
+    expect(session.error).toContain('仍有6份未对冲')
+    const order = controller.getSnapshot().orderHistory[0]
+    expect(order.status).toBe('RECOVERY_REQUIRED')
+    expect(Number(order.mexc.openQuantity)).toBe(10)
+    expect(Number(order.polymarket.openQuantity)).toBe(4)
+    expect(order.polymarket.entryFills).toHaveLength(1)
   })
 
   it('waits 500ms using cached quotes before automatic opening performs lightweight balance checks', async () => {

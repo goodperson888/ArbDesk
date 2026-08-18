@@ -8,6 +8,7 @@ const api: ArbAppApi = {
   execute: (request) => ipcRenderer.invoke('app:execute', request),
   calculateExecutionPlan: (request) => ipcRenderer.invoke('app:calculate-execution-plan', request),
   confirmMexcFill: (fill) => ipcRenderer.invoke('app:confirm-mexc-fill', fill),
+  retryPolymarketHedge: () => ipcRenderer.invoke('app:retry-polymarket-hedge'),
   cancelExecution: () => ipcRenderer.invoke('app:cancel-execution'),
   closeOrder: (request) => ipcRenderer.invoke('app:close-order', request),
   updateSettings: (request) => ipcRenderer.invoke('app:update-settings', request),

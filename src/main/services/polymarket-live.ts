@@ -241,10 +241,11 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     if (quantity.lt(minimumSize)) {
       throw new Error(`Polymarket当前最小下单量为${minimumSize.toString()}份，MEXC实际成交仅${quantity.toString()}份；未提交第二腿`)
     }
-    // A BUY market/FOK order is expressed as the collateral maker amount. Polymarket
-    // accepts at most two decimal places for that value. Round upward so the
-    // resulting token amount cannot under-hedge the confirmed MEXC share count.
-    const spendAmount = maximumPrice.mul(quantity).toDecimalPlaces(2, Decimal.ROUND_UP)
+    // Submit an exact-share marketable limit order. A market BUY's amount is USDC,
+    // which can overbuy shares at better prices and can make FOK fail while enough
+    // target-share liquidity exists. FAK takes all immediately available shares at
+    // or below maximumPrice and cancels only the unmatched remainder.
+    const spendAmount = maximumPrice.mul(quantity)
     if (spendAmount.lt(MIN_MARKETABLE_BUY_AMOUNT)) {
       throw new Error(`Polymarket可立即成交的BUY至少需要1抵押资产；当前${quantity.toString()}份按最高价${maximumPrice.toString()}仅为${spendAmount.toFixed(2)}。第一腿成交量不足，未提交第二腿`)
     }
@@ -257,28 +258,25 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     )
     this.assertBuyingPower(balance, spendAmount.add(estimatedFee), book)
 
-    const signedOrder = await client.createMarketOrder({
+    const signedOrder = await client.createOrder({
       tokenID: order.tokenId,
       price: maximumPrice.toNumber(),
-      amount: spendAmount.toNumber(),
+      size: quantity.toNumber(),
       side: Side.BUY,
-      orderType: OrderType.FOK
     }, {
       tickSize: book.tick_size as TickSize,
       negRisk: book.neg_risk
     })
-    const response = await client.postOrder(signedOrder, OrderType.FOK)
-    if (!response.success) throw new Error(`Polymarket FOK失败：${response.errorMsg || response.status || '未知原因'}`)
+    const response = await client.postOrder(signedOrder, OrderType.FAK)
+    if (!response.success) throw new Error(`Polymarket FAK失败：${response.errorMsg || response.status || '未知原因'}`)
 
     // The order response returns human-readable token/collateral amounts. Balance and
     // allowance responses use 6-decimal integers, but applying that scale here
     // turns a valid 4.26-share fill into 0.00000426 shares.
     const filledQuantity = new Decimal(response.takingAmount || 0)
     const spent = new Decimal(response.makingAmount || 0)
-    if (filledQuantity.lt(quantity)) {
-      throw new Error(`Polymarket FOK返回数量不足：需要${quantity.toString()}，返回${filledQuantity.toString()}`)
-    }
-    if (!response.orderID) throw new Error('Polymarket订单成功但未返回orderID')
+    if (filledQuantity.lte(0)) throw new Error('Polymarket FAK当前没有成交任何份额')
+    if (!response.orderID) throw new Error('Polymarket FAK成交但未返回orderID')
     return {
       venue: 'POLYMARKET',
       direction: order.direction,

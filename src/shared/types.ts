@@ -115,6 +115,7 @@ export interface OrderLegRecord {
   symbolId?: string
   tokenId?: string
   entryFill?: Fill
+  entryFills?: Fill[]
   closeFills: Fill[]
   openQuantity: string
 }
@@ -167,6 +168,9 @@ export interface ExecutionSession {
   updatedAt: number
   mexcFill?: Fill
   polymarketFill?: Fill
+  polymarketFills?: Fill[]
+  remainingHedgeQuantity?: string
+  hedgeAttempts?: number
   error?: string
 }
 
@@ -193,6 +197,8 @@ export interface RiskSettings {
   autoOpenQuantityMode: 'FIXED' | 'MAX_PERCENT'
   autoOpenFixedQuantity: string
   autoOpenMaxQuantityPct: number
+  maxRecoveryLossUsdt: string
+  polymarketHedgeRetryCount: number
 }
 
 export interface ExecutionPlan {
@@ -370,6 +376,7 @@ export interface ArbAppApi {
   execute(request: ExecuteRequest): Promise<ExecutionSession>
   calculateExecutionPlan(request: CalculateExecutionPlanRequest): Promise<ExecutionPlan>
   confirmMexcFill(fill: Pick<Fill, 'quantity' | 'averagePrice' | 'orderId'>): Promise<ExecutionSession>
+  retryPolymarketHedge(): Promise<ExecutionSession>
   cancelExecution(): Promise<ExecutionSession | undefined>
   closeOrder(request: CloseOrderRequest): Promise<ArbitrageOrderRecord>
   updateSettings(request: UpdateSettingsRequest): Promise<RiskSettings>

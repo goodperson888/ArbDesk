@@ -21,6 +21,8 @@
 - 从 MEXC 页面同源公开接口读取当前 BTC 5m/15m 事件、UP/DOWN symbolId 和盘口深度；
 - MEXC 金额框、UP、DOWN、提交按钮的可视化校准；
 - `MEXC 成交 → Polymarket 对冲` 强制状态机；
+- Polymarket BUY 使用精确份额的可立即成交限价 FAK：接受限价内更优价格和部分成交，按 MEXC 实际成交量自动补齐；未补齐时显示双腿实际成交与剩余敞口，可人工重试或平仓处理；
+- 恢复对冲的最大可接受亏损和自动补单次数均可由用户配置，不会无限价追单；
 - 双腿中途平仓遵循 `MEXC自动卖出并回读实际成交 → Polymarket SELL FOK同量平仓`，失败进入恢复状态；
 - 部分成交只按实际成交量对冲；
 - 模拟交易、人工成交确认、审计日志和风险限制；
@@ -117,7 +119,7 @@ MEXC 自动点击在完成四项校准后，可以从设置页明确确认开启
 ARB_ENABLE_LIVE_EXECUTION=true
 ```
 
-`npm run dev:live` 会自动设置该变量。正式安装包内置发行版能力开关，但仍只能在“人工监督”模式中由用户依次开启 MEXC 自动点击、Polymarket 真实 FOK，并经过界面确认；凭据验证、金额、行情时效和结算信号等风控不会绕过。
+`npm run dev:live` 会自动设置该变量。正式安装包内置发行版能力开关，但仍只能在“人工监督”模式中由用户依次开启 MEXC 自动点击、Polymarket 真实对冲，并经过界面确认；BUY 对冲使用精确份额 FAK，SELL 平仓仍使用 FOK。凭据验证、金额、行情时效和结算信号等风控不会绕过。
 
 Polymarket 设置页允许用户自行选择签名类型（EOA、POLY_PROXY、GNOSIS_SAFE、POLY_1271）并填写 funder、订单签名私钥、API key、secret 和 passphrase。秘密值不会写入普通 `settings.json`，也不会回显。配置完成只表示本地材料齐全，不代表已验证余额、allowance 或下单权限；在官方 CLOB 网络连通并完成只读验证前，真实提交仍保持禁用。
 
@@ -142,7 +144,7 @@ design-system/            # UI 设计系统
 ## 下一阶段
 
 - 将当前 Polymarket REST 轮询升级为订单簿 WebSocket 和用户成交流；
-- 使用真实 token ID 完成 FAK/FOK 对冲与订单状态核验；
+- 继续使用真实 token ID 扩充分笔成交、订单状态和恢复路径核验；
 - 增加凭据只读验证、pUSD/POL 余额与 allowance 检查；
 - 在登录账户中验证 MEXC Prediction Markets 实际 DOM 和成交记录结构；
 - 增加 MEXC 成交状态自动读取与页面版本指纹；
