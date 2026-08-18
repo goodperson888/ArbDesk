@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { dirname, join } from 'node:path'
+import { promisify } from 'node:util'
 import { BrowserWindow, ipcMain, session } from 'electron'
 import type { Browser, CDPSession, Locator, Page } from 'playwright-core'
 import type {
@@ -19,6 +20,7 @@ import {
 } from '../domain/mexc-fee'
 import { parseLatestMexcSettlement, parseMexcFill, type MexcFillLogRow, type MexcFillMatch } from '../domain/mexc-fill'
 import { decodeMexcPredictionFrame } from '../domain/mexc-prediction-frame'
+import { canAttemptHubstudioReconnect, hubstudioMarketDuration } from '../domain/hubstudio-connection'
 
 const MEXC_URL = 'https://prediction.mexc.com/prediction-markets/all'
 const HUBSTUDIO_API = 'http://127.0.0.1:6873'
@@ -27,6 +29,7 @@ const MEXC_EVENT_CACHE_MS = 10_000
 const MEXC_FEE_CACHE_MS = 10 * 60_000
 const MEXC_REST_FALLBACK_MS = 10_000
 const MEXC_PREFLIGHT_QUOTE_MS = 500
+const execFileAsync = promisify(execFile)
 
 interface MexcSelectors {
   amountInput?: string
@@ -148,6 +151,9 @@ export class MexcBrowserManager {
   private hubstudioSocketUrls = new Map<string, string>()
   private hubstudioPredictionConfirmedAt = 0
   private hubstudioPredictionSubscriptionKey = ''
+  private hubstudioPassiveConnectPromise?: Promise<boolean>
+  private lastHubstudioPassiveConnectAt = 0
+  private lastHubstudioConnectionError?: string
   private lastHubstudioAccountRefreshAt = 0
   private hubstudioAccountRefreshing = false
   private latestResult?: AutomationResult
@@ -171,6 +177,7 @@ export class MexcBrowserManager {
   private latestWindows: MexcWindowQuote[] = []
   private marketDataListeners = new Set<() => void>()
   private instrumentedHubstudioPages = new WeakSet<Page>()
+  private trackedHubstudioOrderPages = new WeakSet<Page>()
   private discoveredPositionFields = new Set<string>()
   private discoveredOpenOrderFields = new Set<string>()
   private discoveredHistoryFields = new Set<string>()
@@ -235,6 +242,16 @@ export class MexcBrowserManager {
     return this.mode === 'HUBSTUDIO' ? this.openHubstudio() : this.openEmbedded()
   }
 
+  async reconnectIfAvailable(force = false): Promise<MexcBrowserStatus> {
+    if (this.mode !== 'HUBSTUDIO' || this.getStatus().open) return this.getStatus()
+    await this.tryAdoptRunningHubstudio(force, {
+      bringToFront: false,
+      createIfMissing: false,
+      refreshAccount: false
+    })
+    return this.getStatus()
+  }
+
   async prepareOrder(request: PrepareOrderRequest): Promise<AutomationResult> {
     await this.open()
     return this.mode === 'HUBSTUDIO'
@@ -252,8 +269,17 @@ export class MexcBrowserManager {
 
   async fetchActiveBtcWindows(): Promise<MexcWindowQuote[]> {
     if (!this.getStatus().open) {
-      if (this.startupOpenAttempted) throw new Error('MEXC窗口已关闭；请在设置中手动点击打开，软件不会反复拉起')
-      await this.open()
+      if (this.mode === 'HUBSTUDIO') {
+        await this.reconnectIfAvailable()
+        if (!this.getStatus().open && !this.startupOpenAttempted) await this.open()
+        if (!this.getStatus().open) {
+          throw new Error(this.lastHubstudioConnectionError
+            ? `Hubstudio尚未连接，软件会自动重试：${this.lastHubstudioConnectionError}`
+            : 'Hubstudio尚未连接，软件正在自动检测已运行环境')
+        }
+      } else {
+        await this.open()
+      }
     }
     const now = Date.now()
     let events = this.interceptedEvents && now - this.interceptedEvents.receivedAt <= MEXC_EVENT_CACHE_MS
@@ -649,8 +675,17 @@ export class MexcBrowserManager {
       return this.status('Hubstudio MEXC窗口已连接', true, this.hubstudioPage.url())
     }
     if (this.hubstudioBrowser?.isConnected() && this.hubstudioConnectedContainerCode === this.hubstudioContainerCode) {
-      const page = await this.bindHubstudioPage()
+      const page = await this.bindHubstudioPage({ bringToFront: true, createIfMissing: true, refreshAccount: true })
+      if (!page) throw new Error('Hubstudio已连接，但无法取得MEXC标签页')
       return this.status('Hubstudio MEXC标签页已恢复', true, page.url())
+    }
+
+    if (await this.tryAdoptRunningHubstudio(true, {
+      bringToFront: true,
+      createIfMissing: true,
+      refreshAccount: true
+    })) {
+      return this.status('已接管正在运行的Hubstudio环境', true, this.hubstudioPage?.url())
     }
 
     const startResult = await this.callHubstudio<HubstudioStartResponse>('/api/v1/browser/start', {
@@ -670,25 +705,91 @@ export class MexcBrowserManager {
       throw new Error('Hubstudio环境已运行，但未能识别调试端口；请关闭该环境后再从ArbDesk打开')
     }
 
-    const { chromium } = await import('playwright-core')
-    this.hubstudioBrowser = await chromium.connectOverCDP(`http://127.0.0.1:${debuggingPort}`)
-    this.hubstudioDebuggingPort = debuggingPort
-    this.hubstudioConnectedContainerCode = this.hubstudioContainerCode
-    this.hubstudioBrowser.on('disconnected', () => this.clearHubstudioConnection())
-    const page = await this.bindHubstudioPage()
+    const page = await this.connectHubstudioBrowser(debuggingPort, {
+      bringToFront: true,
+      createIfMissing: true,
+      refreshAccount: true
+    })
+    if (!page) throw new Error('Hubstudio环境已启动，但无法取得MEXC标签页')
     return this.status('Hubstudio环境已连接；请在该窗口中登录MEXC。', true, page.url())
   }
 
-  private async bindHubstudioPage(): Promise<Page> {
+  private async tryAdoptRunningHubstudio(
+    force: boolean,
+    options: { bringToFront: boolean; createIfMissing: boolean; refreshAccount: boolean }
+  ): Promise<boolean> {
+    if (!this.hubstudioContainerCode || this.mode !== 'HUBSTUDIO') return false
+    if (this.hubstudioPage && !this.hubstudioPage.isClosed()) {
+      if (options.bringToFront) await this.hubstudioPage.bringToFront()
+      return true
+    }
+    if (this.hubstudioBrowser?.isConnected() && this.hubstudioConnectedContainerCode === this.hubstudioContainerCode) {
+      const page = await this.bindHubstudioPage(options)
+      if (page) {
+        this.lastHubstudioConnectionError = undefined
+        return true
+      }
+    }
+    const now = Date.now()
+    if (this.hubstudioPassiveConnectPromise) return await this.hubstudioPassiveConnectPromise
+    if (!canAttemptHubstudioReconnect(this.lastHubstudioPassiveConnectAt, now, force)) return false
+    this.lastHubstudioPassiveConnectAt = now
+    this.hubstudioPassiveConnectPromise = (async () => {
+      try {
+        const debuggingPort = await this.resolveRunningHubstudioDebuggingPort()
+        if (!Number.isInteger(debuggingPort) || debuggingPort <= 0) {
+          this.lastHubstudioConnectionError = '指定环境尚未运行或调试端口尚未就绪'
+          return false
+        }
+        const page = await this.connectHubstudioBrowser(debuggingPort, options)
+        if (!page) {
+          this.lastHubstudioConnectionError = '环境已运行，等待现有MEXC页面出现'
+          return false
+        }
+        this.lastHubstudioConnectionError = undefined
+        return true
+      } catch (error) {
+        this.lastHubstudioConnectionError = error instanceof Error ? error.message : String(error)
+        return false
+      }
+    })().finally(() => {
+      this.hubstudioPassiveConnectPromise = undefined
+    })
+    return await this.hubstudioPassiveConnectPromise
+  }
+
+  private async connectHubstudioBrowser(
+    debuggingPort: number,
+    options: { bringToFront: boolean; createIfMissing: boolean; refreshAccount: boolean }
+  ): Promise<Page | undefined> {
+    const { chromium } = await import('playwright-core')
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${debuggingPort}`)
+    this.hubstudioBrowser = browser
+    this.hubstudioDebuggingPort = debuggingPort
+    this.hubstudioConnectedContainerCode = this.hubstudioContainerCode
+    browser.on('disconnected', () => {
+      if (this.hubstudioBrowser === browser) this.clearHubstudioConnection()
+    })
+    return await this.bindHubstudioPage(options)
+  }
+
+  private async bindHubstudioPage(options: {
+    bringToFront: boolean
+    createIfMissing: boolean
+    refreshAccount: boolean
+  }): Promise<Page | undefined> {
     const context = this.hubstudioBrowser?.contexts()[0]
     if (!context) throw new Error('无法取得Hubstudio浏览器上下文')
     const pages = context.pages()
-    const page = pages.find((candidate) => candidate.url().includes('prediction.mexc.com'))
-      ?? pages.find((candidate) => candidate.url().includes('mexc.com'))
-      ?? await context.newPage()
-    if (!page.url().includes('prediction.mexc.com')) await page.goto(MEXC_URL)
+    let page = pages.find((candidate) => candidate.url().includes('prediction.mexc.com'))
+    if (!page && options.createIfMissing) {
+      page = pages.find((candidate) => candidate.url().includes('mexc.com')) ?? await context.newPage()
+      if (!page.url().includes('prediction.mexc.com')) await page.goto(MEXC_URL)
+    }
+    if (!page) return undefined
     this.hubstudioPage = page
     this.instrumentHubstudioPage(page)
+    this.adoptExistingHubstudioOrderPages(context.pages())
     await this.startHubstudioWebSocketMonitoring(page)
     page.on('close', () => {
       if (this.hubstudioPage !== page) return
@@ -699,12 +800,29 @@ export class MexcBrowserManager {
       void this.refreshHubstudioAuthentication()
       void this.syncHubstudioPredictionSubscriptions().catch(() => undefined)
     })
-    await page.bringToFront()
+    if (options.bringToFront) await page.bringToFront()
     this.startHubstudioMonitoring()
     await this.refreshHubstudioAuthentication()
-    await this.refreshAccountState()
-    this.lastHubstudioAccountRefreshAt = Date.now()
+    if (options.refreshAccount) {
+      await this.refreshAccountState().catch(() => undefined)
+      this.lastHubstudioAccountRefreshAt = Date.now()
+    }
     return page
+  }
+
+  private adoptExistingHubstudioOrderPages(pages: Page[]): void {
+    for (const page of pages) {
+      if (page.isClosed()) continue
+      const duration = hubstudioMarketDuration(page.url())
+      if (!duration) continue
+      this.instrumentHubstudioPage(page)
+      this.hubstudioOrderPages.set(duration, page)
+      if (this.trackedHubstudioOrderPages.has(page)) continue
+      this.trackedHubstudioOrderPages.add(page)
+      page.on('close', () => {
+        if (this.hubstudioOrderPages.get(duration) === page) this.hubstudioOrderPages.delete(duration)
+      })
+    }
   }
 
   private marketTargetFromEvent(event: MexcRawEvent, origin: string): { eventId: string; url: string } | undefined {
@@ -721,6 +839,7 @@ export class MexcBrowserManager {
     const context = this.hubstudioBrowser?.contexts()[0]
     const monitorPage = this.hubstudioPage
     if (!context || !monitorPage || monitorPage.isClosed()) return
+    this.adoptExistingHubstudioOrderPages(context.pages())
     const origin = new URL(monitorPage.url()).origin
     await Promise.all(events.map(async (event) => {
       const duration = Number(event.sp) === 300 ? 5 as const : Number(event.sp) === 900 ? 15 as const : undefined
@@ -729,7 +848,7 @@ export class MexcBrowserManager {
       let page = this.hubstudioOrderPages.get(duration)
       if (!page || page.isClosed()) {
         page = context.pages().find((candidate) =>
-          candidate !== monitorPage && !candidate.isClosed() &&
+          !candidate.isClosed() &&
           candidate.url().includes(`/prediction-markets/up-down/btc-${duration}min-`)
         ) ?? await context.newPage()
         this.hubstudioOrderPages.set(duration, page)
@@ -1109,8 +1228,12 @@ export class MexcBrowserManager {
     if (!Number.isInteger(pid) || pid <= 0) return 0
     let output = ''
     try {
-      if (process.platform === 'win32') output = execFileSync('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8' })
-      else output = execFileSync('lsof', ['-Pan', '-p', String(pid), '-iTCP', '-sTCP:LISTEN'], { encoding: 'utf8' })
+      const command = process.platform === 'win32' ? 'netstat' : 'lsof'
+      const args = process.platform === 'win32'
+        ? ['-ano', '-p', 'TCP']
+        : ['-Pan', '-p', String(pid), '-iTCP', '-sTCP:LISTEN']
+      const result = await execFileAsync(command, args, { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 })
+      output = String(result.stdout)
     } catch {
       return 0
     }
@@ -1776,6 +1899,7 @@ export class MexcBrowserManager {
     this.hubstudioPredictionSubscriptionKey = ''
     this.hubstudioOrderPages.clear()
     this.hubstudioOrderWarmPromise = undefined
+    this.lastHubstudioPassiveConnectAt = 0
     this.latestFillRows = undefined
     this.fillRowListeners.clear()
     this.lastHubstudioAccountRefreshAt = 0
@@ -1785,6 +1909,7 @@ export class MexcBrowserManager {
     this.hubstudioDebuggingPort = undefined
     this.hubstudioConnectedContainerCode = undefined
     this.hubstudioAuthenticated = false
+    this.lastHubstudioConnectionError = '连接已断开，等待自动重连'
     this.latestAccountState = undefined
     this.latestOrderCapture = undefined
   }

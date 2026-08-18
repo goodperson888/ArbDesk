@@ -189,8 +189,16 @@ app.whenReady().then(async () => {
   // app resume/focus, and before every protected IPC operation.
   const licenseFallbackTimer = setInterval(() => void refreshLicenseState(), 5 * 60_000)
   licenseFallbackTimer.unref()
-  powerMonitor.on('resume', () => void refreshLicenseState(true))
-  app.on('browser-window-focus', () => void refreshLicenseState())
+  powerMonitor.on('resume', () => {
+    void refreshLicenseState(true)
+    void mexcBrowser.reconnectIfAvailable(true).then((status) => {
+      if (status.open) void controller.refreshOpportunities().catch(() => undefined)
+    }).catch(() => undefined)
+  })
+  app.on('browser-window-focus', () => {
+    void refreshLicenseState()
+    void mexcBrowser.reconnectIfAvailable().catch(() => undefined)
+  })
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) void createWindow()
   })

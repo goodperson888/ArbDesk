@@ -1438,7 +1438,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
               <button className="wide-secondary" onClick={() => void setMexcBrowser('HUBSTUDIO')} disabled={!hubstudioCode.trim()}><Check />保存并使用Hubstudio</button></>}
               <button className="wide-secondary" onClick={() => void openMexc()}><ExternalLink />打开{snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? 'Hubstudio环境' : '内嵌MEXC窗口'}</button>
               <button className="wide-secondary" onClick={() => void refreshMexcAccount()} disabled={!mexcStatus?.open || busy}><RefreshCw />读取账户与委托状态（不下单）</button>
-              <p>{snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? '行情固定并行扫描BTC 5m/15m，不依赖当前详情页；执行时自动切换到所选周期和轮次。每次启动最多自动打开一次，关闭后需手动重新打开。' : '每次启动时最多自动打开一次内嵌窗口；关闭后由用户手动重新打开，登录Cookie独立持久保存。'}应用不读取或保存登录密码。</p>
+              <p>{snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? '行情固定并行扫描BTC 5m/15m，不依赖当前详情页；已手动打开环境或页面时会自动接管，连接断开、软件聚焦或电脑休眠恢复后会自动重连，且不会抢占页面焦点。' : '每次启动时最多自动打开一次内嵌窗口；关闭后由用户手动重新打开，登录Cookie独立持久保存。'}应用不读取或保存登录密码。</p>
               {(mexcStatus?.message || mexcStatus?.account || mexcStatus?.lastOrderCapture) && <details className="credential-help diagnostics-details">
                 <summary>连接与账户诊断</summary><div>
               {mexcStatus?.message && <div className="browser-status-detail"><span>{mexcStatus.mode === 'HUBSTUDIO' ? 'HUB' : '内嵌'}</span><p>{mexcStatus.message}{mexcStatus.debuggingPort ? ` · CDP ${mexcStatus.debuggingPort}` : ''}</p></div>}
