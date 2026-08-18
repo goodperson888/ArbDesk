@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AppController } from './app-controller'
-import type { ArbitrageOrderRecord, MexcAccountState } from '../shared/types'
+import type { ArbitrageOrderRecord, Fill, MexcAccountState } from '../shared/types'
 import { EventStore } from './services/event-store'
 import type { MexcBrowserManager } from './services/mexc-browser'
 import type { PolymarketBroker } from './services/polymarket'
@@ -20,7 +20,7 @@ afterEach(async () => {
   }
 })
 
-async function createAssistedExecutionController(hedge: PolymarketBroker['hedge']): Promise<AppController> {
+async function createAssistedExecutionController(hedge: PolymarketBroker['hedge'], readbackFill?: Fill): Promise<AppController> {
   const directory = await mkdtemp(join(tmpdir(), 'arbdesk-partial-hedge-test-'))
   temporaryDirectories.push(directory)
   const startTime = Math.ceil(Date.now() / 300_000) * 300_000
@@ -50,7 +50,8 @@ async function createAssistedExecutionController(hedge: PolymarketBroker['hedge'
       }
     }],
     open: async () => undefined,
-    prepareOrder: async () => ({ ok: true, orderAccepted: false, message: 'prepared', matched: {} })
+    prepareOrder: async () => ({ ok: true, orderAccepted: false, message: 'prepared', matched: {} }),
+    waitForFill: async () => readbackFill
   } as unknown as MexcBrowserManager
   const polymarketData = {
     configureProxy: () => undefined,
@@ -375,13 +376,72 @@ describe('AppController simulation', () => {
     const opportunity = controller.getSnapshot().opportunities[0]
     await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
 
-    const session = await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-fill' })
+    const session = await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-fill', manualAcknowledged: true })
 
     expect(hedge).toHaveBeenCalledWith(expect.objectContaining({
       tokenId: 'poly-down', direction: 'DOWN', quantity: '10', maximumPrice: '0.5000'
     }))
     expect(session.state).toBe('HEDGED')
     expect(session.polymarketFill?.orderId).toBe('poly-live-order')
+  })
+
+  it('rejects an unverified manual MEXC fill and requires a real order id', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const controller = await createAssistedExecutionController(async (order) => ({
+      venue: 'POLYMARKET', direction: order.direction, quantity: order.quantity,
+      averagePrice: '0.50', orderId: 'should-not-run', filledAt: Date.now()
+    }))
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+
+    await expect(controller.confirmMexcFill({
+      quantity: '10', averagePrice: '0.40', orderId: 'manual-confirm', manualAcknowledged: true
+    })).rejects.toThrow('真实订单号')
+    await expect(controller.confirmMexcFill({
+      quantity: '10', averagePrice: '0.40', orderId: 'mexc-real-order', manualAcknowledged: false
+    })).rejects.toThrow('核对数量、均价和真实订单号')
+    expect(controller.getSnapshot().activeSession?.state).toBe('MEXC_SUBMITTED')
+  })
+
+  it('starts the hedge from a platform-read MEXC fill after the user clicks MEXC manually', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const hedge = vi.fn(async (order) => ({
+      venue: 'POLYMARKET' as const, direction: order.direction, quantity: order.quantity,
+      averagePrice: '0.50', orderId: 'poly-platform-readback', filledAt: Date.now(), verificationSource: 'PLATFORM_READBACK' as const
+    }))
+    const controller = await createAssistedExecutionController(hedge, {
+      venue: 'MEXC', direction: 'UP', quantity: '10', averagePrice: '0.40',
+      orderId: 'mexc-platform-order', filledAt: Date.now(), verificationSource: 'PLATFORM_READBACK'
+    })
+    const opportunity = controller.getSnapshot().opportunities[0]
+
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+    await vi.waitFor(() => expect(controller.getSnapshot().activeSession?.state).toBe('HEDGED'))
+
+    expect(hedge).toHaveBeenCalledWith(expect.objectContaining({ quantity: '10' }))
+    expect(controller.getSnapshot().orderHistory[0].mexc.entryFill).toMatchObject({
+      orderId: 'mexc-platform-order', verificationSource: 'PLATFORM_READBACK'
+    })
+  })
+
+  it('records an over-target Polymarket fill as recovery instead of successful hedging', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const controller = await createAssistedExecutionController(async (order) => ({
+      venue: 'POLYMARKET', direction: order.direction, quantity: '11',
+      averagePrice: '0.50', orderId: 'poly-over-target', filledAt: Date.now(), verificationSource: 'PLATFORM_READBACK'
+    }))
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+
+    const session = await controller.confirmMexcFill({
+      quantity: '10', averagePrice: '0.40', orderId: 'mexc-real-order', manualAcknowledged: true
+    })
+
+    expect(session.state).toBe('RECOVERY_REQUIRED')
+    expect(session.polymarketTargetQuantity).toBe('10')
+    expect(session.excessHedgeQuantity).toBe('1')
+    expect(session.error).toContain('超额成交1份')
+    expect(controller.getSnapshot().orderHistory[0].polymarket.targetQuantity).toBe('10')
   })
 
   it('retries the remaining Polymarket quantity after a partial FAK fill', async () => {
@@ -403,7 +463,7 @@ describe('AppController simulation', () => {
     const opportunity = controller.getSnapshot().opportunities[0]
     await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
 
-    const session = await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-fill' })
+    const session = await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-fill', manualAcknowledged: true })
 
     expect(hedge).toHaveBeenCalledTimes(2)
     expect(Number(hedge.mock.calls[0][0].quantity)).toBe(10)
@@ -439,7 +499,7 @@ describe('AppController simulation', () => {
     const opportunity = controller.getSnapshot().opportunities[0]
     await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
 
-    const session = await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-fill' })
+    const session = await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-fill', manualAcknowledged: true })
 
     expect(session.state).toBe('RECOVERY_REQUIRED')
     expect(Number(session.mexcFill?.quantity)).toBe(10)

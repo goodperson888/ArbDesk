@@ -35,6 +35,7 @@ export type ExecutionState =
 export type CloseTarget = 'MEXC' | 'POLYMARKET' | 'BOTH'
 export type ArbitrageOrderStatus = 'OPENING' | 'OPEN' | 'UNHEDGED' | 'CLOSED' | 'RECOVERY_REQUIRED' | 'CANCELLED' | 'EXPIRED'
 export type OrderTriggerSource = 'MANUAL' | 'AUTO' | 'TEST' | 'UNKNOWN'
+export type FillVerificationSource = 'PLATFORM_READBACK' | 'MANUAL_ENTRY' | 'SIMULATED'
 
 export interface OrderBookLevel {
   price: string
@@ -108,6 +109,7 @@ export interface Fill {
   averagePrice: string
   orderId: string
   filledAt: number
+  verificationSource?: FillVerificationSource
 }
 
 export interface OrderLegRecord {
@@ -118,6 +120,7 @@ export interface OrderLegRecord {
   tokenId?: string
   entryFill?: Fill
   entryFills?: Fill[]
+  targetQuantity?: string
   closeFills: Fill[]
   openQuantity: string
 }
@@ -172,7 +175,9 @@ export interface ExecutionSession {
   mexcFill?: Fill
   polymarketFill?: Fill
   polymarketFills?: Fill[]
+  polymarketTargetQuantity?: string
   remainingHedgeQuantity?: string
+  excessHedgeQuantity?: string
   hedgeAttempts?: number
   timings?: ExecutionTimings
   error?: string
@@ -288,6 +293,10 @@ export interface ExecuteRequest {
   opportunityId: string
   quantity: string
   source?: Exclude<OrderTriggerSource, 'UNKNOWN'>
+}
+
+export interface ConfirmMexcFillRequest extends Pick<Fill, 'quantity' | 'averagePrice' | 'orderId'> {
+  manualAcknowledged: boolean
 }
 
 export interface CloseOrderRequest {
@@ -418,7 +427,7 @@ export interface ArbAppApi {
   testPolymarketConnection(): Promise<AppSnapshot>
   execute(request: ExecuteRequest): Promise<ExecutionSession>
   calculateExecutionPlan(request: CalculateExecutionPlanRequest): Promise<ExecutionPlan>
-  confirmMexcFill(fill: Pick<Fill, 'quantity' | 'averagePrice' | 'orderId'>): Promise<ExecutionSession>
+  confirmMexcFill(fill: ConfirmMexcFillRequest): Promise<ExecutionSession>
   retryPolymarketHedge(): Promise<ExecutionSession>
   cancelExecution(): Promise<ExecutionSession | undefined>
   closeOrder(request: CloseOrderRequest): Promise<ArbitrageOrderRecord>

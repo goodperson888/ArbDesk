@@ -31,7 +31,8 @@ export class SimulatedPolymarketBroker implements PolymarketBroker {
       quantity: order.quantity,
       averagePrice: order.maximumPrice,
       orderId: `sim-poly-${randomUUID()}`,
-      filledAt: Date.now()
+      filledAt: Date.now(),
+      verificationSource: 'SIMULATED'
     }
   }
 
@@ -40,7 +41,7 @@ export class SimulatedPolymarketBroker implements PolymarketBroker {
     await new Promise((resolve) => setTimeout(resolve, 180))
     return {
       venue: 'POLYMARKET', direction: order.direction, quantity: order.quantity,
-      averagePrice: '0.5000', orderId: `sim-poly-close-${randomUUID()}`, filledAt: Date.now()
+      averagePrice: '0.5000', orderId: `sim-poly-close-${randomUUID()}`, filledAt: Date.now(), verificationSource: 'SIMULATED'
     }
   }
 }

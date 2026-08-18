@@ -6,6 +6,7 @@ import type {
   AutoOpenState,
   CalculateExecutionPlanRequest,
   CloseOrderRequest,
+  ConfirmMexcFillRequest,
   Direction,
   ExecuteRequest,
   ExecutionEvent,
@@ -70,13 +71,15 @@ function aggregateFills(fills: Fill[], direction: Direction): Fill | undefined {
   const quantity = Decimal.sum(0, ...fills.map((fill) => new Decimal(fill.quantity || 0)))
   if (quantity.lte(0)) return undefined
   const cost = Decimal.sum(0, ...fills.map((fill) => new Decimal(fill.quantity || 0).mul(fill.averagePrice || 0)))
+  const verificationSources = [...new Set(fills.map((fill) => fill.verificationSource).filter(Boolean))]
   return {
     venue: 'POLYMARKET',
     direction,
     quantity: quantity.toDecimalPlaces(6).toString(),
     averagePrice: cost.div(quantity).toDecimalPlaces(6).toString(),
     orderId: fills.map((fill) => fill.orderId).join(','),
-    filledAt: Math.max(...fills.map((fill) => fill.filledAt))
+    filledAt: Math.max(...fills.map((fill) => fill.filledAt)),
+    verificationSource: verificationSources.length === 1 ? verificationSources[0] : undefined
   }
 }
 
@@ -491,7 +494,8 @@ export class AppController {
         quantity: this.activeSession.requestedQuantity,
         averagePrice: opportunity.mexcPrice,
         orderId: `sim-mexc-${randomUUID()}`,
-        filledAt: Date.now()
+        filledAt: Date.now(),
+        verificationSource: 'SIMULATED'
       }
       this.activeSession.mexcFill = fill
       await this.transition('MEXC_FILLED', 'MEXC模拟订单已完全成交')
@@ -533,19 +537,23 @@ export class AppController {
       automationMatched: result.ok,
       orderAccepted: result.orderAccepted ?? false
     })
-    if (
-      this.settings.polymarketLiveEnabled &&
-      this.settings.mexcAutomationEnabled &&
-      result.ok &&
-      result.orderAccepted
-    ) {
-      const submittedAfter = (result.submittedAt ?? Date.now()) - 2_000
-      void this.monitorMexcFill(opportunity, submittedAfter)
+    if (this.settings.polymarketLiveEnabled) {
+      const automaticAccepted = this.settings.mexcAutomationEnabled && result.ok && result.orderAccepted
+      const awaitingManualClick = !this.settings.mexcAutomationEnabled
+      if (automaticAccepted || awaitingManualClick) {
+        const submittedAfter = (result.submittedAt ?? Date.now()) - 2_000
+        void this.monitorMexcFill(opportunity, submittedAfter, awaitingManualClick ? 120_000 : 90_000)
+      }
     }
     return this.activeSession
   }
 
-  async confirmMexcFill(fill: Pick<Fill, 'quantity' | 'averagePrice' | 'orderId'>): Promise<ExecutionSession> {
+  async confirmMexcFill(fill: ConfirmMexcFillRequest): Promise<ExecutionSession> {
+    const orderId = fill.orderId.trim()
+    if (!fill.manualAcknowledged) throw new Error('请先确认已经在MEXC成交记录中核对数量、均价和真实订单号')
+    if (!orderId || orderId.toLowerCase() === 'manual-confirm') {
+      throw new Error('人工强制录入必须填写MEXC成交记录中的真实订单号')
+    }
     return await this.completeMexcFill(fill, false)
   }
 
@@ -565,31 +573,38 @@ export class AppController {
       throw new Error('实际成交数量必须大于0且不能超过委托数量')
     }
     const mexcFill: Fill = {
-      ...fill,
       venue: 'MEXC',
       direction: opportunity.mexcDirection,
       quantity: quantity.toFixed(2),
       averagePrice: new Decimal(fill.averagePrice).toFixed(4),
-      filledAt: fill.filledAt ?? Date.now()
+      orderId: fill.orderId.trim(),
+      filledAt: fill.filledAt ?? Date.now(),
+      verificationSource: trustedReadback ? 'PLATFORM_READBACK' : 'MANUAL_ENTRY'
     }
     this.activeSession.mexcFill = mexcFill
     if (this.activeSession.timings) this.activeSession.timings.mexcFillDetectedAt = Date.now()
     const state: ExecutionState = quantity.eq(this.activeSession.requestedQuantity) ? 'MEXC_FILLED' : 'MEXC_PARTIAL'
-    await this.transition(state, state === 'MEXC_FILLED' ? '已确认MEXC完全成交' : '已确认MEXC部分成交')
+    const sourceLabel = trustedReadback ? 'MEXC平台回读' : '人工强制录入（未经平台回读）'
+    await this.transition(state, `${sourceLabel}：${state === 'MEXC_FILLED' ? '完全成交' : '部分成交'}`)
     await this.hedgePolymarket(opportunity, mexcFill)
     return this.activeSession
   }
 
-  private async monitorMexcFill(opportunity: Opportunity, submittedAfter: number): Promise<void> {
+  private async monitorMexcFill(opportunity: Opportunity, submittedAfter: number, timeoutMs = 90_000): Promise<void> {
     try {
       const fill = await this.mexcBrowser.waitForFill({
         eventId: opportunity.mexcEventId,
         symbolId: opportunity.mexcSymbolId,
         direction: opportunity.mexcDirection,
         submittedAfter
-      })
-      if (!fill || !this.activeSession || this.activeSession.opportunityId !== opportunity.id) return
+      }, timeoutMs)
+      if (!this.activeSession || this.activeSession.opportunityId !== opportunity.id) return
       if (!['MEXC_SUBMITTED', 'MEXC_SUBMITTING'].includes(this.activeSession.state)) return
+      if (!fill) {
+        this.activeSession.error = `MEXC成交回读在${Math.round(timeoutMs / 1_000)}秒内没有检测到本轮真实成交；请核对MEXC成交记录，必要时使用人工强制录入`
+        this.broadcast(this.getSnapshot())
+        return
+      }
       await this.completeMexcFill(fill, true)
     } catch (error) {
       if (!this.activeSession || this.activeSession.opportunityId !== opportunity.id) return
@@ -663,7 +678,8 @@ export class AppController {
         if (order.mode === 'SIMULATION') {
           fill = {
             venue: 'MEXC', direction: order.mexc.direction, quantity: order.mexc.openQuantity,
-            averagePrice: order.mexc.entryFill?.averagePrice ?? '0.5', orderId: `sim-mexc-close-${randomUUID()}`, filledAt: Date.now()
+            averagePrice: order.mexc.entryFill?.averagePrice ?? '0.5', orderId: `sim-mexc-close-${randomUUID()}`, filledAt: Date.now(),
+            verificationSource: 'SIMULATED'
           }
         } else {
           const result = await this.mexcBrowser.closePosition({
@@ -953,8 +969,11 @@ export class AppController {
 
   private async hedgePolymarket(opportunity: Opportunity, mexcFill: Fill, recoveryMode = false): Promise<void> {
     if (!this.activeSession) throw new Error('执行会话意外丢失')
+    const targetQuantity = this.calculatePolymarketTargetQuantity(mexcFill)
+    this.activeSession.polymarketTargetQuantity = targetQuantity.toDecimalPlaces(6).toString()
+    this.activeSession.excessHedgeQuantity = '0'
     if (this.activeSession.state !== 'POLY_HEDGING') {
-      await this.transition('POLY_HEDGING', `${recoveryMode ? '恢复' : '开始'}按MEXC实际成交 ${mexcFill.quantity} 份执行Polymarket精确份额FAK对冲`)
+      await this.transition('POLY_HEDGING', `${recoveryMode ? '恢复' : '开始'}对冲：MEXC实际成交${mexcFill.quantity}份，Polymarket计算目标${targetQuantity.toDecimalPlaces(6).toString()}份`)
     }
     const broker = this.settings.mode === 'SIMULATION'
       ? this.simulatedBroker
@@ -968,7 +987,6 @@ export class AppController {
       return
     }
 
-    const targetQuantity = new Decimal(mexcFill.quantity)
     if (this.activeSession.timings && !this.activeSession.timings.polymarketStartedAt) {
       this.activeSession.timings.polymarketStartedAt = Date.now()
     }
@@ -1034,7 +1052,9 @@ export class AppController {
     }
 
     if (!this.activeSession) throw new Error('执行会话意外丢失')
-    if (remainingQuantity.lte('0.000001') && filledQuantity.lte(targetQuantity.add('0.000001'))) {
+    const excessQuantity = Decimal.max(filledQuantity.minus(targetQuantity), 0)
+    this.activeSession.excessHedgeQuantity = excessQuantity.toDecimalPlaces(6).toString()
+    if (remainingQuantity.lte('0.000001') && excessQuantity.lte('0.000001')) {
       this.activeSession.error = undefined
       this.activeSession.remainingHedgeQuantity = '0'
       if (this.activeSession.timings) {
@@ -1044,7 +1064,9 @@ export class AppController {
       await this.transition('HEDGED', `两腿已按实际成交量对齐；Polymarket共${fills.length}笔FAK成交`)
       return
     }
-    const message = `已对冲${filledQuantity.toDecimalPlaces(6).toString()}份，仍有${remainingQuantity.toDecimalPlaces(6).toString()}份未对冲${lastError ? `：${lastError}` : ''}`
+    const message = excessQuantity.gt('0.000001')
+      ? `Polymarket超额成交${excessQuantity.toDecimalPlaces(6).toString()}份：目标${targetQuantity.toDecimalPlaces(6).toString()}份，实际${filledQuantity.toDecimalPlaces(6).toString()}份；已停止继续买入`
+      : `已对冲${filledQuantity.toDecimalPlaces(6).toString()}份，仍有${remainingQuantity.toDecimalPlaces(6).toString()}份未对冲${lastError ? `：${lastError}` : ''}`
     this.activeSession.error = message
     this.activeSession.remainingHedgeQuantity = remainingQuantity.toDecimalPlaces(6).toString()
     await this.transition('RECOVERY_REQUIRED', `Polymarket部分对冲后仍需恢复：${message}`, {
@@ -1052,6 +1074,18 @@ export class AppController {
       filledQuantity: filledQuantity.toDecimalPlaces(6).toString(),
       remainingQuantity: remainingQuantity.toDecimalPlaces(6).toString()
     })
+  }
+
+  private calculatePolymarketTargetQuantity(mexcFill: Fill): Decimal {
+    // Both connected contracts currently settle one winning share to one unit.
+    // Keep this as a payout-ratio calculation so venue-specific settlement deductions
+    // can be introduced without changing the execution safety boundary.
+    const mexcNetPayoutPerShare = new Decimal(1)
+    const polymarketNetPayoutPerShare = new Decimal(1)
+    return new Decimal(mexcFill.quantity)
+      .mul(mexcNetPayoutPerShare)
+      .div(polymarketNetPayoutPerShare)
+      .toDecimalPlaces(6, Decimal.ROUND_FLOOR)
   }
 
   private calculateRecoveryMaximumPrice(
@@ -1136,14 +1170,17 @@ export class AppController {
     const mexc = session.mexcFill && !current.mexc.entryFill
       ? { ...current.mexc, entryFill: session.mexcFill, openQuantity: session.mexcFill.quantity }
       : current.mexc
+    const polymarketBase = session.polymarketTargetQuantity
+      ? { ...current.polymarket, targetQuantity: session.polymarketTargetQuantity }
+      : current.polymarket
     const polymarket = session.polymarketFill
       ? {
-        ...current.polymarket,
+        ...polymarketBase,
         entryFill: session.polymarketFill,
         entryFills: session.polymarketFills ?? [session.polymarketFill],
         openQuantity: session.polymarketFill.quantity
       }
-      : current.polymarket
+      : polymarketBase
     const status = current.endTime <= Date.now() && !['CLOSED', 'CANCELLED'].includes(current.status)
       ? 'EXPIRED' as const
       : session.state === 'HEDGED'

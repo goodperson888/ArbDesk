@@ -30,7 +30,7 @@ describe('MEXC fill parser', () => {
     })
     expect(fill).toEqual({
       venue: 'MEXC', direction: 'UP', quantity: '5.05', averagePrice: '0.99',
-      orderId: '717334792135258112X1', filledAt: 1786808178000
+      orderId: '717334792135258112X1', filledAt: 1786808178000, verificationSource: 'PLATFORM_READBACK'
     })
   })
 

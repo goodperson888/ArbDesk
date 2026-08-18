@@ -265,15 +265,33 @@ td small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px
 .execution-close svg { width: 14px; }
 
 .modal-backdrop, .drawer-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 20px; background: rgba(1,4,13,.76); backdrop-filter: blur(8px); }
-.modal { width: min(520px, 100%); padding: 20px; border: 1px solid var(--border); border-radius: 15px; background: #091325; box-shadow: 0 24px 80px rgba(0,0,0,.5); }
+.modal { width: min(520px, 100%); max-height: calc(100vh - 40px); padding: 20px; overflow-y: auto; border: 1px solid var(--border); border-radius: 15px; background: #091325; box-shadow: 0 24px 80px rgba(0,0,0,.5); }
 .modal-heading, .drawer-header { justify-content: space-between; }
 .modal-warning { margin: 15px 0; padding: 11px; display: flex; gap: 9px; color: #fde68a; border: 1px solid rgba(245,158,11,.2); border-radius: 9px; background: var(--amber-soft); font-size: 11px; }
 .modal-warning svg { width: 17px; flex: 0 0 auto; }
+.modal-warning strong { color: #fef3c7; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
 .form-grid label { color: var(--text-soft); font-size: 11px; font-weight: 650; }
 .form-grid input { margin-top: 6px; border-radius: 9px; }
 .form-grid .span-two { grid-column: 1 / -1; }
 .modal-actions { margin-top: 18px; display: grid; grid-template-columns: 1fr 1.3fr; gap: 9px; }
+.manual-fill-monitor { min-height: 58px; display: grid; grid-template-columns: 20px 1fr; align-items: center; gap: 10px; padding: 10px 11px; color: #bbf7d0; border: 1px solid rgba(34,197,94,.22); border-radius: 9px; background: rgba(34,197,94,.06); }
+.manual-fill-monitor > svg { width: 18px; }
+.manual-fill-monitor div { min-width: 0; display: flex; flex-direction: column; }
+.manual-fill-monitor strong { font-size: 11px; }
+.manual-fill-monitor small { margin-top: 3px; color: var(--text-soft); font-size: 9px; line-height: 1.45; }
+.manual-fill-monitor.warning { color: #fde68a; border-color: rgba(245,158,11,.22); background: rgba(245,158,11,.06); }
+.manual-fill-override { margin-top: 12px; border: 1px solid rgba(245,158,11,.2); border-radius: 9px; background: rgba(245,158,11,.04); }
+.manual-fill-override > summary { min-height: 44px; display: flex; align-items: center; gap: 8px; padding: 0 11px; color: #fde68a; cursor: pointer; list-style: none; font-size: 10px; font-weight: 750; }
+.manual-fill-override > summary::-webkit-details-marker { display: none; }
+.manual-fill-override > summary svg { width: 15px; }
+.manual-fill-override > summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.manual-fill-override-body { padding: 0 11px 11px; border-top: 1px solid rgba(245,158,11,.12); }
+.manual-fill-override-body > p { margin: 10px 0; color: #fde68a; font-size: 9px; line-height: 1.55; }
+.manual-fill-acknowledgement { min-height: 44px; margin-top: 10px; display: grid; grid-template-columns: 18px 1fr; align-items: center; gap: 8px; color: var(--text-soft); font-size: 9px; line-height: 1.45; }
+.manual-fill-acknowledgement input { width: 16px; height: 16px; accent-color: var(--amber); }
+.manual-fill-confirm { width: 100%; margin-top: 9px; }
+.manual-fill-cancel { margin-top: 12px; }
 .compact-button { min-height: 42px; margin: 0; }
 .history-modal { width: min(1120px, calc(100vw - 32px)); max-height: calc(100vh - 32px); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: 15px; background: #091325; box-shadow: 0 24px 80px rgba(0,0,0,.5); }
 .history-heading { flex: 0 0 auto; padding: 14px 16px; border-bottom: 1px solid var(--border-soft); }
@@ -292,6 +310,8 @@ td small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px
 .history-legs span, .history-legs small { color: var(--muted); font-size: 9px; }
 .history-legs strong { margin: 2px 0; color: var(--text-soft); font-size: 11px; font-variant-numeric: tabular-nums; }
 .history-order-id { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fill-verification { color: #86efac !important; }
+.fill-verification.manual { color: #fde68a !important; }
 .history-expired-note { display: flex; align-items: flex-start; gap: 6px; margin: 8px 0 0; padding: 7px 8px; color: #cbd5e1; border: 1px solid rgba(148,163,184,.18); border-radius: 7px; background: rgba(148,163,184,.06); font-size: 9px; line-height: 1.45; }
 .history-expired-note svg { width: 13px; height: 13px; flex: 0 0 auto; }
 .history-error { margin: 8px 0 0; color: #fca5a5; font-size: 9px; }

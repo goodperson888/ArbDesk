@@ -46,7 +46,8 @@ export function parseMexcFill(rows: MexcFillLogRow[], match: MexcFillMatch): Fil
       quantity: String(payload.quantity),
       averagePrice: String(payload.price),
       orderId: row.tn,
-      filledAt: Number(row.tt) || Date.now()
+      filledAt: Number(row.tt) || Date.now(),
+      verificationSource: 'PLATFORM_READBACK'
     }
   }
   return undefined

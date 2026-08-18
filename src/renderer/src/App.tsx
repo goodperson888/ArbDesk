@@ -106,6 +106,13 @@ function entryOrderIds(order: ArbitrageOrderRecord): { mexc?: string; polymarket
   }
 }
 
+function fillVerificationLabel(fill: ArbitrageOrderRecord['mexc']['entryFill']): string {
+  if (fill?.verificationSource === 'PLATFORM_READBACK') return '平台成交回读'
+  if (fill?.verificationSource === 'MANUAL_ENTRY' || fill?.orderId === 'manual-confirm') return '人工强制录入 · 未经平台回读'
+  if (fill?.verificationSource === 'SIMULATED' || fill?.orderId.startsWith('sim-')) return '模拟成交'
+  return '历史来源未记录'
+}
+
 function secondsRemaining(endTime: number, now: number): string {
   const total = Math.max(0, Math.floor((endTime - now) / 1000))
   const minutes = Math.floor(total / 60)
@@ -371,6 +378,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [fillQuantity, setFillQuantity] = useState('')
   const [fillPrice, setFillPrice] = useState('')
   const [fillOrderId, setFillOrderId] = useState('')
+  const [manualFillAcknowledged, setManualFillAcknowledged] = useState(false)
   const [hubstudioCode, setHubstudioCode] = useState('')
   const [polymarketProxyUrl, setPolymarketProxyUrl] = useState('')
   const [polymarketCredentials, setPolymarketCredentials] = useState<PolymarketCredentialSummary>()
@@ -631,10 +639,12 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   }, [canExecute, now, selected?.id, snapshot?.settings.opportunitySoundCooldownSeconds, snapshot?.settings.opportunitySoundEnabled, snapshot?.settings.opportunitySoundVolume])
 
   useEffect(() => {
-    if (!selected || snapshot?.activeSession?.opportunityId !== selected.id) return
-    setFillQuantity(snapshot.activeSession.requestedQuantity)
-    setFillPrice(selected.mexcPrice)
-  }, [selected, snapshot?.activeSession])
+    if (!snapshot?.activeSession?.id) return
+    setFillQuantity('')
+    setFillPrice('')
+    setFillOrderId('')
+    setManualFillAcknowledged(false)
+  }, [snapshot?.activeSession?.id])
 
   async function run<T>(action: () => Promise<T>, success?: string): Promise<T | undefined> {
     setBusy(true)
@@ -676,8 +686,13 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
 
   async function confirmFill(): Promise<void> {
     await run(
-      () => window.arbApp.confirmMexcFill({ quantity: fillQuantity, averagePrice: fillPrice, orderId: fillOrderId || 'manual-confirm' }),
-      '已按MEXC实际成交量发起对冲'
+      () => window.arbApp.confirmMexcFill({
+        quantity: fillQuantity,
+        averagePrice: fillPrice,
+        orderId: fillOrderId,
+        manualAcknowledged: manualFillAcknowledged
+      }),
+      '已按人工核对的MEXC成交量发起对冲'
     )
   }
 
@@ -1079,6 +1094,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const needsMexcConfirmation = active &&
     ['MEXC_SUBMITTED', 'MEXC_SUBMITTING'].includes(active.state) &&
     !automaticLiveFlow
+  const mexcReadbackError = active?.error?.startsWith('MEXC成交回读') ? active.error : undefined
 
   return (
     <div className="app-shell">
@@ -1246,17 +1262,26 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       {needsMexcConfirmation && (
         <div className="modal-backdrop" role="presentation">
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="fill-title">
-            <div className="modal-heading"><div><span className="eyebrow">HUMAN CHECKPOINT</span><h2 id="fill-title">确认MEXC实际成交</h2></div></div>
-            <div className="modal-warning"><ShieldAlert aria-hidden="true" /><span>请以MEXC页面实际成交记录为准，不要填写原始委托数量。</span></div>
-            <div className="form-grid">
-              <label>实际成交份额<input value={fillQuantity} onChange={(event) => setFillQuantity(event.target.value)} inputMode="decimal" /></label>
-              <label>成交均价<input value={fillPrice} onChange={(event) => setFillPrice(event.target.value)} inputMode="decimal" /></label>
-              <label className="span-two">MEXC订单号<input value={fillOrderId} onChange={(event) => setFillOrderId(event.target.value)} placeholder="可暂填 manual-confirm" /></label>
+            <div className="modal-heading"><div><span className="eyebrow">MEXC FILL READBACK</span><h2 id="fill-title">等待MEXC真实成交</h2></div></div>
+            <div className="modal-warning"><ShieldAlert aria-hidden="true" /><span>软件在人工监督模式下<strong>不会点击MEXC买入</strong>。请先确认MEXC页面的周期、方向和金额，再手动点击买入；软件读取到平台成交记录后会自动开始Polymarket对冲。</span></div>
+            <div className={`manual-fill-monitor ${mexcReadbackError ? 'warning' : ''}`} role="status" aria-live="polite">
+              {mexcReadbackError ? <AlertTriangle aria-hidden="true" /> : <LoaderCircle className="spin" aria-hidden="true" />}
+              <div><strong>{mexcReadbackError ? '暂未读取到平台成交' : '正在监听MEXC成交流水'}</strong><small>{mexcReadbackError ?? '只接受本轮市场、方向和开始时间之后的真实成交；不会使用申请数量代替成交数量。'}</small></div>
             </div>
-            <div className="modal-actions">
-              <button className="secondary-button" onClick={() => void run(() => window.arbApp.cancelExecution())}>取消执行</button>
-              <button className="execute-button compact-button" onClick={() => void confirmFill()} disabled={busy || !fillQuantity || !fillPrice}><Check aria-hidden="true" />确认并对冲</button>
-            </div>
+            <details className="manual-fill-override">
+              <summary><AlertTriangle aria-hidden="true" />自动读取失败？使用人工强制录入</summary>
+              <div className="manual-fill-override-body">
+                <p>仅在你已经打开MEXC“成交记录”，逐项核对真实成交后使用。人工数据无法由软件验证，填写错误会直接造成单边持仓。</p>
+                <div className="form-grid">
+                  <label>实际成交份额<input value={fillQuantity} onChange={(event) => setFillQuantity(event.target.value)} inputMode="decimal" autoComplete="off" /></label>
+                  <label>成交均价<input value={fillPrice} onChange={(event) => setFillPrice(event.target.value)} inputMode="decimal" autoComplete="off" /></label>
+                  <label className="span-two">MEXC真实订单号<input value={fillOrderId} onChange={(event) => setFillOrderId(event.target.value)} placeholder="必须填写成交记录中的订单号" autoComplete="off" /></label>
+                </div>
+                <label className="manual-fill-acknowledgement"><input type="checkbox" checked={manualFillAcknowledged} onChange={(event) => setManualFillAcknowledged(event.target.checked)} /><span>我已在MEXC成交记录中核对以上数量、均价和订单号，并理解软件尚未从平台回读验证。</span></label>
+                <button className="danger-confirm-button manual-fill-confirm" onClick={() => void confirmFill()} disabled={busy || !fillQuantity || !fillPrice || !fillOrderId.trim() || !manualFillAcknowledged}><ShieldAlert aria-hidden="true" />按人工成交记录启动对冲</button>
+              </div>
+            </details>
+            <button className="wide-secondary manual-fill-cancel" onClick={() => void run(() => window.arbApp.cancelExecution())} disabled={busy}>我尚未在MEXC下单，取消本次</button>
           </section>
         </div>
       )}
@@ -1652,8 +1677,8 @@ function HistoryModal({
                 </div>
                 {order.status === 'EXPIRED' && <p className="history-expired-note"><Info aria-hidden="true" />市场已结束；下方数量是结算前的本地执行记录，不代表当前平台仍有持仓。</p>}
                 <div className="history-legs">
-                  <div><span className="history-venue">MEXC <Direction direction={order.mexc.direction} /></span><strong>{order.mexc.entryFill ? `${order.mexc.entryFill.quantity}份 @ ${money(order.mexc.entryFill.averagePrice, 4)}` : '未成交'}</strong>{orderIds.mexc && <small className="history-order-id" title={orderIds.mexc}>订单号 {orderIds.mexc}</small>}{order.mexc.closeFills.at(-1) && <small>最近卖出 @ {money(order.mexc.closeFills.at(-1)!.averagePrice, 4)}</small>}<small>记录剩余 {money(order.mexc.openQuantity, 2)}份</small></div>
-                  <div><span className="history-venue">Polymarket <Direction direction={order.polymarket.direction} /></span><strong>{order.polymarket.entryFill ? `${order.polymarket.entryFill.quantity}份 @ ${money(order.polymarket.entryFill.averagePrice, 4)}` : '未成交'}</strong>{orderIds.polymarket && <small className="history-order-id" title={orderIds.polymarket}>订单号 {orderIds.polymarket}</small>}{order.polymarket.closeFills.at(-1) && <small>最近卖出 @ {money(order.polymarket.closeFills.at(-1)!.averagePrice, 4)}</small>}<small>记录剩余 {money(order.polymarket.openQuantity, 2)}份</small></div>
+                  <div><span className="history-venue">MEXC <Direction direction={order.mexc.direction} /></span><strong>{order.mexc.entryFill ? `${order.mexc.entryFill.quantity}份 @ ${money(order.mexc.entryFill.averagePrice, 4)}` : '未成交'}</strong>{order.mexc.entryFill && <small className={`fill-verification ${order.mexc.entryFill.verificationSource === 'MANUAL_ENTRY' || order.mexc.entryFill.orderId === 'manual-confirm' ? 'manual' : ''}`}>{fillVerificationLabel(order.mexc.entryFill)}</small>}{orderIds.mexc && <small className="history-order-id" title={orderIds.mexc}>订单号 {orderIds.mexc}</small>}{order.mexc.closeFills.at(-1) && <small>最近卖出 @ {money(order.mexc.closeFills.at(-1)!.averagePrice, 4)}</small>}<small>记录剩余 {money(order.mexc.openQuantity, 2)}份</small></div>
+                  <div><span className="history-venue">Polymarket <Direction direction={order.polymarket.direction} /></span><strong>{order.polymarket.entryFill ? `${order.polymarket.entryFill.quantity}份 @ ${money(order.polymarket.entryFill.averagePrice, 4)}` : '未成交'}</strong><small>目标对冲 {money(order.polymarket.targetQuantity ?? order.mexc.entryFill?.quantity ?? '0', 2)}份</small>{orderIds.polymarket && <small className="history-order-id" title={orderIds.polymarket}>订单号 {orderIds.polymarket}</small>}{order.polymarket.closeFills.at(-1) && <small>最近卖出 @ {money(order.polymarket.closeFills.at(-1)!.averagePrice, 4)}</small>}<small>记录剩余 {money(order.polymarket.openQuantity, 2)}份</small></div>
                   <div><span>预计本金 / 利润</span><strong>${money(order.expectedCapital)} / {Number(order.expectedProfit) >= 0 ? '+' : ''}${money(order.expectedProfit)}</strong><small>{order.mode === 'SIMULATION' ? '模拟' : '实盘记录'}</small></div>
                 </div>
                 {order.closeOperation?.error && <p className={`history-error ${order.status === 'EXPIRED' ? 'archived' : ''}`}>{order.status === 'EXPIRED' ? '历史执行备注：' : ''}{order.closeOperation.error}</p>}
@@ -1743,12 +1768,14 @@ function ExecutionBar({
   const done = state === 'HEDGED' || state === 'CLOSED'
   const mexcQuantity = Number(session.mexcFill?.quantity ?? 0)
   const polymarketQuantity = Number(session.polymarketFill?.quantity ?? 0)
-  const remainingQuantity = Math.max(0, Number(session.remainingHedgeQuantity ?? mexcQuantity - polymarketQuantity))
+  const targetQuantity = Number(session.polymarketTargetQuantity ?? mexcQuantity)
+  const remainingQuantity = Math.max(0, Number(session.remainingHedgeQuantity ?? targetQuantity - polymarketQuantity))
+  const excessQuantity = Math.max(0, Number(session.excessHedgeQuantity ?? polymarketQuantity - targetQuantity))
   const timingSummary = executionTimingSummary(session)
   return <div className={`execution-bar ${danger ? 'danger' : done ? 'done' : ''}`}>
     <div className="execution-pulse">{done ? <Check /> : danger ? <AlertTriangle /> : <LoaderCircle className="spin" />}</div>
     <div className="execution-summary">
-      <span>申请{session.requestedQuantity} · MEXC {mexcQuantity.toFixed(2)} · Poly {polymarketQuantity.toFixed(2)} · 未对冲 {remainingQuantity.toFixed(2)}份</span>
+      <span>申请{session.requestedQuantity} · MEXC {mexcQuantity.toFixed(2)} · Poly目标 {targetQuantity.toFixed(2)} · 已成交 {polymarketQuantity.toFixed(2)} · {excessQuantity > 0 ? `超额 ${excessQuantity.toFixed(2)}` : `未对冲 ${remainingQuantity.toFixed(2)}`}份</span>
       <strong>{STATE_LABELS[state]}</strong>
       {timingSummary && <small className="execution-timings" title="本次执行各阶段耗时">{timingSummary}</small>}
       {error && <small className="execution-error" title={error}>{error}</small>}

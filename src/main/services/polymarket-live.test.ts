@@ -231,7 +231,7 @@ describe('PolymarketLiveBroker', () => {
     expect(result.message).toContain('抵押资产59.12')
   })
 
-  it('submits an exact-share FAK limit that accepts prices up to the hedge cap', async () => {
+  it('submits the target shares only at the current best ask instead of spending the full hedge cap', async () => {
     const postOrder = vi.fn(async (_signed, orderType) => {
       expect(orderType).toBe(OrderType.FAK)
       return {
@@ -254,7 +254,7 @@ describe('PolymarketLiveBroker', () => {
       createOrder: vi.fn(async (order) => {
         expect(order).toEqual(expect.objectContaining({
           size: 10,
-          price: 0.57,
+          price: 0.55,
         }))
         return { version: 2 }
       }),
@@ -298,9 +298,34 @@ describe('PolymarketLiveBroker', () => {
 
     const fill = await broker.hedge({ tokenId: 'token', direction: 'UP', quantity: '10', maximumPrice: '0.94' })
 
-    expect(createOrder).toHaveBeenCalledWith(expect.objectContaining({ size: 10, price: 0.94 }), expect.anything())
+    expect(createOrder).toHaveBeenCalledWith(expect.objectContaining({ size: 10, price: 0.55 }), expect.anything())
     expect(fill.quantity).toBe('5.265957')
     expect(Number(fill.quantity)).toBeLessThan(10)
+  })
+
+  it('limits each FAK attempt to the shares available at the current best price level', async () => {
+    const createOrder = vi.fn(async () => ({ version: 2 }))
+    const client = {
+      getOrderBook: vi.fn(async () => ({
+        ...orderBook(),
+        asks: [{ price: '0.55', size: '6' }, { price: '0.56', size: '100' }]
+      })),
+      getBalanceAllowance: vi.fn(async () => ({
+        balance: '100000000',
+        allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
+      })),
+      createOrder,
+      postOrder: vi.fn(async () => ({
+        success: true, errorMsg: '', orderID: 'best-level-only', status: 'matched',
+        takingAmount: '6', makingAmount: '3.3'
+      }))
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    const fill = await broker.hedge({ tokenId: 'token', direction: 'DOWN', quantity: '10', maximumPrice: '0.57' })
+
+    expect(createOrder).toHaveBeenCalledWith(expect.objectContaining({ size: 6, price: 0.55 }), expect.anything())
+    expect(fill).toMatchObject({ quantity: '6', averagePrice: '0.55', verificationSource: 'PLATFORM_READBACK' })
   })
 
   it('includes the V2 curve fee in the collateral balance check', async () => {
@@ -308,7 +333,7 @@ describe('PolymarketLiveBroker', () => {
     const client = {
       getOrderBook: vi.fn(async () => orderBook()),
       getBalanceAllowance: vi.fn(async () => ({
-        balance: '5750000',
+        balance: '5600000',
         allowances: {
           '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000'
         }
@@ -375,7 +400,7 @@ describe('PolymarketLiveBroker', () => {
     const createMarketOrder = vi.fn()
     const postOrder = vi.fn()
     const client = {
-      getOrderBook: vi.fn(async () => orderBook()),
+      getOrderBook: vi.fn(async () => ({ ...orderBook(), asks: [{ price: '0.04', size: '100' }] })),
       getBalanceAllowance: vi.fn(async () => ({
         balance: '100000000',
         allowances: { exchange: '1000000000' }

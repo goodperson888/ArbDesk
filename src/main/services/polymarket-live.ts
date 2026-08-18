@@ -273,17 +273,30 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     if (quantity.lt(minimumSize)) {
       throw new Error(`Polymarket当前最小下单量为${minimumSize.toString()}份，MEXC实际成交仅${quantity.toString()}份；未提交第二腿`)
     }
-    // Submit an exact-share marketable limit order. A market BUY's amount is USDC,
-    // which can overbuy shares at better prices and can make FOK fail while enough
-    // target-share liquidity exists. FAK takes all immediately available shares at
-    // or below maximumPrice and cancels only the unmatched remainder.
-    const spendAmount = maximumPrice.mul(quantity)
+    const executableAsks = book.asks
+      .map((level) => ({ price: new Decimal(level.price || 0), size: new Decimal(level.size || 0) }))
+      .filter((level) => level.price.gt(0) && level.price.lte(maximumPrice) && level.size.gt(0))
+      .sort((left, right) => left.price.comparedTo(right.price))
+    const bestLevel = executableAsks[0]
+    if (!bestLevel) {
+      throw new Error(`Polymarket当前没有价格不高于${maximumPrice.toString()}的可成交卖盘`)
+    }
+    // A BUY signed at the recovery price can consume the full collateral budget at
+    // a better price and receive more shares than requested. Submit only against the
+    // current best level, at that level's price, then let the controller recompute the
+    // remaining target before another FAK attempt.
+    const submissionQuantity = Decimal.min(quantity, bestLevel.size).toDecimalPlaces(2, Decimal.ROUND_FLOOR)
+    if (submissionQuantity.lt(minimumSize)) {
+      throw new Error(`Polymarket最优档仅${submissionQuantity.toString()}份，低于当前最小下单量${minimumSize.toString()}份；等待盘口补充后重试`)
+    }
+    const submissionPrice = bestLevel.price
+    const spendAmount = submissionPrice.mul(submissionQuantity)
     if (spendAmount.lt(MIN_MARKETABLE_BUY_AMOUNT)) {
-      throw new Error(`Polymarket可立即成交的BUY至少需要1抵押资产；当前${quantity.toString()}份按最高价${maximumPrice.toString()}仅为${spendAmount.toFixed(2)}。第一腿成交量不足，未提交第二腿`)
+      throw new Error(`Polymarket可立即成交的BUY至少需要1抵押资产；当前最优档${submissionQuantity.toString()}份按${submissionPrice.toString()}仅为${spendAmount.toFixed(2)}。第一腿成交量不足，未提交第二腿`)
     }
     const estimatedFee = this.estimateFeeOnSpend(
       spendAmount,
-      maximumPrice,
+      submissionPrice,
       book,
       new Decimal(order.feeRate ?? 0),
       new Decimal(order.feeExponent ?? 1)
@@ -292,13 +305,14 @@ export class PolymarketLiveBroker implements PolymarketBroker {
 
     const signedOrder = await client.createOrder({
       tokenID: order.tokenId,
-      price: maximumPrice.toNumber(),
-      size: quantity.toNumber(),
+      price: submissionPrice.toNumber(),
+      size: submissionQuantity.toNumber(),
       side: Side.BUY,
     }, {
       tickSize: book.tick_size as TickSize,
       negRisk: book.neg_risk
     })
+    this.orderBookCache.delete(order.tokenId)
     const response = await client.postOrder(signedOrder, OrderType.FAK)
     if (!response.success) throw new Error(`Polymarket FAK失败：${response.errorMsg || response.status || '未知原因'}`)
 
@@ -315,7 +329,8 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       quantity: filledQuantity.toDecimalPlaces(6).toString(),
       averagePrice: spent.div(filledQuantity).toDecimalPlaces(6).toString(),
       orderId: response.orderID,
-      filledAt: Date.now()
+      filledAt: Date.now(),
+      verificationSource: 'PLATFORM_READBACK'
     }
   }
 
@@ -368,7 +383,8 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       quantity: filledQuantity.toDecimalPlaces(6).toString(),
       averagePrice: proceeds.div(filledQuantity).toDecimalPlaces(6).toString(),
       orderId: response.orderID,
-      filledAt: Date.now()
+      filledAt: Date.now(),
+      verificationSource: 'PLATFORM_READBACK'
     }
   }
 
