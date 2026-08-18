@@ -60,12 +60,20 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .license-status.expired, .license-status.clock_error, .license-status.invalid { color: #fecaca; border-color: rgba(239,68,68,.28); background: var(--red-soft); }
 .machine-code-block { margin-top: 24px; padding: 14px; border: 1px solid var(--border); border-radius: 11px; background: rgba(15,23,42,.55); }
 .machine-code-block > label, .license-code-field { color: var(--text-soft); font-size: 11px; font-weight: 700; }
-.machine-code-block > div { margin-top: 7px; display: grid; grid-template-columns: 1fr 40px; align-items: center; gap: 8px; }
+.machine-code-block > div { margin-top: 7px; display: grid; grid-template-columns: 1fr 44px; align-items: center; gap: 8px; }
 .machine-code-block code { min-width: 0; overflow: hidden; color: #bbf7d0; font-size: 13px; font-weight: 750; letter-spacing: .055em; text-overflow: ellipsis; white-space: nowrap; }
-.machine-code-block button { width: 40px; height: 40px; display: grid; place-items: center; color: var(--text-soft); border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
+.machine-code-block button { width: 44px; height: 44px; display: grid; place-items: center; color: var(--text-soft); border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
 .machine-code-block button:hover { color: var(--text); border-color: #475569; }
 .machine-code-block button svg { width: 16px; }
 .machine-code-block small, .license-safety-note { display: block; margin-top: 7px; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.license-help { margin-top: 12px; border: 1px solid var(--border-soft); border-radius: 10px; background: rgba(148,163,184,.04); }
+.license-help summary { min-height: 44px; display: flex; align-items: center; gap: 7px; padding: 0 11px; color: var(--text-soft); cursor: pointer; list-style: none; font-size: 10px; font-weight: 750; }
+.license-help summary::-webkit-details-marker { display: none; }
+.license-help summary svg { width: 15px; color: var(--blue); }
+.license-help summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.license-help ol { margin: 0; padding: 2px 28px 4px 34px; color: var(--text-soft); font-size: 10px; line-height: 1.65; }
+.license-help p { margin: 5px 11px 11px; color: var(--muted); font-size: 9px; line-height: 1.55; }
+.license-help code { color: #bbf7d0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .license-code-field { display: block; margin-top: 18px; }
 .license-code-field textarea { width: 100%; min-height: 94px; margin-top: 7px; resize: vertical; padding: 11px 12px; color: var(--text); border: 1px solid var(--border); border-radius: 10px; background: rgba(2,6,23,.72); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.5; }
 .license-code-field textarea:focus { border-color: var(--green); }
@@ -330,6 +338,8 @@ td small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px
 .settings-module-body { padding: 13px 12px 14px; }
 .settings-module-body > p { margin: 7px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .settings-module-body > .settings-field { margin-top: 12px; }
+.license-settings-module .machine-code-block.compact { margin-top: 0; padding: 11px; }
+.license-renewal-steps { margin: 10px 0 0; padding-left: 22px; color: var(--text-soft); font-size: 10px; line-height: 1.65; }
 .diagnostics-details .browser-status-detail:first-child { margin-top: 0; }
 .segmented-control { display: grid !important; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 10px; padding: 4px; border-radius: 10px; background: rgba(2,6,23,.6); }
 .segmented-control button { min-height: 40px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; color: var(--muted); border: 0; border-radius: 7px; background: transparent; font-weight: 700; }

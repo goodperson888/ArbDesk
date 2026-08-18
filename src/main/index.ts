@@ -1,6 +1,6 @@
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { app, BrowserWindow, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, powerMonitor, shell } from 'electron'
 import { AppController } from './app-controller'
 import { EventStore } from './services/event-store'
 import { MexcBrowserManager } from './services/mexc-browser'
@@ -88,13 +88,53 @@ app.whenReady().then(async () => {
     return { ...summary, emergencyOnly: summary.status !== 'ACTIVE' && controller.hasRecoverableExposure() }
   }
   const requireActiveLicense = async <T>(operation: () => Promise<T> | T): Promise<T> => {
-    await licenseService.requireActive()
+    try {
+      await licenseService.requireActive()
+    } catch (error) {
+      await refreshLicenseState(true)
+      throw error
+    }
     return await operation()
   }
   const requireActiveOrEmergency = async <T>(operation: () => Promise<T> | T): Promise<T> => {
     const summary = await licenseService.getSummary()
+    if (summary.status !== 'ACTIVE') await refreshLicenseState(true)
     if (summary.status !== 'ACTIVE' && !controller.hasRecoverableExposure()) throw new Error(`授权不可用：${summary.message}`)
     return await operation()
+  }
+
+  let previousLicenseStatus = (await licenseAccessSummary()).status
+  let licenseExpiryTimer: NodeJS.Timeout | undefined
+  let checkingLicense = false
+  const scheduleLicenseExpiryCheck = (summary: LicenseSummary): void => {
+    if (licenseExpiryTimer) clearTimeout(licenseExpiryTimer)
+    licenseExpiryTimer = undefined
+    if (summary.status !== 'ACTIVE' || !summary.validUntil) return
+    // Node timers cannot safely span arbitrary 30/90-day licenses. Wake at most
+    // once per day, then schedule the exact remaining interval on later passes.
+    const delay = Math.max(1_000, Math.min(summary.validUntil - Date.now() + 250, 24 * 60 * 60_000))
+    licenseExpiryTimer = setTimeout(() => void refreshLicenseState(), delay)
+    licenseExpiryTimer.unref()
+  }
+  const refreshLicenseState = async (forceBroadcast = false): Promise<LicenseSummary | undefined> => {
+    if (checkingLicense) return undefined
+    checkingLicense = true
+    try {
+      const summary = await licenseAccessSummary()
+      controller.setLicenseActive(summary.status === 'ACTIVE')
+      if (summary.status !== 'ACTIVE') await controller.disarmAutoOpen('授权已到期或失效，自动开单已停用')
+      if (forceBroadcast || summary.status !== previousLicenseStatus) {
+        previousLicenseStatus = summary.status
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('license:state', summary)
+      }
+      scheduleLicenseExpiryCheck(summary)
+      return summary
+    } catch (error) {
+      console.error('license-state-check-failed', error)
+      return undefined
+    } finally {
+      checkingLicense = false
+    }
   }
 
   controller.setBroadcaster((snapshot) => {
@@ -105,13 +145,19 @@ app.whenReady().then(async () => {
   ipcMain.handle('license:activate', async (_event, activationCode) => {
     const activated = await licenseService.activate(String(activationCode ?? ''))
     controller.setLicenseActive(activated.status === 'ACTIVE')
-    return await licenseAccessSummary()
+    const summary = await licenseAccessSummary()
+    previousLicenseStatus = summary.status
+    scheduleLicenseExpiryCheck(summary)
+    return summary
   })
   ipcMain.handle('license:deactivate', async () => {
     await controller.disarmAutoOpen('授权已退出，自动开单已停用')
     controller.setLicenseActive(false)
     await licenseService.deactivate()
-    return await licenseAccessSummary()
+    const summary = await licenseAccessSummary()
+    previousLicenseStatus = summary.status
+    scheduleLicenseExpiryCheck(summary)
+    return summary
   })
   ipcMain.handle('license:emergency-snapshot', () => controller.getEmergencyAccessSnapshot())
   ipcMain.handle('app:get-snapshot', () => requireActiveLicense(() => controller.getSnapshot()))
@@ -138,17 +184,13 @@ app.whenReady().then(async () => {
   ipcMain.handle('polymarket:validate-identity', (_event, tokenId) => requireActiveLicense(() => polymarketLive.validateIdentity(tokenId)))
 
   await createWindow()
-  let previousLicenseStatus = (await licenseAccessSummary()).status
-  const licenseTimer = setInterval(async () => {
-    const summary = await licenseAccessSummary()
-    controller.setLicenseActive(summary.status === 'ACTIVE')
-    if (summary.status !== 'ACTIVE') await controller.disarmAutoOpen('授权已到期或失效，自动开单已停用')
-    if (summary.status !== previousLicenseStatus || summary.status !== 'ACTIVE') {
-      previousLicenseStatus = summary.status
-      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('license:state', summary)
-    }
-  }, 15_000)
-  licenseTimer.unref()
+  await refreshLicenseState()
+  // Low-frequency fallback only. Normal checks happen at startup, exact expiry,
+  // app resume/focus, and before every protected IPC operation.
+  const licenseFallbackTimer = setInterval(() => void refreshLicenseState(), 5 * 60_000)
+  licenseFallbackTimer.unref()
+  powerMonitor.on('resume', () => void refreshLicenseState(true))
+  app.on('browser-window-focus', () => void refreshLicenseState())
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) void createWindow()
   })

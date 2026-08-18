@@ -253,6 +253,16 @@ function LicenseGate({ summary, onActivated }: { summary: LicenseSummary; onActi
         <div><code>{summary.machineCode}</code><button onClick={() => void copyMachineCode()} aria-label="复制机器码" title="复制机器码"><Copy aria-hidden="true" /></button></div>
         <small>把机器码发给管理员，由管理员按授权天数生成激活码。</small>
       </div>
+      <details className="license-help">
+        <summary><CircleHelp aria-hidden="true" />客户如何获取和使用机器码</summary>
+        <ol>
+          <li>打开 ArbDesk，未授权时会直接停留在当前授权页面。</li>
+          <li>在“本机机器码”一栏点击右侧复制按钮。</li>
+          <li>把以 <code>ARB-</code> 开头的完整机器码发给授权管理员，不要发送账户密码或交易私钥。</li>
+          <li>收到以 <code>ARB1.</code> 开头的授权码后，粘贴到下方并点击“验证并进入软件”。</li>
+        </ol>
+        <p>已经进入软件时，可在“右上角设置 → 账户与环境 → 软件授权”再次复制机器码，用于续期。</p>
+      </details>
       <label className="license-code-field" htmlFor="license-code">授权码
         <textarea id="license-code" value={activationCode} onChange={(event) => setActivationCode(event.target.value)} placeholder="ARB1..." autoComplete="off" spellCheck={false} />
       </label>
@@ -330,12 +340,12 @@ function App(): JSX.Element {
     return window.arbApp.onLicenseState(setLicense)
   }, [])
   if (!license) return <div className="loading-screen"><LoaderCircle className="spin" /><span>正在验证软件授权</span></div>
-  if (license.status === 'ACTIVE') return <TradingApp />
+  if (license.status === 'ACTIVE') return <TradingApp license={license} />
   if (license.emergencyOnly) return <EmergencyLicensePage summary={license} onStateChange={setLicense} />
   return <LicenseGate summary={license} onActivated={setLicense} />
 }
 
-function TradingApp(): JSX.Element {
+function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [snapshot, setSnapshot] = useState<AppSnapshot>()
   const [selectedId, setSelectedId] = useState<string>()
   const [quantity, setQuantity] = useState('50')
@@ -629,6 +639,15 @@ function TradingApp(): JSX.Element {
       return undefined
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function copyLicenseMachineCode(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(license.machineCode)
+      setMessage('机器码已复制，可发送给授权管理员续期')
+    } catch {
+      setMessage(`请手动复制机器码：${license.machineCode}`)
     }
   }
 
@@ -1352,6 +1371,22 @@ function TradingApp(): JSX.Element {
             </section>}
             {settingsView === 'ACCOUNT' && <>
             <div className="settings-module-intro">这些项目通常只在首次安装、更换环境或连接异常时调整。</div>
+            <details className="settings-module license-settings-module">
+              <summary><div><strong>软件授权</strong><span className="ready-text">已授权 · 剩余{formatLicenseRemaining(license.validUntil ? Math.max(0, Math.floor((license.validUntil - now) / 1_000)) : license.remainingSeconds)}</span><small>查看机器码、到期时间和续期步骤</small></div><ChevronRight /></summary>
+              <div className="settings-module-body">
+                <div className="machine-code-block compact">
+                  <label>本机机器码</label>
+                  <div><code>{license.machineCode}</code><button onClick={() => void copyLicenseMachineCode()} aria-label="复制授权机器码" title="复制机器码"><Copy aria-hidden="true" /></button></div>
+                  <small>续期时把完整机器码发给授权管理员。机器码不是密码，可以发送；账户密码、助记词和交易私钥不能发送。</small>
+                </div>
+                <div className="browser-status-detail"><span>有效期</span><p>{license.validUntil ? new Date(license.validUntil).toLocaleString('zh-CN') : '未提供到期时间'} · 当前客户 {license.customer ?? '未命名'}</p></div>
+                <ol className="license-renewal-steps">
+                  <li>点击上方复制按钮。</li>
+                  <li>把机器码发给管理员并说明需要续期多久。</li>
+                  <li>到期后软件会回到授权页，再粘贴新授权码即可。</li>
+                </ol>
+              </div>
+            </details>
             <details className="settings-module">
               <summary><div><strong>MEXC环境</strong><span className={mexcStatus?.open ? 'ready-text' : ''}>{mexcStatus?.open ? (mexcStatus.authenticated ? '已连接 · 已登录' : '已连接 · 待登录') : '尚未打开'}</span><small>浏览器模式、Hubstudio环境和账户读取</small></div><ChevronRight /></summary>
               <div className="settings-module-body">
