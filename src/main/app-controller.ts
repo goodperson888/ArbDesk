@@ -1644,6 +1644,15 @@ export class AppController {
         }))
       }
     }
+    // 一侧盘口瞬时缺失（新开盘Polymarket未就绪、深度暂时为空）会让整条机会
+    // 从本轮重建结果中消失，左侧列表跟着闪断。只要本轮还没到期，就沿用
+    // 上一条记录并标记stale，等下一次成功重建自然恢复。
+    const freshIds = new Set(opportunities.map((opportunity) => opportunity.id))
+    for (const previous of this.opportunities) {
+      if (freshIds.has(previous.id)) continue
+      if (previous.endTime <= now) continue
+      opportunities.push({ ...previous, stale: true })
+    }
     return opportunities.sort((left, right) =>
       left.durationMinutes - right.durationMinutes ||
       Number(left.mexcDirection === 'DOWN') - Number(right.mexcDirection === 'DOWN')
