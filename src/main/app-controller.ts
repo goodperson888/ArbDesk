@@ -1496,7 +1496,8 @@ export class AppController {
         : 'MEXC 当前没有可交易的 BTC 5m/15m 盘口'
     } catch (error) {
       this.mexcDataMessage = `MEXC 读取失败：${error instanceof Error ? error.message : String(error)}`
-      this.opportunities = []
+      // 瞬时读取失败不清空列表：清空会导致左侧列表闪烁消失，
+      // 保留上一次结果并让stale标记自然生效即可。
       const snapshot = this.getSnapshot()
       this.broadcast(snapshot)
       return snapshot
@@ -1518,7 +1519,7 @@ export class AppController {
       this.evaluateAutoOpen()
     } catch (error) {
       this.polymarketDataMessage = this.polymarketData.getStatus().message
-      this.opportunities = []
+      // 同上：Polymarket瞬时失败保留上一次列表，避免整列闪烁。
     }
     const snapshot = this.getSnapshot()
     this.broadcast(snapshot)

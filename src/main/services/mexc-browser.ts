@@ -1870,6 +1870,8 @@ export class MexcBrowserManager {
     this.hubstudioMonitor = setInterval(() => {
       if (!this.hubstudioPage || this.hubstudioPage.isClosed()) return
       void this.followHubstudioLiveMarket().catch(() => undefined)
+      void this.prunePredictionTrackerCookies().catch(() => undefined)
+      void this.recoverStuckErrorPages().catch(() => undefined)
       if (Date.now() - this.lastHubstudioAccountRefreshAt < 15_000 || this.hubstudioAccountRefreshing) return
       this.hubstudioAccountRefreshing = true
       void this.refreshAccountBalanceState()
@@ -1879,6 +1881,52 @@ export class MexcBrowserManager {
         })
         .catch(() => undefined)
     }, 5_000)
+  }
+
+  // 长时间运行的环境Cookie会膨胀，MEXC(nginx)可能返回“400 Request Header Or
+  // Cookie Too Large”错误页；预热下单页一旦卡在错误页会被一直复用导致下单失败。
+  // 周期体检：发现错误页自动重载，1分钟冷却避免死循环。
+  private lastErrorPageCheckAt = 0
+  private readonly errorPageReloadAt = new Map<Page, number>()
+
+  // MEXC预测页的埋点SDK会按访问路径写Cookie（_TDID_CK等），每切一个新盘累积一份，
+  // 攒到数百个后请求头超过nginx限制触发400。周期清理重复的追踪Cookie，不动登录态。
+  private lastTrackerCookiePruneAt = 0
+
+  private async prunePredictionTrackerCookies(): Promise<void> {
+    const now = Date.now()
+    if (now - this.lastTrackerCookiePruneAt < 60_000) return
+    this.lastTrackerCookiePruneAt = now
+    const context = this.hubstudioBrowser?.contexts()[0]
+    if (!context) return
+    const cookies = await context.cookies(['https://prediction.mexc.com']).catch(() => [])
+    const counts = new Map<string, number>()
+    for (const cookie of cookies) counts.set(cookie.name, (counts.get(cookie.name) ?? 0) + 1)
+    const junkNames = [...counts.entries()]
+      .filter(([name, count]) => count > 3 && name !== 'NEXT_LOCALE')
+      .map(([name]) => name)
+    if (junkNames.length === 0) return
+    for (const name of junkNames) {
+      await context.clearCookies({ name, domain: 'prediction.mexc.com' }).catch(() => undefined)
+    }
+    console.error(`[MEXC] 清理重复追踪Cookie：${junkNames.map((name) => `${name}×${counts.get(name)}`).join('、')}`)
+  }
+
+  private async recoverStuckErrorPages(): Promise<void> {
+    const now = Date.now()
+    if (now - this.lastErrorPageCheckAt < 15_000) return
+    this.lastErrorPageCheckAt = now
+    const pages = [this.hubstudioPage, ...this.hubstudioOrderPages.values()]
+    for (const page of pages) {
+      if (!page || page.isClosed()) continue
+      const title = await page.title().catch(() => '')
+      if (!/^\s*(400|401|403|502|504)\b|Request Header Or Cookie/i.test(title)) continue
+      const lastReload = this.errorPageReloadAt.get(page) ?? 0
+      if (now - lastReload < 60_000) continue
+      this.errorPageReloadAt.set(page, now)
+      console.error(`[MEXC] 页面卡在错误页（${title.slice(0, 50)}），自动重载：${page.url()}`)
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => undefined)
+    }
   }
 
   private async refreshAccountBalanceState(): Promise<MexcAccountState> {
