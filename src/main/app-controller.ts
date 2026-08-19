@@ -606,6 +606,12 @@ export class AppController {
     if (!this.settings.unprotectedExecutionEnabled && this.settings.preHedgeRatioPct <= 0) return
     const plannedQuantity = new Decimal(this.activeSession.requestedQuantity)
     const minimumSize = new Decimal(opportunity.polymarketMinOrderSize || '1').toDecimalPlaces(2, Decimal.ROUND_CEIL)
+    // Polymarket BUY除最小份数外还要求抵押金额至少1 USDT：按计划对冲价折算成
+    // 最小份数并与平台最小单量取大，预对冲份额低于它时整单必被拒，直接跳过。
+    const hedgePrice = new Decimal(this.activeExecutionPlan.polymarketAveragePrice || '0')
+    const minimumSubmission = hedgePrice.gt(0)
+      ? Decimal.max(minimumSize, POLYMARKET_MIN_BUY_AMOUNT.div(hedgePrice).toDecimalPlaces(2, Decimal.ROUND_CEIL))
+      : minimumSize
     const ratioPercent = this.settings.unprotectedExecutionEnabled
       ? 100
       : Math.min(Math.max(this.settings.preHedgeRatioPct, 0), 100)
@@ -615,6 +621,13 @@ export class AppController {
       plannedQuantity
     )
     if (portion.lt(minimumSize) || portion.lte(0)) return
+    if (portion.lt(minimumSubmission)) {
+      void this.recordActiveExecutionEvent(
+        'MEXC_SUBMITTED',
+        `预对冲跳过：按${ratioPercent}%应买${portion.toFixed(2)}份，低于Polymarket最小可提交量${minimumSubmission.toFixed(2)}份（BUY金额至少1），等待MEXC成交回报后全量对冲`
+      )
+      return
+    }
     const plannedFill: Fill = {
       venue: 'MEXC',
       direction: opportunity.mexcDirection,

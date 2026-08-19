@@ -258,14 +258,16 @@ export class MexcBrowserManager {
   }
 
   async prepareOrder(request: PrepareOrderRequest): Promise<AutomationResult> {
-    await this.open()
+    // 已连接时不再走open()：openHubstudio会bringToFront并刷新认证，
+    // 把Hubstudio窗口抢到最前还多付一次往返，后台标签页本来就能完成下单。
+    if (!this.getStatus().open) await this.open()
     return this.mode === 'HUBSTUDIO'
       ? this.prepareHubstudioOrder(request)
       : this.prepareEmbeddedOrder(request)
   }
 
   async closePosition(request: CloseMexcPositionRequest): Promise<AutomationResult> {
-    await this.open()
+    if (!this.getStatus().open) await this.open()
     if (this.mode !== 'HUBSTUDIO') {
       return { ok: false, message: 'MEXC自动卖出当前仅支持Hubstudio模式；未操作网页', matched: {} }
     }
