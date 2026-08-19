@@ -285,7 +285,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     const client = this.getAuthenticatedClient(credentials, signer)
     const cachedBook = this.orderBookCache.get(order.tokenId)
     const liveLevelsFresh = Boolean(
-      order.levels?.length && order.quoteReceivedAt && Date.now() - order.quoteReceivedAt <= 1_500
+      order.levels?.length && order.quoteReceivedAt && Date.now() - order.quoteReceivedAt <= 4_000
     )
     const cachedBookFresh = Boolean(cachedBook && Date.now() - cachedBook.checkedAt <= 1_500)
     const bookStartedAt = Date.now()

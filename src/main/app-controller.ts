@@ -1093,9 +1093,12 @@ export class AppController {
       this.activeSession.hedgeAttempts = (this.activeSession.hedgeAttempts ?? 0) + 1
       try {
         if (!opportunity.polymarketTokenId) throw new Error('Polymarket对冲缺少token')
+        // 常驻WS流的PONG心跳每5秒刷新一次receivedAt；流在线且无推送说明盘口未变，
+        // 1秒阈值会让几乎每次对冲都多一次REST拉取。放宽到4秒，FAK限价+未撮合
+        // 强制刷新重试仍然兜底盘口突变的场景。
         await this.polymarketData.confirmOutcomeQuote?.(
           opportunity.polymarketTokenId,
-          forceQuoteRefresh ? -1 : 1_000
+          forceQuoteRefresh ? -1 : 4_000
         )
         forceQuoteRefresh = false
         const currentWindows = this.polymarketData.getLatestWindows?.() ?? this.latestPolymarketWindows
