@@ -1297,8 +1297,8 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                     return (
                       <tr key={opportunity.id} className={['opportunity-row', positive ? 'ready' : '', isBest ? 'best' : '', isSelected ? 'selected' : ''].filter(Boolean).join(' ')} onClick={() => selectOpportunity(opportunity.id)} tabIndex={0} onKeyDown={(event) => event.key === 'Enter' && selectOpportunity(opportunity.id)}>
                         <td><span className="duration-pill">{opportunity.durationMinutes}m</span>{isBest && <span className="best-badge">最佳</span>}</td>
-                        <td><span className="quote-inline"><Direction direction={opportunity.mexcDirection} /><span className="mono">{money(opportunity.mexcPrice, 4)}</span></span></td>
-                        <td><span className="quote-inline"><Direction direction={opportunity.polymarketDirection} /><span className="mono">{money(opportunity.polymarketPrice, 4)}</span></span></td>
+                        <td><span className="quote-inline"><Direction direction={opportunity.mexcDirection} /><span className="mono">{Number(opportunity.mexcAvailableQuantity) > 0 ? money(opportunity.mexcPrice, 4) : '--'}</span></span></td>
+                        <td><span className="quote-inline"><Direction direction={opportunity.polymarketDirection} /><span className="mono">{Number(opportunity.polymarketAvailableQuantity) > 0 ? money(opportunity.polymarketPrice, 4) : '--'}</span></span></td>
                         <td><span className="edge-cell" title={opportunity.feeVerificationBlocked ? '费用待校验' : opportunity.settlementRiskBlocked ? '风控拦截' : positive ? '当前可执行' : '未通过全部执行门槛'}>
                           <span className={positive ? 'positive-value' : 'negative-value'}>
                             {opportunity.feeVerificationBlocked ? '—' : `${positive ? '+' : ''}${money(opportunity.netEdgePerShare, 4)}`}

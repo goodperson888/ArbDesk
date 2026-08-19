@@ -134,12 +134,19 @@ export function applyPolymarketStreamEvent(
         else byPrice.delete(update.price)
         levels = [...byPrice.values()].sort((left, right) => Number(left.price) - Number(right.price))
       }
-      const bestAsk = update.best_ask || levels[0]?.price || current.bestAsk
+      const eventBestAsk = Number(update.best_ask) > 0 ? update.best_ask : undefined
+      // 定盘/流动性撤走时，流推送的空盘本身就是权威状态：旧最优价只留作
+      // 展示参考，挂单量必须归零。否则幽灵价会带着旧数量一直显得"新鲜"。
+      const asksCleared = levels.length === 0 && (
+        event.event_type === 'book' ||
+        update.side?.toUpperCase() === 'SELL'
+      )
+      const bestAsk = eventBestAsk ?? levels[0]?.price ?? current.bestAsk
       const bestLevel = levels.find((level) => level.price === bestAsk) ?? levels[0]
       outcomes[direction] = {
         ...current,
         bestAsk,
-        askSize: bestLevel?.size ?? current.askSize,
+        askSize: bestLevel?.size ?? (asksCleared ? '0' : current.askSize),
         levels,
         receivedAt,
         minOrderSize: event.min_order_size || current.minOrderSize
