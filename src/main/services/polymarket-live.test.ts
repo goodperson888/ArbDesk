@@ -201,6 +201,28 @@ describe('PolymarketLiveBroker', () => {
     expect(getBalanceAllowance).toHaveBeenCalledTimes(1)
   })
 
+  it('caches the CLOB server-time offset and reuses the authenticated client', async () => {
+    const getServerTime = vi.fn(async () => Date.now() + 1_234)
+    const client = {
+      getServerTime,
+      getOrderBook: vi.fn(async () => orderBook()),
+      getBalanceAllowance: vi.fn(async () => ({
+        balance: '100000000',
+        allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
+      })),
+      getClosedOnlyMode: vi.fn(async () => ({ closed_only: false }))
+    } as unknown as ClobClient
+    const factory = vi.fn(() => client)
+    const broker = new PolymarketLiveBroker(credentialStore(), factory)
+
+    await broker.prefetchServerTime()
+    await broker.prefetchServerTime()
+    await broker.ensureTradingCapacity(0)
+
+    expect(getServerTime).toHaveBeenCalledTimes(1)
+    expect(factory).toHaveBeenCalledTimes(1)
+  })
+
   it('probes read-only balances and recommends the funded signature type', async () => {
     const proxyFunder = '0x1111111111111111111111111111111111111111'
     const proxyCredentials: PolymarketCredentials = {

@@ -548,6 +548,17 @@ export class AppController {
       mexcSubmittedAt: result.submittedAt,
       mexcAcceptedAt: result.responseAt ?? Date.now()
     }
+    if (result.orderResponseBody !== undefined) {
+      await this.recordActiveExecutionEvent(
+        'MEXC_SUBMITTING',
+        '已捕获MEXC下单接口完整请求与响应，用于成交确认提速分析',
+        {
+          orderResponseUrl: result.orderResponseUrl ?? '',
+          orderRequestBody: (result.orderRequestBody ?? '').slice(0, 500),
+          orderResponseBody: (result.orderResponseBody ?? '').slice(0, 4_000)
+        }
+      )
+    }
     const automaticSubmissionFailed = this.settings.mexcAutomationEnabled && (!result.ok || !result.orderAccepted)
     if (automaticSubmissionFailed) {
       const message = result.ok
@@ -571,6 +582,12 @@ export class AppController {
       if (automaticAccepted || awaitingManualClick) {
         const submittedAfter = (result.submittedAt ?? Date.now()) - 2_000
         void this.monitorMexcFill(opportunity, submittedAfter, awaitingManualClick ? 120_000 : 90_000)
+      }
+      // 把Polymarket侧的准备请求藏在MEXC成交等待窗口内：服务器时间偏移与
+      // 盘口元数据预热完成后，对冲下单路径可少付1-2个CLOB往返。
+      if (opportunity.polymarketTokenId) {
+        void this.liveBroker?.prefetchServerTime?.()
+        void this.liveBroker?.prefetchOrderBooks?.([opportunity.polymarketTokenId])
       }
     }
     return this.activeSession
@@ -953,6 +970,7 @@ export class AppController {
       void Promise.all([
         this.mexcBrowser.ensureAccountBalance?.(30_000),
         this.liveBroker?.ensureTradingCapacity(0),
+        this.liveBroker?.prefetchServerTime?.(),
         this.liveBroker?.prefetchOrderBooks?.(
           this.opportunities.map((opportunity) => opportunity.polymarketTokenId ?? '')
         )

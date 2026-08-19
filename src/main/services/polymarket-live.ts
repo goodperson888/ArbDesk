@@ -73,6 +73,10 @@ export class PolymarketLiveBroker implements PolymarketBroker {
   private cachedTradingCapacity?: PolymarketTradingCapacity
   private cachedBalanceAllowance?: BalanceAllowanceResponse
   private orderBookCache = new Map<string, { checkedAt: number; book: OrderBookSummary }>()
+  private cachedClient?: ClobClient
+  private cachedClientKey?: string
+  private serverTimeOffsetMs?: number
+  private serverTimeSyncedAt = 0
   private proxyUrl = ''
 
   constructor(
@@ -136,6 +140,8 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     })
     this.cachedTradingCapacity = undefined
     this.cachedBalanceAllowance = undefined
+    this.cachedClient = undefined
+    this.cachedClientKey = undefined
     this.orderBookCache.clear()
     return updated
   }
@@ -152,7 +158,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     if (missing.length === 0) return
     const credentials = await this.credentialStore.getCredentials()
     const signer = this.createSigner(credentials.signerPrivateKey)
-    const client = this.createAuthenticatedClient(credentials, signer)
+    const client = this.getAuthenticatedClient(credentials, signer)
     await Promise.all(missing.map(async (tokenId) => {
       const book = await client.getOrderBook(tokenId)
       this.orderBookCache.set(tokenId, { checkedAt: Date.now(), book })
@@ -165,7 +171,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     }
     const credentials = await this.credentialStore.getCredentials()
     const signer = this.createSigner(credentials.signerPrivateKey)
-    const client = this.createAuthenticatedClient(credentials, signer)
+    const client = this.getAuthenticatedClient(credentials, signer)
     const [balance, closedOnlyResult] = await Promise.all([
       client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }),
       client.getClosedOnlyMode()
@@ -184,7 +190,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
   async validateIdentity(tokenId?: string): Promise<PolymarketIdentityValidation> {
     const credentials = await this.credentialStore.getCredentials()
     const signer = this.createSigner(credentials.signerPrivateKey)
-    const client = this.createAuthenticatedClient(credentials, signer)
+    const client = this.getAuthenticatedClient(credentials, signer)
     await createL1Headers(signer, Chain.POLYGON)
 
     const [, closedOnlyResult, balance, openOrders, trades] = await Promise.all([
@@ -276,7 +282,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     const startedAt = Date.now()
     const credentials = await this.credentialStore.getCredentials()
     const signer = this.createSigner(credentials.signerPrivateKey)
-    const client = this.createAuthenticatedClient(credentials, signer)
+    const client = this.getAuthenticatedClient(credentials, signer)
     const cachedBook = this.orderBookCache.get(order.tokenId)
     const liveLevelsFresh = Boolean(
       order.levels?.length && order.quoteReceivedAt && Date.now() - order.quoteReceivedAt <= 1_500
@@ -552,7 +558,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
 
     const credentials = await this.credentialStore.getCredentials()
     const signer = this.createSigner(credentials.signerPrivateKey)
-    const client = this.createAuthenticatedClient(credentials, signer)
+    const client = this.getAuthenticatedClient(credentials, signer)
     const [book, balance] = await Promise.all([
       client.getOrderBook(order.tokenId),
       client.getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: order.tokenId })
@@ -617,6 +623,48 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       retryOnError: false,
       throwOnError: true
     })
+  }
+
+  private getAuthenticatedClient(credentials: PolymarketCredentials, signer: WalletClient): ClobClient {
+    const key = [
+      credentials.apiKey, credentials.apiSecret, credentials.apiPassphrase,
+      credentials.signatureType, credentials.funderAddress, credentials.signerPrivateKey
+    ].join('|')
+    if (this.cachedClient && this.cachedClientKey === key) return this.cachedClient
+    const client = this.createAuthenticatedClient(credentials, signer)
+    // useServerTime makes the SDK await GET /time before every signed request,
+    // adding a full CLOB round trip to each hedge submission. Cache the measured
+    // local-clock offset for 5 minutes instead; the periodic capacity refresh
+    // keeps the offset warm so the order path skips the extra round trip.
+    const remoteServerTime = typeof client.getServerTime === 'function'
+      ? client.getServerTime.bind(client) as () => Promise<number>
+      : undefined
+    if (remoteServerTime) {
+      client.getServerTime = async (): Promise<number> => {
+        if (this.serverTimeOffsetMs !== undefined && Date.now() - this.serverTimeSyncedAt < 300_000) {
+          return Date.now() + this.serverTimeOffsetMs
+        }
+        const remote = await remoteServerTime()
+        this.serverTimeOffsetMs = remote - Date.now()
+        this.serverTimeSyncedAt = Date.now()
+        return remote
+      }
+    }
+    this.cachedClient = client
+    this.cachedClientKey = key
+    return client
+  }
+
+  async prefetchServerTime(): Promise<void> {
+    if (this.serverTimeOffsetMs !== undefined && Date.now() - this.serverTimeSyncedAt < 120_000) return
+    try {
+      const credentials = await this.credentialStore.getCredentials()
+      if (!credentials.apiKey || !credentials.signerPrivateKey) return
+      const signer = this.createSigner(credentials.signerPrivateKey)
+      await this.getAuthenticatedClient(credentials, signer).getServerTime()
+    } catch {
+      // 预热失败不影响下单路径：真实下单时会再次请求服务器时间
+    }
   }
 
   private async findFundedSignatureType(

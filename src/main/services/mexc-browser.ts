@@ -68,6 +68,9 @@ interface AutomationResult {
   submittedAt?: number
   responseAt?: number
   submissionUncertain?: boolean
+  orderResponseUrl?: string
+  orderRequestBody?: string
+  orderResponseBody?: string
 }
 
 interface HubstudioStartResponse {
@@ -1400,6 +1403,7 @@ export class MexcBrowserManager {
       let orderAccepted = false
       let submittedAt: number | undefined
       let responseAt: number | undefined
+      let orderCapture: { orderResponseUrl: string; orderRequestBody: string; orderResponseBody: string } | undefined
       if (request.allowSubmit) {
         submittedAt = Date.now()
         const orderResponsePromise = page.waitForResponse(
@@ -1429,6 +1433,15 @@ export class MexcBrowserManager {
         } catch {
           responseBody = undefined
         }
+        const orderCaptureValue = {
+          orderResponseUrl: orderResponse.url(),
+          orderRequestBody: orderResponse.request().postData() ?? '',
+          orderResponseBody: responseBody === undefined ? '' : JSON.stringify(responseBody)
+        }
+        orderCapture = orderCaptureValue
+        console.info(
+          `[MEXC下单接口] ${orderCaptureValue.orderResponseUrl} 请求=${orderCaptureValue.orderRequestBody} 响应=${orderCaptureValue.orderResponseBody}`
+        )
         const record = responseBody && typeof responseBody === 'object'
           ? responseBody as Record<string, unknown>
           : undefined
@@ -1450,7 +1463,8 @@ export class MexcBrowserManager {
             responseAt,
             submissionUncertain: false,
             message: `MEXC下单接口未确认成功：${reason}；未启动Polymarket对冲`,
-            matched
+            matched,
+            ...orderCapture
           }
         }
       }
@@ -1466,7 +1480,10 @@ export class MexcBrowserManager {
         message: request.allowSubmit
           ? 'MEXC下单接口已确认接收，正在等待该笔实际成交'
           : '已在Hubstudio中自动选择涨跌并填入金额，买入按钮已高亮，等待人工确认',
-        matched
+        matched,
+        orderResponseUrl: orderCapture?.orderResponseUrl,
+        orderRequestBody: orderCapture?.orderRequestBody,
+        orderResponseBody: orderCapture?.orderResponseBody
       }
     } catch (error) {
       return {
