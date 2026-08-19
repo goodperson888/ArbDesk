@@ -149,6 +149,7 @@ export class MexcBrowserManager {
   private hubstudioOrderPages = new Map<5 | 15, Page>()
   private hubstudioOrderWarmPromise?: Promise<void>
   private hubstudioDebuggingPort?: number
+  private hubstudioApiBase?: string
   private hubstudioConnectedContainerCode?: string
   private hubstudioMonitor?: NodeJS.Timeout
   private hubstudioNetworkSession?: CDPSession
@@ -1947,20 +1948,76 @@ export class MexcBrowserManager {
     this.latestOrderCapture = undefined
   }
 
-  private async callHubstudio<T>(path: string, body: Record<string, unknown> | string[]): Promise<T> {
-    let response: Response
+  // Hubstudio 3.57+ 的本地API端口是启动时动态分配的（API子进程命令行为
+  // `Hubstudio ... httpServer.cjs <port> ...`）。先扫描进程命令行提取候选端口，
+  // 逐个探测 /api/v1/browser/all-browser-status 验证；旧版本的固定端口6873作为兜底。
+  private async discoverHubstudioApiBase(): Promise<string | undefined> {
+    const candidates: number[] = []
     try {
-      response = await fetch(`${HUBSTUDIO_API}${path}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(20_000)
-      })
-    } catch (error) {
-      throw new Error(`无法连接Hubstudio Local API（127.0.0.1:6873）：${error instanceof Error ? error.message : String(error)}`)
+      const result = process.platform === 'win32'
+        ? await execFileAsync('powershell', [
+            '-NoProfile', '-Command',
+            "Get-CimInstance Win32_Process -Filter \"Name='Hubstudio.exe'\" | ForEach-Object { $_.CommandLine }"
+          ], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 })
+        : await execFileAsync('ps', ['-axo', 'args='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 })
+      for (const match of String(result.stdout).matchAll(/httpServer\.cjs\D+(\d{2,5})/g)) {
+        const port = Number(match[1])
+        if (Number.isInteger(port) && port > 0) candidates.push(port)
+      }
+    } catch {
+      // 进程扫描失败时只依赖固定端口
     }
-    if (!response.ok) throw new Error(`Hubstudio Local API返回HTTP ${response.status}`)
-    return await response.json() as T
+    candidates.push(6873)
+    for (const port of [...new Set(candidates)]) {
+      const base = `http://127.0.0.1:${port}`
+      try {
+        const probe = await fetch(`${base}/api/v1/browser/all-browser-status`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '[]',
+          signal: AbortSignal.timeout(1_500)
+        })
+        if (!probe.ok) continue
+        const payload = await probe.json() as { code?: unknown }
+        if (typeof payload.code === 'number') return base
+      } catch {
+        // 该端口不是Hubstudio Local API，继续探测
+      }
+    }
+    return undefined
+  }
+
+  private async callHubstudio<T>(path: string, body: Record<string, unknown> | string[]): Promise<T> {
+    const serialized = JSON.stringify(body)
+    const send = async (base: string): Promise<T> => {
+      let response: Response
+      try {
+        response = await fetch(`${base}${path}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: serialized,
+          signal: AbortSignal.timeout(20_000)
+        })
+      } catch (error) {
+        throw new Error(`无法连接Hubstudio Local API（${base.replace('http://', '')}）：${error instanceof Error ? error.message : String(error)}`)
+      }
+      if (!response.ok) throw new Error(`Hubstudio Local API返回HTTP ${response.status}`)
+      return await response.json() as T
+    }
+    if (!this.hubstudioApiBase) {
+      this.hubstudioApiBase = (await this.discoverHubstudioApiBase()) ?? HUBSTUDIO_API
+    }
+    try {
+      return await send(this.hubstudioApiBase)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      // 仅网络层失败才可能是端口变了（Hubstudio重启后动态端口会换），重新发现一次
+      if (!message.startsWith('无法连接Hubstudio Local API')) throw error
+      const rediscovered = await this.discoverHubstudioApiBase()
+      if (!rediscovered || rediscovered === this.hubstudioApiBase) throw error
+      this.hubstudioApiBase = rediscovered
+      return await send(this.hubstudioApiBase)
+    }
   }
 
   private async isVisible(page: Page, selector?: string): Promise<boolean> {
