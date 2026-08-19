@@ -1162,6 +1162,13 @@ export class AppController {
       }
     }
 
+    // 两腿成交后余额都已变化、缓存失效。这里异步强制刷新一次，让下一次
+    // 点“执行/最大”时的复核直接命中缓存，不再付出余额查询等待。
+    void Promise.allSettled([
+      this.mexcBrowser.ensureAccountBalance?.(0),
+      this.liveBroker?.ensureTradingCapacity?.(0)
+    ])
+
     if (!this.activeSession) throw new Error('执行会话意外丢失')
     const excessQuantity = Decimal.max(filledQuantity.minus(targetQuantity), 0)
     this.activeSession.excessHedgeQuantity = excessQuantity.toDecimalPlaces(6).toString()
