@@ -45,7 +45,7 @@ export type ExecutionState =
 export type CloseTarget = 'MEXC' | 'POLYMARKET' | 'BOTH'
 export type ArbitrageOrderStatus = 'OPENING' | 'OPEN' | 'UNHEDGED' | 'CLOSED' | 'RECOVERY_REQUIRED' | 'CANCELLED' | 'EXPIRED'
 export type OrderTriggerSource = 'MANUAL' | 'AUTO' | 'TEST' | 'UNKNOWN'
-export type FillVerificationSource = 'PLATFORM_READBACK' | 'MANUAL_ENTRY' | 'SIMULATED'
+export type FillVerificationSource = 'PLATFORM_READBACK' | 'MANUAL_ENTRY' | 'SIMULATED' | 'PLANNED'
 
 export interface OrderBookLevel {
   price: string
@@ -247,6 +247,8 @@ export interface RiskSettings {
   maxRecoveryLossUsdt: string
   polymarketHedgeRetryCount: number
   polymarketHedgeMode: PolymarketHedgeMode
+  preHedgeRatioPct: number
+  unprotectedExecutionEnabled: boolean
   manualExecutionConditions: ManualExecutionConditions
   autoOpenStabilityMs: number
 }

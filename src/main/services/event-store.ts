@@ -70,8 +70,14 @@ export class EventStore {
   }
 
   async saveOrderHistory(orders: ArbitrageOrderRecord[]): Promise<void> {
-    const temporaryPath = `${this.ordersPath}.tmp`
-    await writeFile(temporaryPath, JSON.stringify(orders, null, 2), 'utf8')
-    await rename(temporaryPath, this.ordersPath)
+    const write = async (): Promise<void> => {
+      const temporaryPath = `${this.ordersPath}.${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`
+      await writeFile(temporaryPath, JSON.stringify(orders, null, 2), 'utf8')
+      await rename(temporaryPath, this.ordersPath)
+    }
+    this.orderSaveChain = this.orderSaveChain.then(write, write)
+    return this.orderSaveChain
   }
+
+  private orderSaveChain: Promise<void> = Promise.resolve()
 }

@@ -30,7 +30,8 @@ import {
   SlidersHorizontal,
   Trash2,
   Volume2,
-  X
+  X,
+  Zap
 } from 'lucide-react'
 import type {
   ArbitrageOrderRecord,
@@ -506,6 +507,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [maxHedgeSlippageDraft, setMaxHedgeSlippageDraft] = useState('0.0300')
   const [maxRecoveryLossDraft, setMaxRecoveryLossDraft] = useState('2.00')
   const [hedgeRetryCountDraft, setHedgeRetryCountDraft] = useState('8')
+  const [preHedgeRatioDraft, setPreHedgeRatioDraft] = useState('50')
   const [hedgeModeDraft, setHedgeModeDraft] = useState<PolymarketHedgeMode>('PROTECTED_MARKET')
   const previousCanExecuteRef = useRef(false)
   const soundCooldownRef = useRef(new Map<string, number>())
@@ -546,6 +548,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     setMaxHedgeSlippageDraft(snapshot?.settings.maxHedgeSlippage ?? '0.0300')
     setMaxRecoveryLossDraft(snapshot?.settings.maxRecoveryLossUsdt ?? '2.00')
     setHedgeRetryCountDraft(String(snapshot?.settings.polymarketHedgeRetryCount ?? 8))
+    setPreHedgeRatioDraft(String(snapshot?.settings.preHedgeRatioPct ?? 50))
     setHedgeModeDraft(snapshot?.settings.polymarketHedgeMode ?? 'PROTECTED_MARKET')
     setSettlementRuleDrafts((snapshot?.settings.settlementDistanceRules ?? defaultSettlementDistanceRules()).map((rule) => ({
       id: rule.id,
@@ -581,7 +584,9 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const orderedOpportunities = useMemo(() => snapshot
     ? [...snapshot.opportunities].sort((left, right) =>
       left.durationMinutes - right.durationMinutes ||
-      Number(left.mexcDirection === 'DOWN') - Number(right.mexcDirection === 'DOWN')
+      Number(left.mexcDirection === 'DOWN') - Number(right.mexcDirection === 'DOWN') ||
+      left.startTime - right.startTime ||
+      String(left.id).localeCompare(String(right.id))
     )
     : [], [snapshot])
 
@@ -644,6 +649,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const manualConditions = snapshot?.settings.manualExecutionConditions
   const manualConditionEnabled = (condition: keyof ManualExecutionConditions): boolean => manualConditions?.[condition] !== false
   const manualRiskOverrideActive = Boolean(manualConditions && Object.values(manualConditions).some((enabled) => !enabled))
+  const unprotectedMode = Boolean(snapshot?.settings.unprotectedExecutionEnabled && snapshot.settings.mode === 'ASSISTED')
   const executionPlanBlockReason = currentPlan?.blockReason?.includes('最低条件收益率')
     ? `保护价内盘口有${currentPlan.marketDepthQuantity}份，但滑点后条件收益率${money(effectiveConditionalReturn, 2)}%低于设置的${money(String(snapshot?.settings.minConditionalReturnPct ?? 0), 2)}%`
     : currentPlan?.blockReason
@@ -651,15 +657,15 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     selected &&
       Number(quantity) > 0 &&
       Number(quantity) >= minimumAlignedQuantity &&
-      (!currentPlan || currentPlan.executable) &&
-      Number(quantity) <= Number(currentPlan?.maxExecutableQuantity ?? selected.maxQuantity) &&
+      (unprotectedMode || (!currentPlan || currentPlan.executable)) &&
+      (unprotectedMode || Number(quantity) <= Number(currentPlan?.maxExecutableQuantity ?? selected.maxQuantity)) &&
       requestedCapital <= Number(snapshot?.settings.maxCapitalPerTrade ?? 0) &&
-      (!manualConditionEnabled('feeVerification') || !selected.feeVerificationBlocked) &&
+      (unprotectedMode || !manualConditionEnabled('feeVerification') || !selected.feeVerificationBlocked) &&
       (!snapshot?.settings.allowUnprofitableTestTrade || (minimumTestCapital <= 12 && requestedCapital <= dynamicTestCapitalLimit)) &&
-      (!manualConditionEnabled('conditionalReturn') || Number(effectiveConditionalReturn) >= Number(snapshot?.settings.minConditionalReturnPct ?? 0) || testOverrideReady) &&
-      (!manualConditionEnabled('settlementRisk') || !selected.settlementRiskBlocked || testOverrideReady) &&
-      (!manualConditionEnabled('quoteFreshness') || !selected.stale) &&
-      (!manualConditionEnabled('expiryCutoff') || (selected.endTime - now) / 1_000 > Number(snapshot?.settings.stopBeforeExpirySeconds ?? 0)) &&
+      (unprotectedMode || !manualConditionEnabled('conditionalReturn') || Number(effectiveConditionalReturn) >= Number(snapshot?.settings.minConditionalReturnPct ?? 0) || testOverrideReady) &&
+      (unprotectedMode || !manualConditionEnabled('settlementRisk') || !selected.settlementRiskBlocked || testOverrideReady) &&
+      (unprotectedMode || !manualConditionEnabled('quoteFreshness') || !selected.stale) &&
+      (unprotectedMode || !manualConditionEnabled('expiryCutoff') || (selected.endTime - now) / 1_000 > Number(snapshot?.settings.stopBeforeExpirySeconds ?? 0)) &&
       executionSessionIdle &&
       !busy
   )
@@ -979,12 +985,27 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       setMessage('Polymarket自动补单次数须为0至20的整数')
       return
     }
+    const preHedgeRatio = Number(preHedgeRatioDraft)
+    if (!Number.isFinite(preHedgeRatio) || preHedgeRatio < 0 || preHedgeRatio > 100) {
+      setMessage('预对冲比例须为0至100之间的数值')
+      return
+    }
     const result = await run(() => window.arbApp.updateSettings({
       maxHedgeSlippage: maximumSlippage.toFixed(4),
       maxRecoveryLossUsdt: maximumLoss.toFixed(2),
       polymarketHedgeRetryCount: retryCount,
-      polymarketHedgeMode: hedgeModeDraft
+      polymarketHedgeMode: hedgeModeDraft,
+      preHedgeRatioPct: preHedgeRatio
     }), '第二腿价格保护与恢复参数已保存')
+    if (result && snapshot) setSnapshot({ ...snapshot, settings: result })
+  }
+
+  async function toggleUnprotectedExecution(): Promise<void> {
+    if (!snapshot) return
+    const enabling = !snapshot.settings.unprotectedExecutionEnabled
+    if (enabling && !window.confirm('无保护模式：MEXC点击被接受后立即全量并行提交Polymarket FAK（限价0.99），不等成交回报、不校验滑点/收益/结算信号门槛。单腿失败会产生裸敞口，成交价可能很差，不保证锁利。仅保留单笔本金上限。确认开启？')) return
+    const result = await run(() => window.arbApp.updateSettings({ unprotectedExecutionEnabled: enabling }),
+      enabling ? '无保护极速模式已开启' : '无保护极速模式已关闭')
     if (result && snapshot) setSnapshot({ ...snapshot, settings: result })
   }
 
@@ -1286,7 +1307,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                         </span></td>
                         <td className="mono">{money(opportunity.maxQuantity, 0)}</td>
                         <td className="mono countdown">{secondsRemaining(opportunity.endTime, now)}</td>
-                        <td className="mono all-in-cost-cell">{opportunity.feeVerificationBlocked ? '—' : money(opportunity.allInCostPerShare, 4)}</td>
+                        <td className="mono all-in-cost-cell">{opportunity.feeVerificationBlocked ? '—' : money(opportunity.allInCostPerShare, 2)}</td>
                       </tr>
                     )
                   })}
@@ -1311,9 +1332,9 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
               </div>
 
               <div className="execute-action-row">
-                <button className={`execute-button ${manualRiskOverrideActive ? 'risk-override' : ''}`} onClick={() => void execute()} disabled={!canExecute} title="点击后先复核所选两边盘口；确认MEXC实际成交后才会提交Polymarket对冲">
+                <button className={`execute-button ${unprotectedMode || manualRiskOverrideActive ? 'risk-override' : ''}`} onClick={() => void execute()} disabled={!canExecute} title={unprotectedMode ? '无保护模式：MEXC点击后立即并行全量提交Polymarket FAK(最高0.99)，不等成交回报、不校验滑点与收益门槛' : '点击后先复核所选两边盘口；确认MEXC实际成交后才会提交Polymarket对冲'}>
                   {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <ArrowRight aria-hidden="true" />}
-                  {manualRiskOverrideActive ? '风险执行 · ' : ''}
+                  {unprotectedMode ? '极速无保护 · ' : manualRiskOverrideActive ? '风险执行 · ' : ''}
                   {snapshot.settings.mode === 'SIMULATION'
                     ? '模拟执行两腿'
                     : snapshot.settings.mexcAutomationEnabled
@@ -1719,8 +1740,20 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <label className="settings-field" htmlFor="hedge-retry-count">自动补单次数
                   <input id="hedge-retry-count" type="number" min="0" max="20" step="1" value={hedgeRetryCountDraft} onChange={(event) => setHedgeRetryCountDraft(event.target.value)} inputMode="numeric" />
                 </label>
+                <label className="settings-field" htmlFor="pre-hedge-ratio">预对冲比例（%）
+                  <input id="pre-hedge-ratio" type="number" min="0" max="100" step="5" value={preHedgeRatioDraft} onChange={(event) => setPreHedgeRatioDraft(event.target.value)} inputMode="numeric" />
+                  <small>MEXC下单被接受后立即先对冲这个比例的份额，成交回报到达后补齐差额；0表示关闭。不低于平台最小单量。</small>
+                </label>
               </div>
               <button className="wide-secondary" onClick={() => void saveRecoverySettings()} disabled={busy}><Check />保存恢复参数</button>
+              <div><Zap /><div><h3>无保护极速模式</h3><p>MEXC下单被接受后立即全量并行提交Polymarket FAK（限价0.99），不等成交回报，跳过滑点/收益/结算信号门槛。单腿失败会产生裸敞口，仅保留单笔本金上限。</p></div></div>
+              <button
+                className={snapshot.settings.unprotectedExecutionEnabled ? 'wide-secondary danger-active' : 'wide-secondary'}
+                onClick={() => void toggleUnprotectedExecution()}
+                disabled={busy}
+              >
+                {snapshot.settings.unprotectedExecutionEnabled ? '关闭无保护极速模式' : '开启无保护极速模式'}
+              </button>
               <div><Bot /><div><h3>自动开单</h3><p>全部按钮条件连续满足设定时间后触发；期间只读实时缓存，下单热路径不刷新账户。每轮最多一单，异常自动停用。</p></div></div>
               <div className="segmented-control browser-mode-control">
                 <button className={snapshot.settings.autoOpenQuantityMode === 'FIXED' ? 'active' : ''} onClick={() => void setAutoQuantityMode('FIXED')} disabled={snapshot.settings.autoOpenEnabled}>固定份额</button>

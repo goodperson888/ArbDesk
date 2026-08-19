@@ -6,7 +6,7 @@ import { AppController } from './app-controller'
 import type { ArbitrageOrderRecord, Fill, MexcAccountState, Opportunity } from '../shared/types'
 import { EventStore } from './services/event-store'
 import type { MexcBrowserManager } from './services/mexc-browser'
-import type { PolymarketBroker } from './services/polymarket'
+import type { PolymarketBroker, HedgeOrder } from './services/polymarket'
 import type { PolymarketMarketData } from './services/polymarket-market-data'
 import type { PolymarketLiveBroker, PolymarketTradingCapacity } from './services/polymarket-live'
 
@@ -23,7 +23,8 @@ afterEach(async () => {
 async function createAssistedExecutionController(
   hedge: PolymarketBroker['hedge'],
   readbackFill?: Fill,
-  confirmOutcomeQuote?: PolymarketMarketData['confirmOutcomeQuote']
+  confirmOutcomeQuote?: PolymarketMarketData['confirmOutcomeQuote'],
+  prepareOrderResult?: Partial<Awaited<ReturnType<MexcBrowserManager['prepareOrder']>>>
 ): Promise<AppController> {
   const directory = await mkdtemp(join(tmpdir(), 'arbdesk-partial-hedge-test-'))
   temporaryDirectories.push(directory)
@@ -54,7 +55,7 @@ async function createAssistedExecutionController(
       }
     }],
     open: async () => undefined,
-    prepareOrder: async () => ({ ok: true, orderAccepted: false, message: 'prepared', matched: {} }),
+    prepareOrder: async () => ({ ok: true, orderAccepted: false, message: 'prepared', matched: {}, ...prepareOrderResult }),
     waitForFill: async () => readbackFill
   } as unknown as MexcBrowserManager
   const polymarketData = {
@@ -689,6 +690,72 @@ describe('AppController simulation', () => {
     expect(hedge).toHaveBeenCalledTimes(2)
     expect(confirmOutcomeQuote).toHaveBeenLastCalledWith('poly-down', -1)
     expect(session.state).toBe('HEDGED')
+  })
+
+  it('pre-hedges the configured ratio right after MEXC acceptance and tops up after the readback', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const hedge = vi.fn(async (order: { quantity: string; direction: 'UP' | 'DOWN' }) => ({
+      venue: 'POLYMARKET' as const,
+      direction: order.direction,
+      quantity: order.quantity,
+      averagePrice: '0.52',
+      orderId: `pre-hedge-${hedge.mock.calls.length}`,
+      filledAt: Date.now()
+    }))
+    const controller = await createAssistedExecutionController(
+      hedge,
+      undefined,
+      undefined,
+      { ok: true, orderAccepted: true, message: 'submitted', submittedAt: Date.now() }
+    )
+    await controller.updateSettings({ mexcAutomationEnabled: true, preHedgeRatioPct: 50 })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+
+    const session = await controller.confirmMexcFill({
+      quantity: '10', averagePrice: '0.40', orderId: 'mexc-pre-hedge', manualAcknowledged: true
+    })
+
+    expect(hedge).toHaveBeenCalledTimes(2)
+    expect(hedge.mock.calls.map((call) => call[0].quantity)).toEqual(['5', '5'])
+    expect(session.state).toBe('HEDGED')
+    expect(Number(session.polymarketFill?.quantity)).toBe(10)
+  })
+
+  it('submits the full Polymarket leg at the 0.99 cap immediately in unprotected mode', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const hedge = vi.fn(async (order: HedgeOrder) => ({
+      venue: 'POLYMARKET' as const,
+      direction: order.direction,
+      quantity: order.quantity,
+      averagePrice: '0.97',
+      orderId: 'unprotected-fill',
+      filledAt: Date.now()
+    }))
+    const controller = await createAssistedExecutionController(
+      hedge,
+      undefined,
+      undefined,
+      { ok: true, orderAccepted: true, message: 'submitted', submittedAt: Date.now() }
+    )
+    await controller.updateSettings({
+      mexcAutomationEnabled: true,
+      unprotectedExecutionEnabled: true,
+      minConditionalReturnPct: '100'
+    })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    // minConditionalReturnPct=100 would normally block execution; unprotected mode bypasses it.
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+
+    const session = await controller.confirmMexcFill({
+      quantity: '10', averagePrice: '0.40', orderId: 'mexc-unprotected', manualAcknowledged: true
+    })
+
+    expect(hedge).toHaveBeenCalledTimes(1)
+    expect(hedge.mock.calls[0][0].quantity).toBe('10')
+    expect(hedge.mock.calls[0][0].maximumPrice).toBe('0.9900')
+    expect(session.state).toBe('HEDGED')
+    expect(Number(session.polymarketFill?.quantity)).toBe(10)
   })
 
   it('does not expose or block on a recovery session after its market has expired', async () => {

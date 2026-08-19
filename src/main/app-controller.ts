@@ -59,6 +59,8 @@ const DEFAULT_SETTINGS: RiskSettings = {
   maxRecoveryLossUsdt: '2.00',
   polymarketHedgeRetryCount: 8,
   polymarketHedgeMode: 'PROTECTED_MARKET',
+  preHedgeRatioPct: 50,
+  unprotectedExecutionEnabled: false,
   manualExecutionConditions: defaultManualExecutionConditions(),
   autoOpenStabilityMs: 100
 }
@@ -91,6 +93,7 @@ export class AppController {
   private opportunities: Opportunity[] = []
   private activeSession?: ExecutionSession
   private activeOpportunity?: Opportunity
+  private parallelHedgePromise?: Promise<void>
   private recentEvents: ExecutionEvent[] = []
   private orderHistory: ArbitrageOrderRecord[] = []
   private broadcast: (snapshot: AppSnapshot) => void = () => undefined
@@ -589,8 +592,54 @@ export class AppController {
         void this.liveBroker?.prefetchServerTime?.()
         void this.liveBroker?.prefetchOrderBooks?.([opportunity.polymarketTokenId])
       }
+      // MEXC下单被接受后立即并行启动Polymarket腿：无保护模式全量同时下，
+      // 保护模式按preHedgeRatioPct比例预对冲，等MEXC真实成交回报后补齐差额。
+      if (automaticAccepted && this.settings.mode === 'ASSISTED') {
+        this.launchParallelHedge(opportunity)
+      }
     }
     return this.activeSession
+  }
+
+  private launchParallelHedge(opportunity: Opportunity): void {
+    if (!this.activeSession || !this.activeExecutionPlan) return
+    if (!this.settings.unprotectedExecutionEnabled && this.settings.preHedgeRatioPct <= 0) return
+    const plannedQuantity = new Decimal(this.activeSession.requestedQuantity)
+    const minimumSize = new Decimal(opportunity.polymarketMinOrderSize || '1').toDecimalPlaces(2, Decimal.ROUND_CEIL)
+    const ratioPercent = this.settings.unprotectedExecutionEnabled
+      ? 100
+      : Math.min(Math.max(this.settings.preHedgeRatioPct, 0), 100)
+    // 预对冲份额不小于平台最小单量，否则这批会被拒单；也不超过计划总量。
+    const portion = Decimal.min(
+      Decimal.max(plannedQuantity.mul(ratioPercent).div(100).toDecimalPlaces(2, Decimal.ROUND_FLOOR), minimumSize),
+      plannedQuantity
+    )
+    if (portion.lt(minimumSize) || portion.lte(0)) return
+    const plannedFill: Fill = {
+      venue: 'MEXC',
+      direction: opportunity.mexcDirection,
+      quantity: portion.toFixed(2),
+      averagePrice: this.activeExecutionPlan.mexcAveragePrice,
+      orderId: 'planned-pre-hedge',
+      filledAt: Date.now(),
+      verificationSource: 'PLANNED'
+    }
+    const label = this.settings.unprotectedExecutionEnabled ? '无保护全量并行' : `预对冲${ratioPercent}%`
+    void this.recordActiveExecutionEvent('MEXC_SUBMITTED', `${label}：不等MEXC成交回报，立即提交Polymarket FAK买${plannedFill.quantity}份`, {
+      unprotected: this.settings.unprotectedExecutionEnabled,
+      portion: plannedFill.quantity
+    })
+    this.parallelHedgePromise = this.hedgePolymarket(
+      opportunity,
+      plannedFill,
+      false,
+      this.settings.polymarketHedgeMode,
+      { parallel: true, unprotected: this.settings.unprotectedExecutionEnabled }
+    ).catch((error) => {
+      console.error(`[并行对冲失败] ${error instanceof Error ? error.message : String(error)}`)
+    }).finally(() => {
+      this.parallelHedgePromise = undefined
+    })
   }
 
   async confirmMexcFill(fill: ConfirmMexcFillRequest): Promise<ExecutionSession> {
@@ -631,7 +680,11 @@ export class AppController {
     const state: ExecutionState = quantity.eq(this.activeSession.requestedQuantity) ? 'MEXC_FILLED' : 'MEXC_PARTIAL'
     const sourceLabel = trustedReadback ? 'MEXC平台回读' : '人工强制录入（未经平台回读）'
     await this.transition(state, `${sourceLabel}：${state === 'MEXC_FILLED' ? '完全成交' : '部分成交'}`)
-    await this.hedgePolymarket(opportunity, mexcFill)
+    // 预对冲/并行对冲可能仍在进行，先等它落地再补齐，避免同时写fills互相覆盖。
+    if (this.parallelHedgePromise) await this.parallelHedgePromise
+    await this.hedgePolymarket(opportunity, mexcFill, false, this.settings.polymarketHedgeMode, {
+      unprotected: this.settings.unprotectedExecutionEnabled
+    })
     return this.activeSession
   }
 
@@ -1002,6 +1055,12 @@ export class AppController {
     if (quantity.lt(minimumQuantity)) {
       throw new Error(`最小对齐份额为${minimumQuantity.toFixed(2)}份（Polymarket至少${opportunity.polymarketMinOrderSize}份且BUY金额至少1，MEXC本金至少1 USDT）`)
     }
+    if (new Decimal(executionPlan.capitalRequired).gt(this.settings.maxCapitalPerTrade)) {
+      throw new Error('预计本金超过单笔限额')
+    }
+    // 无保护模式以速度优先：跳过收益/信号/行情时效等风控门槛，只保留
+    // 数量与单笔本金上限两道硬约束。
+    if (this.settings.unprotectedExecutionEnabled && this.settings.mode === 'ASSISTED') return
     if (!executionPlan.executable) throw new Error(`当前数量不可执行：${executionPlan.blockReason ?? '深度或账户条件不足'}`)
     if (opportunity.stale && this.executionConditionEnabled('quoteFreshness', source)) throw new Error('行情已过期，请刷新')
     if (opportunity.feeVerificationBlocked && this.executionConditionEnabled('feeVerification', source)) {
@@ -1044,13 +1103,16 @@ export class AppController {
     opportunity: Opportunity,
     mexcFill: Fill,
     recoveryMode = false,
-    hedgeMode = this.settings.polymarketHedgeMode
+    hedgeMode = this.settings.polymarketHedgeMode,
+    options: { parallel?: boolean; unprotected?: boolean } = {}
   ): Promise<void> {
     if (!this.activeSession) throw new Error('执行会话意外丢失')
     const targetQuantity = this.calculatePolymarketTargetQuantity(mexcFill)
     this.activeSession.polymarketTargetQuantity = targetQuantity.toDecimalPlaces(6).toString()
     this.activeSession.excessHedgeQuantity = '0'
-    if (this.activeSession.state !== 'POLY_HEDGING') {
+    // 并行预对冲不能改会话状态：MEXC成交回读依赖 MEXC_SUBMITTED 状态机，
+    // 这里只记录Polymarket成交，等真实成交回报后由补齐调用收尾。
+    if (!options.parallel && this.activeSession.state !== 'POLY_HEDGING') {
       await this.transition('POLY_HEDGING', `${recoveryMode ? '恢复' : '开始'}对冲：MEXC实际成交${mexcFill.quantity}份，Polymarket计算目标${targetQuantity.toDecimalPlaces(6).toString()}份`)
     }
     const broker = this.settings.mode === 'SIMULATION'
@@ -1082,8 +1144,10 @@ export class AppController {
 
     for (let attempt = 0; attempt < totalAttempts && remainingQuantity.gt('0.000001'); attempt += 1) {
       const recoveryMaximumPrice = this.calculateRecoveryMaximumPrice(opportunity, mexcFill, fills, remainingQuantity)
-      const maximumPrice = recoveryMode || attempt > 0 ? recoveryMaximumPrice : normalMaximumPrice
-      if (maximumPrice.lte(0)) {
+      const maximumPrice = options.unprotected
+        ? POLYMARKET_MAX_ORDER_PRICE
+        : recoveryMode || attempt > 0 ? recoveryMaximumPrice : normalMaximumPrice
+      if (!options.unprotected && maximumPrice.lte(0)) {
         lastError = `恢复损失上限${this.settings.maxRecoveryLossUsdt} USDT内没有可接受的Polymarket价格`
         break
       }
@@ -1169,6 +1233,14 @@ export class AppController {
       this.liveBroker?.ensureTradingCapacity?.(0)
     ])
 
+    // 并行预对冲只负责把份额打上去，会话仍处于MEXC等待状态；成交回报到达后
+    // 的补齐调用会把预对冲成交计入fills并统一计算结果与收尾，这里提前返回。
+    if (options.parallel) {
+      this.activeSession.remainingHedgeQuantity = remainingQuantity.toDecimalPlaces(6).toString()
+      this.broadcast(this.getSnapshot())
+      return
+    }
+
     if (!this.activeSession) throw new Error('执行会话意外丢失')
     const excessQuantity = Decimal.max(filledQuantity.minus(targetQuantity), 0)
     this.activeSession.excessHedgeQuantity = excessQuantity.toDecimalPlaces(6).toString()
@@ -1176,7 +1248,10 @@ export class AppController {
     this.activeSession.hedgeOutcome = outcome
     const exactlyAligned = remainingQuantity.lte('0.000001') && excessQuantity.lte('0.000001')
     const safeImbalance = !exactlyAligned && Boolean(outcome?.safe)
-    const safeToComplete = outcome ? outcome.safe : exactlyAligned
+    // 无保护模式用户已明确接受裸露风险：只要两腿份额对齐就按HEDGED收尾，
+    // 盈亏照实写进结果摘要，不再因滑点亏损强制进入恢复流程。
+    const unsafeButAccepted = Boolean(options.unprotected && exactlyAligned && outcome && !outcome.safe)
+    const safeToComplete = outcome ? outcome.safe || unsafeButAccepted : exactlyAligned
     if (safeToComplete) {
       this.activeSession.error = undefined
       if (exactlyAligned) this.activeSession.remainingHedgeQuantity = '0'
