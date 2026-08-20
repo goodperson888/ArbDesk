@@ -7,6 +7,8 @@ export interface MexcFillLogRow {
   tn?: string
   tt?: number
   sif?: string
+  /** 订单号，与下单接口返回的data一致 */
+  si?: string
 }
 
 interface MexcFillPayload {
@@ -22,6 +24,8 @@ export interface MexcFillMatch {
   symbolId?: string
   direction: Direction
   submittedAfter: number
+  /** 直连下单时place响应返回的订单号，与流水行的si字段同源；优先按它精确匹配。 */
+  orderId?: string
 }
 
 export function parseMexcFill(rows: MexcFillLogRow[], match: MexcFillMatch): Fill | undefined {
@@ -33,10 +37,15 @@ export function parseMexcFill(rows: MexcFillLogRow[], match: MexcFillMatch): Fil
     } catch {
       continue
     }
-    const eventId = String(payload.ei ?? row.ei ?? '')
-    const direction = String(row.rft ?? '').toUpperCase()
-    const symbolMatches = !match.symbolId || !payload.symbolId || payload.symbolId === match.symbolId
-    if (eventId !== match.eventId || direction !== match.direction || !symbolMatches) continue
+    if (match.orderId) {
+      // 订单号是place接口返回的原始ID，与流水si一一对应，比事件+方向+时间窗更严格。
+      if (String(row.si ?? '') !== match.orderId) continue
+    } else {
+      const eventId = String(payload.ei ?? row.ei ?? '')
+      const direction = String(row.rft ?? '').toUpperCase()
+      const symbolMatches = !match.symbolId || !payload.symbolId || payload.symbolId === match.symbolId
+      if (eventId !== match.eventId || direction !== match.direction || !symbolMatches) continue
+    }
     const quantity = Number(payload.quantity)
     const price = Number(payload.price)
     if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0 || price >= 1) continue

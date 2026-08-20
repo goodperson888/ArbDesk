@@ -175,11 +175,18 @@ function executionTimingSummary(session: ExecutionSession): string | undefined {
   const fill = duration(timings.mexcSubmittedAt, timings.mexcFillDetectedAt)
   const hedge = duration(timings.polymarketStartedAt, timings.polymarketCompletedAt)
   const total = duration(timings.executeRequestedAt, timings.hedgedAt)
+  // 并行预对冲模式下Poly腿在MEXC成交回报前就启动，两段计时重叠，
+  // 分段相加会大于总计；标注出来避免误读成两平台时长相加。
+  const hedgeOverlapsFill = Boolean(
+    timings.polymarketStartedAt && timings.mexcSubmittedAt &&
+    timings.polymarketStartedAt >= timings.mexcSubmittedAt &&
+    (!timings.mexcFillDetectedAt || timings.polymarketStartedAt < timings.mexcFillDetectedAt)
+  )
   if (preflight) segments.push(`复核 ${preflight}`)
   if (page) segments.push(`页面/按钮 ${page}`)
   if (fill) segments.push(`MEXC成交 ${fill}`)
-  if (hedge) segments.push(`Poly对冲 ${hedge}`)
-  if (total) segments.push(`总计 ${total}`)
+  if (hedge) segments.push(`Poly对冲${hedgeOverlapsFill ? '(并行) ' : ' '}${hedge}`)
+  if (total) segments.push(`总计(墙钟) ${total}`)
   return segments.length > 0 ? segments.join(' · ') : undefined
 }
 
@@ -440,10 +447,13 @@ function EmergencyLicensePage({ summary, onStateChange }: { summary: LicenseSumm
         {snapshot.orders.map((order) => {
           const mexcOpen = Number(order.mexc.openQuantity) > 0
           const polymarketOpen = Number(order.polymarket.openQuantity) > 0
+          const hedgeRemaining = Math.max(0, Number(order.polymarket.targetQuantity ?? order.mexc.entryFill?.quantity ?? 0) - Number(order.polymarket.entryFill?.quantity ?? 0))
+          const recoverableHedge = order.status === 'RECOVERY_REQUIRED' && hedgeRemaining > 0.000001 && Date.now() < order.endTime
           const target: CloseTarget | undefined = mexcOpen && polymarketOpen ? 'BOTH' : mexcOpen ? 'MEXC' : polymarketOpen ? 'POLYMARKET' : undefined
           const orderIds = entryOrderIds(order)
           return <article key={order.id} className="emergency-order-card">
             <div><strong>{order.durationMinutes}分钟 · MEXC {directionLabel(order.mexc.direction)}</strong><small>{triggerSourceLabel(order.triggerSource)} · 执行 {new Date(order.createdAt).toLocaleString('zh-CN', { hour12: false })}</small><small>状态 {order.status} · MEXC {Number(order.mexc.openQuantity).toFixed(2)}份 · Poly {Number(order.polymarket.openQuantity).toFixed(2)}份</small>{(orderIds.mexc || orderIds.polymarket) && <small className="emergency-order-ids" title={`MEXC ${orderIds.mexc ?? '无'} / Polymarket ${orderIds.polymarket ?? '无'}`}>订单号：MEXC {orderIds.mexc ?? '—'} · Poly {orderIds.polymarket ?? '—'}</small>}</div>
+            {recoverableHedge && <button disabled={busy} onClick={() => void recover(() => window.arbApp.retryPolymarketHedge({ orderId: order.id }))}><RotateCcw />补齐剩余对冲</button>}
             {target
               ? <button disabled={busy} onClick={() => void recover(() => window.arbApp.closeOrder({ orderId: order.id, target }))}><LogOut />{target === 'BOTH' ? '平掉两腿' : target === 'MEXC' ? '平掉MEXC' : '平掉Polymarket'}</button>
               : <small className="emergency-manual-note">成交数量未知，请先在两平台人工核对；重新授权后可进入完整记录处理。</small>}
@@ -494,6 +504,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [logsOpen, setLogsOpen] = useState(false)
   const [closeIntent, setCloseIntent] = useState<{ order: ArbitrageOrderRecord; target: CloseTarget }>()
   const [dismissedExecutionNoticeKey, setDismissedExecutionNoticeKey] = useState<string>()
+  const [dismissedRecoveryIds, setDismissedRecoveryIds] = useState<Set<string>>(new Set())
   const [maxCapitalDraft, setMaxCapitalDraft] = useState('100.00')
   const [minConditionalReturnDraft, setMinConditionalReturnDraft] = useState('0.00')
   const [quoteValidityDraft, setQuoteValidityDraft] = useState('8')
@@ -642,7 +653,9 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     minimumTestCapital <= 12 &&
     requestedCapital <= dynamicTestCapitalLimit
   )
-  const executionSessionIdle = !snapshot?.activeSession || ['HEDGED', 'CANCELLED'].includes(snapshot.activeSession.state)
+  // 需要恢复的套利组不再阻塞新开仓：主进程会在下一次执行前自动挂起它。
+  const recoveryPending = snapshot?.activeSession?.state === 'RECOVERY_REQUIRED'
+  const executionSessionIdle = !snapshot?.activeSession || ['HEDGED', 'CANCELLED', 'RECOVERY_REQUIRED'].includes(snapshot.activeSession.state)
   const effectiveConditionalReturn = currentPlan?.conditionalReturnPct ?? selected?.conditionalReturnPct ?? '0'
   const conditionalReturnPassed = Boolean(selected && snapshot && Number(effectiveConditionalReturn) >= Number(snapshot.settings.minConditionalReturnPct))
   const settlementRiskPassed = Boolean(selected && !selected.settlementRiskBlocked)
@@ -720,7 +733,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     ...(snapshot.settings.allowUnprofitableTestTrade
       ? [{ id: 'test-trade-limit', passed: testOverrideReady, label: `小额联调限制：人工监督、Poly真实对冲、本金≤${dynamicTestCapitalLimit.toFixed(2)} USDT且硬上限12 USDT`, locked: true }]
       : []),
-    { id: 'execution-idle', passed: executionSessionIdle && !busy, label: executionSessionIdle ? (busy ? '当前操作正在执行' : '当前无执行中操作') : `已有执行中套利组（${snapshot.activeSession?.state ?? '未知状态'}）`, locked: true }
+    { id: 'execution-idle', passed: executionSessionIdle && !busy, label: executionSessionIdle ? (recoveryPending ? '上组待恢复（不阻塞新开仓，可在历史中补单）' : busy ? '当前操作正在执行' : '当前无执行中操作') : `已有执行中套利组（${snapshot.activeSession?.state ?? '未知状态'}）`, locked: true }
   ] : []
 
   useEffect(() => {
@@ -1412,6 +1425,31 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
         onDismiss={() => setDismissedExecutionNoticeKey(executionNoticeKey)}
       />}
 
+      {/* 挂起的待恢复套利组：继续钉在主页醒目位置，按订单号补单，不与新开仓互斥 */}
+      {snapshot.recoverySessions
+        .filter((session) => !dismissedRecoveryIds.has(session.id))
+        .map((session) => <ExecutionBar
+          key={session.id}
+          session={session}
+          busy={busy}
+          onRetryProtected={() => void run(async () => {
+            const result = await window.arbApp.retryPolymarketHedge({ orderId: session.id, mode: 'PROTECTED' })
+            if (result.state !== 'HEDGED') throw new Error(result.error ?? '仍有未对冲份额，请继续恢复或平仓处理')
+            return result
+          }, 'Polymarket剩余敞口恢复完成')}
+          onRetryEmergency={() => {
+            const confirmed = window.confirm('快速恢复会在最大可接受亏损范围内使用多个价位成交，速度更快，但平均价格可能稍差。确认用于减少当前未对冲敞口？')
+            if (!confirmed) return
+            void run(async () => {
+              const result = await window.arbApp.retryPolymarketHedge({ orderId: session.id, mode: 'EMERGENCY_MARKET' })
+              if (result.state !== 'HEDGED') throw new Error(result.error ?? '快速恢复后仍有未对冲份额，请继续恢复或平仓处理')
+              return result
+            }, 'Polymarket快速恢复完成')
+          }}
+          onOpenHistory={() => setHistoryOpen(true)}
+          onDismiss={() => setDismissedRecoveryIds((current) => new Set(current).add(session.id))}
+        />)}
+
       {needsMexcConfirmation && (
         <div className="modal-backdrop" role="presentation">
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="fill-title">
@@ -1446,6 +1484,9 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
         onCloseOrder={(order, target) => {
           setHistoryOpen(false)
           setCloseIntent({ order, target })
+        }}
+        onRetryHedge={(order) => {
+          void run(() => window.arbApp.retryPolymarketHedge({ orderId: order.id }), `已对 ${new Date(order.createdAt).toLocaleTimeString('zh-CN', { hour12: false })} 的套利组发起补单`)
         }}
       />}
 
@@ -1830,12 +1871,14 @@ function HistoryModal({
   orders,
   busy,
   onDismiss,
-  onCloseOrder
+  onCloseOrder,
+  onRetryHedge
 }: {
   orders: ArbitrageOrderRecord[]
   busy: boolean
   onDismiss: () => void
   onCloseOrder: (order: ArbitrageOrderRecord, target: CloseTarget) => void
+  onRetryHedge: (order: ArbitrageOrderRecord) => void
 }): JSX.Element {
   const statusLabels: Record<ArbitrageOrderRecord['status'], string> = {
     OPENING: '开仓中', OPEN: '双腿持仓', UNHEDGED: '单腿敞口', CLOSED: '已平仓',
@@ -1853,6 +1896,8 @@ function HistoryModal({
             const mexcOpen = Number(order.mexc.openQuantity) > 0
             const polymarketOpen = Number(order.polymarket.openQuantity) > 0
             const closeable = Date.now() < order.endTime && !['CLOSED', 'CANCELLED', 'EXPIRED'].includes(order.status)
+            const hedgeRemaining = Math.max(0, Number(order.polymarket.targetQuantity ?? order.mexc.entryFill?.quantity ?? 0) - Number(order.polymarket.entryFill?.quantity ?? 0))
+            const hedgeRetryable = closeable && order.status === 'RECOVERY_REQUIRED' && hedgeRemaining > 0.000001
             const orderIds = entryOrderIds(order)
             return (
               <article className={`history-order ${order.status.toLowerCase()}`} key={order.id}>
@@ -1870,6 +1915,9 @@ function HistoryModal({
                 </div>
                 {order.hedgeOutcome && Number(order.hedgeOutcome.quantityDifference) !== 0 && <p className={`history-hedge-outcome ${order.hedgeOutcome.safe ? 'safe' : 'unsafe'}`}><Info aria-hidden="true" />Poly相对MEXC {Number(order.hedgeOutcome.quantityDifference) >= 0 ? '+' : ''}{money(order.hedgeOutcome.quantityDifference, 2)}份；{order.hedgeOutcome.safe ? '正常互斥结算下两种结果均不亏，未自动平仓。' : '至少一种正常结算结果可能亏损，需要恢复或平仓。'}</p>}
                 {order.closeOperation?.error && <p className={`history-error ${order.status === 'EXPIRED' ? 'archived' : ''}`}>{order.status === 'EXPIRED' ? '历史执行备注：' : ''}{order.closeOperation.error}</p>}
+                {hedgeRetryable && <div className="history-actions">
+                  <button className="recovery-retry-button" onClick={() => onRetryHedge(order)} disabled={busy}>补齐剩余对冲 {hedgeRemaining.toFixed(2)}份</button>
+                </div>}
                 {closeable && (mexcOpen || polymarketOpen) && <div className="history-actions">
                   <button onClick={() => onCloseOrder(order, 'MEXC')} disabled={busy || !mexcOpen}>平 MEXC</button>
                   <button onClick={() => onCloseOrder(order, 'POLYMARKET')} disabled={busy || !polymarketOpen}>平 Polymarket</button>

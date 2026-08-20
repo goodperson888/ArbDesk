@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { BrowserWindow, ipcMain, session } from 'electron'
@@ -45,6 +46,8 @@ interface PrepareOrderRequest {
   durationMinutes?: MarketDuration
   startTime?: number
   eventId?: string
+  /** 计划算出的MEXC最贵可吃档价；直连下单用它做逐档深度检查与价格保护。 */
+  maximumPrice?: string
 }
 
 export interface CloseMexcPositionRequest {
@@ -71,6 +74,7 @@ interface AutomationResult {
   orderResponseUrl?: string
   orderRequestBody?: string
   orderResponseBody?: string
+  orderId?: string
 }
 
 interface HubstudioStartResponse {
@@ -88,6 +92,7 @@ interface MexcRawOutcome {
   si?: string
   rn?: string
   ap?: string
+  [key: string]: unknown
 }
 
 interface MexcRawEvent {
@@ -186,6 +191,9 @@ export class MexcBrowserManager {
   private discoveredPositionFields = new Set<string>()
   private discoveredOpenOrderFields = new Set<string>()
   private discoveredHistoryFields = new Set<string>()
+  private symbolCurrencyMap?: { receivedAt: number; byId: Map<string, { cd: string; mcd: string }> }
+  private symbolCurrencyMapRefreshPromise?: Promise<void>
+  private arbFetchJsonPages = new WeakSet<Page>()
 
   constructor(private readonly configPath: string) {
     this.selectorStore = this.loadSelectors()
@@ -320,6 +328,18 @@ export class MexcBrowserManager {
         .finally(() => { this.hubstudioOrderWarmPromise = undefined })
     }
     const symbolIds = [...new Set(selected.flatMap((event) => event.ers ?? []).map((outcome) => String(outcome.si ?? '')).filter(Boolean))]
+    // 直连下单依赖 symbolsV2 的 si→currencyId 映射；开盘滚动会出现新si，
+    // 缓存缺失或临近过期（>7分钟，早于10分钟TTL）时后台刷新，
+    // 保证下单瞬间永远直接命中缓存、绝不在线上拉这5MB。
+    if (this.mode === 'HUBSTUDIO' && !this.symbolCurrencyMapRefreshPromise &&
+        (!this.symbolCurrencyMap ||
+          symbolIds.some((symbolId) => !this.symbolCurrencyMap!.byId.has(symbolId)) ||
+          Date.now() - this.symbolCurrencyMap.receivedAt > 420_000)) {
+      this.symbolCurrencyMapRefreshPromise = this.fetchSymbolCurrencyMap(true)
+        .then(() => undefined)
+        .catch(() => undefined)
+        .finally(() => { this.symbolCurrencyMapRefreshPromise = undefined })
+    }
     const effectiveDepthReceivedAt = (symbolId: string): number => Math.max(
       Number(this.interceptedDepth.get(symbolId)?.receivedAt) || 0,
       this.hubstudioPredictionSubscriptionKey.includes(symbolId) ? this.hubstudioPredictionConfirmedAt : 0
@@ -601,6 +621,17 @@ export class MexcBrowserManager {
     return this.getStatus()
   }
 
+  private async fetchSummaryLogRows(page: Page): Promise<MexcFillLogRow[]> {
+    const outcome = await this.evaluateMexcFetchJson(
+      page,
+      '/api/platform/predict/asset/query/web/summaryLog?comboExclude=false&pageNum=1&pageSize=50',
+      { method: 'GET' }
+    )
+    if (!outcome.httpOk) throw new Error(`MEXC history HTTP ${outcome.status}`)
+    const body = outcome.body as { data?: { result?: MexcFillLogRow[] } }
+    return body.data?.result ?? []
+  }
+
   async waitForFill(match: MexcFillMatch, timeoutMs = 90_000): Promise<import('../../shared/types').Fill | undefined> {
     const deadline = Date.now() + timeoutMs
     const passiveFill = await this.waitForInterceptedFill(match, Math.min(200, timeoutMs))
@@ -608,14 +639,16 @@ export class MexcBrowserManager {
     const fallbackDelays = [250, 250, 500, 750, 1_000]
     let fallbackIndex = 0
     while (Date.now() < deadline) {
-      const rows = await this.evaluateMexcPage(async () => {
-        const response = await fetch('/api/platform/predict/asset/query/web/summaryLog?comboExclude=false&pageNum=1&pageSize=50', {
-          headers: { accept: 'application/json' }, credentials: 'include'
+      const rows = this.mode === 'HUBSTUDIO' && this.hubstudioPage && !this.hubstudioPage.isClosed()
+        ? await this.fetchSummaryLogRows(this.hubstudioPage)
+        : await this.evaluateMexcPage(async () => {
+          const response = await fetch('/api/platform/predict/asset/query/web/summaryLog?comboExclude=false&pageNum=1&pageSize=50', {
+            headers: { accept: 'application/json' }, credentials: 'include'
+          })
+          if (!response.ok) throw new Error(`MEXC history HTTP ${response.status}`)
+          const body = await response.json() as { data?: { result?: MexcFillLogRow[] } }
+          return body.data?.result ?? []
         })
-        if (!response.ok) throw new Error(`MEXC history HTTP ${response.status}`)
-        const body = await response.json() as { data?: { result?: MexcFillLogRow[] } }
-        return body.data?.result ?? []
-      })
       const receivedAt = Date.now()
       this.applyFeeCalibration(rows as MexcAssetLogRow[], receivedAt, false)
       this.applyInterceptedFillRows(rows, receivedAt)
@@ -901,6 +934,66 @@ export class MexcBrowserManager {
     return await window.webContents.executeJavaScript(`(${fn.toString()})(${JSON.stringify(argument)})`)
   }
 
+  /**
+   * 页面内fetch的常驻通道。Hubstudio容器的CDP是远程连接，page.evaluate每次
+   * 都要把整段函数体序列化传输，单轮往返约1秒；首次调用把__arbFetchJson装进
+   * 页面后，后续每轮只传小参数，把直连下单和成交轮询的往返降到百毫秒级。
+   * 页面跳转后注入会丢失：结果为空或异常时清掉标记并走一次性注入回退，
+   * 下一轮自动重装。fetch仍完全运行在页面上下文里（cookie/指纹与手动一致）。
+   */
+  private async evaluateMexcFetchJson(
+    page: Page,
+    url: string,
+    init: { method?: string; headers?: Record<string, string>; body?: string }
+  ): Promise<{ status: number; httpOk: boolean; body: unknown }> {
+    interface FetchOutcome { status: number; httpOk: boolean; body: unknown }
+    const oneShot = async (): Promise<FetchOutcome> => await page.evaluate(async (argument: { url: string; init: { method?: string; headers?: Record<string, string>; body?: string } }) => {
+      const response = await fetch(argument.url, {
+        method: argument.init.method ?? 'GET',
+        credentials: 'include',
+        headers: { accept: 'application/json', ...(argument.init.headers ?? {}) },
+        body: argument.init.body
+      })
+      let body: unknown
+      try { body = await response.json() } catch { body = undefined }
+      return { status: response.status, httpOk: response.ok, body }
+    }, { url, init })
+    if (!this.arbFetchJsonPages.has(page)) {
+      try {
+        await page.evaluate(() => {
+          const scope = window as unknown as {
+            __arbFetchJson?: (url: string, init: { method?: string; headers?: Record<string, string>; body?: string }) => Promise<{ status: number; httpOk: boolean; body: unknown }>
+          }
+          scope.__arbFetchJson = async (url, init) => {
+            const response = await fetch(url, {
+              method: init.method ?? 'GET',
+              credentials: 'include',
+              headers: { accept: 'application/json', ...(init.headers ?? {}) },
+              body: init.body
+            })
+            let body: unknown
+            try { body = await response.json() } catch { body = undefined }
+            return { status: response.status, httpOk: response.ok, body }
+          }
+        })
+        this.arbFetchJsonPages.add(page)
+      } catch {
+        return await oneShot()
+      }
+    }
+    try {
+      const result = await page.evaluate((argument: { url: string; init: { method?: string; headers?: Record<string, string>; body?: string } }) => {
+        const scope = window as unknown as {
+          __arbFetchJson?: (url: string, init: { method?: string; headers?: Record<string, string>; body?: string }) => Promise<{ status: number; httpOk: boolean; body: unknown }>
+        }
+        return scope.__arbFetchJson?.(argument.url, argument.init)
+      }, { url, init })
+      if (result) return result
+    } catch { /* 回落到一次性注入 */ }
+    this.arbFetchJsonPages.delete(page)
+    return await oneShot()
+  }
+
   private instrumentHubstudioPage(page: Page): void {
     if (this.instrumentedHubstudioPages.has(page)) return
     this.instrumentedHubstudioPages.add(page)
@@ -944,6 +1037,19 @@ export class MexcBrowserManager {
           const normalizedBody = { ...body, timestamp: Number(body.timestamp) || Date.now(), receivedAt: Date.now() }
           this.interceptedDepth.set(symbolId, normalizedBody)
           this.applyInterceptedDepth(symbolId, normalizedBody)
+        }).catch(() => undefined)
+      }
+      if (/\/api\/platform\/predict\/market\/web\/symbolsV2/.test(responseUrl)) {
+        // 页面自己会定期拉symbolsV2，白嫖它的响应更新缓存：
+        // 零额外请求，还顺带刷新7分钟主动预热的计时钟。
+        void response.json().then((body: { data?: { symbols?: Record<string, Array<{ id?: string; cd?: string; mcd?: string }>> } }) => {
+          const byId = new Map<string, { cd: string; mcd: string }>()
+          for (const items of Object.values(body.data?.symbols ?? {})) {
+            for (const item of items) {
+              if (item.id && item.cd && item.mcd) byId.set(item.id, { cd: item.cd, mcd: item.mcd })
+            }
+          }
+          if (byId.size > 0) this.symbolCurrencyMap = { receivedAt: Date.now(), byId }
         }).catch(() => undefined)
       }
       if (/\/api\/platform\/predict\/market\/web\/event\/index\/price\/range/.test(responseUrl)) {
@@ -1299,6 +1405,199 @@ export class MexcBrowserManager {
     }
   }
 
+  // symbolsV2 提供 symbolId(事件里的si) → currencyId(cd)/marketCurrencyId(mcd) 的映射，
+  // 是下单接口必填currencyId的唯一来源。响应约5MB，不能在热路径刷新：
+  // 缓存10分钟，盘中出现新si（开盘滚动）才是真正的刷新时机。
+  private async fetchSymbolCurrencyMap(force = false): Promise<Map<string, { cd: string; mcd: string }> | undefined> {
+    const now = Date.now()
+    if (!force && this.symbolCurrencyMap && now - this.symbolCurrencyMap.receivedAt < 600_000) {
+      return this.symbolCurrencyMap.byId
+    }
+    // 已有后台刷新在跑就等它复用（含热路径强制刷新场景），
+    // 绝不并发第二个5MB请求。注：prewarm先调用本方法再赋值promise，
+    // 同步段读到undefined，不会自等待死锁。
+    if (this.symbolCurrencyMapRefreshPromise) {
+      await this.symbolCurrencyMapRefreshPromise
+      return this.symbolCurrencyMap?.byId
+    }
+    try {
+      const rows = await this.evaluateMexcPage(async () => {
+        const response = await fetch('/api/platform/predict/market/web/symbolsV2', {
+          headers: { accept: 'application/json' }
+        })
+        if (!response.ok) return []
+        const body = await response.json() as {
+          data?: { symbols?: Record<string, Array<{ id?: string; cd?: string; mcd?: string }>> }
+        }
+        const out: Array<{ id: string; cd: string; mcd: string }> = []
+        for (const items of Object.values(body.data?.symbols ?? {})) {
+          for (const item of items) {
+            if (item.id && item.cd && item.mcd) out.push({ id: item.id, cd: item.cd, mcd: item.mcd })
+          }
+        }
+        return out
+      })
+      if (!Array.isArray(rows) || rows.length === 0) return this.symbolCurrencyMap?.byId
+      const byId = new Map(rows.map((row) => [row.id, { cd: row.cd, mcd: row.mcd }]))
+      this.symbolCurrencyMap = { receivedAt: Date.now(), byId }
+      return byId
+    } catch {
+      return this.symbolCurrencyMap?.byId
+    }
+  }
+
+  // MEXC网页端签名（已用真实抓包复算验证）：
+  //   salt = md5(uc_token + nonce).substring(7)
+  //   e    = 请求体按key排序后的urlencoded串
+  //   sign = md5(nonce + e + salt)，随 x-mxc-nonce / x-mxc-sign 头发送。
+  private buildMexcSignedHeaders(token: string, payload: Record<string, string>): Record<string, string> {
+    const nonce = String(Date.now())
+    const md5 = (value: string): string => createHash('md5').update(value).digest('hex')
+    const salt = md5(token + nonce).substring(7)
+    const sorted = Object.keys(payload).sort()
+    const e = new URLSearchParams(sorted.map((key) => [key, payload[key]])).toString()
+    return {
+      'x-mxc-nonce': nonce,
+      'x-mxc-sign': md5(nonce + e + salt)
+    }
+  }
+
+  private async trySubmitHubstudioOrderDirect(page: Page, request: PrepareOrderRequest): Promise<AutomationResult | undefined> {
+    const eventId = String(request.eventId ?? '')
+    const event = (this.interceptedEvents?.events ?? [])
+      .find((candidate) => String(candidate.id ?? '') === eventId)
+    const outcome = (event?.ers ?? [])
+      .find((candidate) => String(candidate.rn ?? '').toUpperCase() === request.direction)
+    if (!outcome) return undefined
+    const symbolId = String(outcome.si ?? '')
+    if (!symbolId) return undefined
+    const currency = (await this.fetchSymbolCurrencyMap())?.get(symbolId)
+      // 仅当上面的调用确实用了旧缓存（而非刚拉取过）时才强制重拉，
+      // 避免热路径上背靠背两次5MB请求（曾造成29秒卡顿）。
+      ?? (Date.now() - (this.symbolCurrencyMap?.receivedAt ?? 0) >= 5_000
+        ? (await this.fetchSymbolCurrencyMap(true))?.get(symbolId)
+        : undefined)
+    if (!currency) return undefined
+    // 逐档深度检查：卖档从低到高累计可成交金额，提交价=恰好覆盖下单金额的那一档。
+    // 旧逻辑只报最优档价，多档计划会被价格保护截断成部分成交（申请10成交8.46的根因）。
+    // 深度不足时不放弃整单：FAK按可成交部分成交，Polymarket按实际成交量对冲（少赚也是赚）；
+    // 但盘口整体超过保护价时只按保护价提交，绝不买贵。
+    const asks = (this.interceptedDepth.get(symbolId)?.data?.asks ?? [])
+      .map((level) => ({ price: String(level.p ?? ''), size: Number(level.q) }))
+      .filter((level) => Number(level.price) > 0 && Number(level.price) < 1 && Number.isFinite(level.size) && level.size > 0)
+      .sort((left, right) => Number(left.price) - Number(right.price))
+    let price = String(outcome.ap ?? '')
+    if (asks.length > 0) {
+      const cap = Number(request.maximumPrice) > 0 ? Number(request.maximumPrice) : Number.POSITIVE_INFINITY
+      const spendAmount = Number(request.amount)
+      let cumulativeCost = 0
+      let walkedPrice = ''
+      for (const level of asks) {
+        if (Number(level.price) > cap) break
+        cumulativeCost += Number(level.price) * level.size
+        walkedPrice = level.price
+        if (cumulativeCost >= spendAmount) break
+      }
+      if (walkedPrice) {
+        price = walkedPrice
+        if (cumulativeCost < spendAmount) {
+          console.info(`[MEXC深度检查] 保护价${request.maximumPrice}内约可成交${cumulativeCost.toFixed(2)} USDT < 下单${request.amount} USDT；按FAK部分成交处理，Polymarket按实际成交量对冲`)
+        }
+      } else if (Number(request.maximumPrice) > 0) {
+        // 盘口已整体超过保护价：按保护价提交，撮不到就不成交，不追价。
+        price = String(request.maximumPrice)
+      }
+    }
+    if (!price) return undefined
+    const cookies = await page.context().cookies(['https://prediction.mexc.com'])
+    const token = cookies.find((cookie) => cookie.name === 'uc_token')?.value
+      ?? cookies.find((cookie) => cookie.name === 'u_id')?.value
+    if (!token) return undefined
+    const payload: Record<string, string> = {
+      currencyId: currency.cd,
+      marketCurrencyId: currency.mcd || MEXC_USDT_COIN_ID,
+      tradeType: 'BUY',
+      price,
+      orderType: 'MARKET_ORDER',
+      orderSource: 'WEB',
+      amount: String(request.amount)
+    }
+    const signedHeaders = this.buildMexcSignedHeaders(token, payload)
+    const submittedAt = Date.now()
+    let outcome2: { status: number; httpOk: boolean; body: unknown }
+    try {
+      // 常驻通道：请求仍由页面上下文发出（cookie/指纹与手动一致），省掉函数体序列化。
+      outcome2 = await this.evaluateMexcFetchJson(page, 'https://prediction.mexc.com/api/platform/predict/orderCenter/web/order/place/market', {
+        method: 'POST',
+        headers: {
+          accept: '*/*',
+          'content-type': 'application/json',
+          language: 'en-US',
+          platform: 'WEB',
+          ...signedHeaders
+        },
+        body: JSON.stringify(payload)
+      })
+    } catch (error) {
+      // 请求可能已到达服务器但响应丢失，重试有重复下单风险，按“结果不确定”上报。
+      return {
+        ok: false,
+        submissionUncertain: true,
+        submittedAt,
+        responseAt: Date.now(),
+        message: `MEXC直连下单网络异常：${error instanceof Error ? error.message : String(error)}；为避免重复下单不再改走页面操作`,
+        matched: {}
+      }
+    }
+    const responseAt = Date.now()
+    const record = outcome2.body && typeof outcome2.body === 'object' ? outcome2.body as Record<string, unknown> : undefined
+    const responseCode = Number(record?.code)
+    const orderAccepted = outcome2.httpOk && (responseCode === 0 || responseCode === 200 || record?.success === true)
+    const orderResponseUrl = 'https://prediction.mexc.com/api/platform/predict/orderCenter/web/order/place/market'
+    const orderRequestBody = JSON.stringify(payload)
+    const orderResponseBody = record === undefined ? '' : JSON.stringify(outcome2.body)
+    if (record === undefined) {
+      return {
+        ok: false,
+        submissionUncertain: true,
+        submittedAt,
+        responseAt,
+        orderResponseUrl,
+        orderRequestBody,
+        message: 'MEXC直连下单返回非JSON响应，接收状态不确定；不再改走页面操作',
+        matched: {}
+      }
+    }
+    if (!orderAccepted) {
+      const reason = String(record?.msg ?? record?.message ?? `HTTP ${outcome2.status}`)
+      return {
+        ok: false,
+        orderAccepted: false,
+        submittedAt,
+        responseAt,
+        orderResponseUrl,
+        orderRequestBody,
+        orderResponseBody,
+        message: `MEXC直连下单被拒绝：${reason}；未启动Polymarket对冲`,
+        matched: {}
+      }
+    }
+    console.info(`[MEXC直连下单] ${orderResponseUrl} 请求=${orderRequestBody} 响应=${orderResponseBody}`)
+    return {
+      ok: true,
+      orderAccepted: true,
+      submittedAt,
+      responseAt,
+      orderResponseUrl,
+      orderRequestBody,
+      orderResponseBody,
+      // place响应data即订单号，与成交流水行的si字段一致，用于精确匹配成交。
+      orderId: typeof record?.data === 'string' ? record.data : undefined,
+      message: 'MEXC直连下单已确认接收（跳过页面操作），正在等待该笔实际成交',
+      matched: {}
+    }
+  }
+
   private async prepareHubstudioOrder(request: PrepareOrderRequest): Promise<AutomationResult> {
     const page = this.hubstudioExecutionPage(request.durationMinutes)
     if (!page || page.isClosed()) return { ok: false, message: 'Hubstudio MEXC页面不可用', matched: {} }
@@ -1307,6 +1606,12 @@ export class MexcBrowserManager {
     }
     if (request.allowSubmit && Number(request.amount) < 1) {
       return { ok: false, message: `MEXC下单金额${request.amount} USDT低于当前1 USDT最小值；未点击买入`, matched: {} }
+    }
+    // 直连下单：字段映射已验证时直接POST下单API，跳过全部UI操作
+    // （切盘、点方向、填金额、等按钮），约省1.4s；解析不了则回退UI自动化。
+    if (request.allowSubmit && request.eventId) {
+      const direct = await this.trySubmitHubstudioOrderDirect(page, request)
+      if (direct) return direct
     }
     if (request.durationMinutes && request.startTime) {
       try {

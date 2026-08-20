@@ -262,6 +262,8 @@ export interface ExecutionPlan {
   bestLevelQuantity: string
   marketDepthQuantity: string
   mexcAveragePrice: string
+  /** 覆盖计划数量所要吃到的最贵MEXC档位价，作为直连下单的价格保护上限。 */
+  mexcMaximumPrice: string
   polymarketAveragePrice: string
   polymarketMaximumPrice: string
   mexcSpend: string
@@ -312,6 +314,7 @@ export interface AppSnapshot {
   opportunities: Opportunity[]
   orderHistory: ArbitrageOrderRecord[]
   activeSession?: ExecutionSession
+  recoverySessions: ExecutionSession[]
   recentEvents: ExecutionEvent[]
   autoOpenState: AutoOpenState
 }
@@ -333,6 +336,7 @@ export interface CloseOrderRequest {
 
 export interface RetryPolymarketHedgeRequest {
   mode?: RecoveryHedgeMode
+  orderId?: string
 }
 
 export interface UpdateSettingsRequest extends Omit<Partial<RiskSettings>, 'manualExecutionConditions'> {

@@ -188,6 +188,7 @@ export function calculateDepthExecutionPlan(input: ExecutionPlanInput): Executio
     bestLevelQuantity: bestLevelQuantity.toFixed(2),
     marketDepthQuantity: marketDepth.toFixed(2),
     mexcAveragePrice: values?.mexc.averagePrice.toFixed(6) ?? '0',
+    mexcMaximumPrice: values?.mexc.worstPrice.toFixed(4) ?? '',
     polymarketAveragePrice: values?.polymarket.averagePrice.toFixed(6) ?? '0',
     polymarketMaximumPrice: values?.polymarket.worstPrice.toFixed(4) ?? maximumPolymarketPrice.toFixed(4),
     mexcSpend: values?.mexc.cost.toFixed(2, Decimal.ROUND_UP) ?? '0.00',

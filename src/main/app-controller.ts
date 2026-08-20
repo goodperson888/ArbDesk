@@ -93,6 +93,9 @@ export class AppController {
   private opportunities: Opportunity[] = []
   private activeSession?: ExecutionSession
   private activeOpportunity?: Opportunity
+  // RECOVERY_REQUIRED的会话不再占用唯一的执行槽：挂起后可以继续开新仓，
+  // 恢复补单时按orderId取回（见resolveRecoverySession）。
+  private parkedRecoverySessions = new Map<string, ExecutionSession>()
   private parallelHedgePromise?: Promise<void>
   private recentEvents: ExecutionEvent[] = []
   private orderHistory: ArbitrageOrderRecord[] = []
@@ -215,6 +218,13 @@ export class AppController {
       opportunities: this.opportunities,
       orderHistory: this.orderHistory,
       activeSession: this.activeSessionForSnapshot(now),
+      // 已到期的挂起恢复组不再展示，也从挂起区清掉。
+      recoverySessions: [...this.parkedRecoverySessions.values()].filter((session) => {
+        const order = this.orderHistory.find((candidate) => candidate.id === session.id)
+        const stillRecoverable = Boolean(order) && order!.endTime > now && order!.status !== 'EXPIRED'
+        if (!stillRecoverable) this.parkedRecoverySessions.delete(session.id)
+        return stillRecoverable
+      }),
       recentEvents: this.recentEvents,
       autoOpenState: this.autoOpenState
     }
@@ -431,11 +441,44 @@ export class AppController {
     this.broadcast(this.getSnapshot())
   }
 
+  private parkRecoverySessionIfNeeded(): void {
+    if (!this.activeSession || this.activeSession.state !== 'RECOVERY_REQUIRED') return
+    this.parkedRecoverySessions.set(this.activeSession.id, this.activeSession)
+    this.activeSession = undefined
+    this.activeExecutionPlan = undefined
+    this.broadcast(this.getSnapshot())
+  }
+
+  private resolveRecoverySession(orderId?: string): ExecutionSession {
+    const active = this.activeSession
+    if (active && !['HEDGED', 'CANCELLED', 'RECOVERY_REQUIRED'].includes(active.state)) {
+      throw new Error('当前有执行中的流程，请等它结束或恢复后再补单')
+    }
+    if (!orderId && active?.state === 'RECOVERY_REQUIRED') return active
+    const parked = orderId
+      ? this.parkedRecoverySessions.get(orderId)
+      : [...this.parkedRecoverySessions.values()].at(-1)
+    if (!parked) throw new Error('当前没有可重试的Polymarket剩余对冲')
+    const order = this.orderHistory.find((candidate) => candidate.id === parked.id)
+    if (!order || order.endTime <= Date.now() || order.status === 'EXPIRED') {
+      this.parkedRecoverySessions.delete(parked.id)
+      throw new Error('该套利组已到期，不能再补对冲')
+    }
+    this.parkedRecoverySessions.delete(parked.id)
+    // 只挂起真正待恢复的会话；已完成的（HEDGED等）直接让位。
+    if (this.activeSession?.state === 'RECOVERY_REQUIRED') {
+      this.parkedRecoverySessions.set(this.activeSession.id, this.activeSession)
+    }
+    this.activeSession = parked
+    return parked
+  }
+
   async execute(request: ExecuteRequest): Promise<ExecutionSession> {
     const executeRequestedAt = Date.now()
     const triggerSource = request.source ?? (this.settings.allowUnprofitableTestTrade ? 'TEST' : 'MANUAL')
     let quotesConfirmedAt = executeRequestedAt
     if (this.closingOrderId) throw new Error('平仓流程正在执行，不能同时开新仓')
+    this.parkRecoverySessionIfNeeded()
     if (this.hasActionableActiveSession(executeRequestedAt)) {
       throw new Error('已有执行中的套利组，不能重复开仓')
     }
@@ -541,7 +584,8 @@ export class AppController {
       allowSubmit: this.settings.mexcAutomationEnabled,
       durationMinutes: opportunity.durationMinutes,
       startTime: opportunity.startTime,
-      eventId: opportunity.mexcEventId
+      eventId: opportunity.mexcEventId,
+      maximumPrice: executionPlan.mexcMaximumPrice
     })
     this.activeSession.timings = {
       ...this.activeSession.timings!,
@@ -584,7 +628,7 @@ export class AppController {
       const awaitingManualClick = !this.settings.mexcAutomationEnabled
       if (automaticAccepted || awaitingManualClick) {
         const submittedAfter = (result.submittedAt ?? Date.now()) - 2_000
-        void this.monitorMexcFill(opportunity, submittedAfter, awaitingManualClick ? 120_000 : 90_000)
+        void this.monitorMexcFill(opportunity, submittedAfter, awaitingManualClick ? 120_000 : 90_000, result.orderId)
       }
       // 把Polymarket侧的准备请求藏在MEXC成交等待窗口内：服务器时间偏移与
       // 盘口元数据预热完成后，对冲下单路径可少付1-2个CLOB往返。
@@ -701,15 +745,19 @@ export class AppController {
     return this.activeSession
   }
 
-  private async monitorMexcFill(opportunity: Opportunity, submittedAfter: number, timeoutMs = 90_000): Promise<void> {
+  private async monitorMexcFill(opportunity: Opportunity, submittedAfter: number, timeoutMs = 90_000, orderId?: string): Promise<void> {
+    // 多组并行后同一个机会可能被再次执行：严格绑定会话ID，
+    // 防止上一组的成交回读把fill写进新会话。
+    const sessionId = this.activeSession?.id
     try {
       const fill = await this.mexcBrowser.waitForFill({
         eventId: opportunity.mexcEventId,
         symbolId: opportunity.mexcSymbolId,
         direction: opportunity.mexcDirection,
-        submittedAfter
+        submittedAfter,
+        ...(orderId ? { orderId } : {})
       }, timeoutMs)
-      if (!this.activeSession || this.activeSession.opportunityId !== opportunity.id) return
+      if (!this.activeSession || this.activeSession.id !== sessionId || this.activeSession.opportunityId !== opportunity.id) return
       if (!['MEXC_SUBMITTED', 'MEXC_SUBMITTING'].includes(this.activeSession.state)) return
       if (!fill) {
         this.activeSession.error = `MEXC成交回读在${Math.round(timeoutMs / 1_000)}秒内没有检测到本轮真实成交；请核对MEXC成交记录，必要时使用人工强制录入`
@@ -718,7 +766,7 @@ export class AppController {
       }
       await this.completeMexcFill(fill, true)
     } catch (error) {
-      if (!this.activeSession || this.activeSession.opportunityId !== opportunity.id) return
+      if (!this.activeSession || this.activeSession.id !== sessionId || this.activeSession.opportunityId !== opportunity.id) return
       if (!['MEXC_SUBMITTED', 'MEXC_SUBMITTING'].includes(this.activeSession.state)) return
       this.activeSession.error = `MEXC自动成交读取失败：${error instanceof Error ? error.message : String(error)}`
       this.broadcast(this.getSnapshot())
@@ -735,23 +783,30 @@ export class AppController {
   }
 
   async retryPolymarketHedge(request: RetryPolymarketHedgeRequest = {}): Promise<ExecutionSession> {
-    if (
-      !this.activeSession ||
-      this.activeSession.state !== 'RECOVERY_REQUIRED' ||
-      !this.hasActionableActiveSession(Date.now())
-    ) {
+    const session = this.resolveRecoverySession(request.orderId)
+    if (!this.hasActionableActiveSession(Date.now())) {
       throw new Error('当前没有可重试的Polymarket剩余对冲')
     }
-    const opportunity = this.activeOpportunity ?? this.opportunities.find((item) => item.id === this.activeSession?.opportunityId)
-    if (!opportunity || !this.activeSession.mexcFill) throw new Error('恢复所需的原机会或MEXC成交记录已经丢失')
-    this.activeSession.error = undefined
+    // 挂起会话恢复时activeOpportunity可能已指向别组，严格按会话的opportunityId找。
+    const opportunity = this.opportunities.find((item) => item.id === session.opportunityId)
+    if (!opportunity || !session.mexcFill) throw new Error('恢复所需的原机会或MEXC成交记录已经丢失')
+    session.error = undefined
     const hedgeMode = request.mode === 'EMERGENCY_MARKET'
       ? 'PROTECTED_MARKET'
       : request.mode === 'PROTECTED'
         ? 'PROTECTED_LIMIT'
         : this.settings.polymarketHedgeMode
-    await this.hedgePolymarket(opportunity, this.activeSession.mexcFill, true, hedgeMode)
-    return this.activeSession
+    try {
+      await this.hedgePolymarket(opportunity, session.mexcFill, true, hedgeMode)
+    } finally {
+      // 恢复后仍未完成时重新挂起，继续让出执行槽给新的开仓。
+      if (this.activeSession === session && session.state === 'RECOVERY_REQUIRED') {
+        this.parkedRecoverySessions.set(session.id, session)
+        this.activeSession = undefined
+        this.broadcast(this.getSnapshot())
+      }
+    }
+    return session
   }
 
   async closeOrder(request: CloseOrderRequest): Promise<ArbitrageOrderRecord> {
@@ -1703,7 +1758,7 @@ export class AppController {
   private evaluateAutoOpen(): void {
     if (
       !this.settings.autoOpenEnabled || this.autoOpenAttempting ||
-      (this.activeSession && !['HEDGED', 'CANCELLED'].includes(this.activeSession.state))
+      (this.activeSession && !['HEDGED', 'CANCELLED', 'RECOVERY_REQUIRED'].includes(this.activeSession.state))
     ) {
       this.clearAutoOpenCandidate()
       return

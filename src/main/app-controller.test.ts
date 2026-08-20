@@ -593,6 +593,39 @@ describe('AppController simulation', () => {
     expect(order.polymarket.entryFills).toHaveLength(1)
   })
 
+  it('parks a recovery group so it does not block a new execution, then recovers it by orderId', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    let allowFill = false
+    const hedge = vi.fn(async (order: HedgeOrder) => {
+      if (!allowFill) throw new Error('temporary no liquidity')
+      return {
+        venue: 'POLYMARKET' as const, direction: order.direction, quantity: order.quantity,
+        averagePrice: '0.52', orderId: `parked-retry-${Date.now()}`, filledAt: Date.now()
+      }
+    })
+    const controller = await createAssistedExecutionController(hedge)
+    await controller.updateSettings({ polymarketHedgeRetryCount: 0 })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+    const first = await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-parked-1', manualAcknowledged: true })
+    expect(first.state).toBe('RECOVERY_REQUIRED')
+    expect(first.remainingHedgeQuantity).toBe('10')
+
+    const secondSession = await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+    expect(secondSession.id).not.toBe(first.id)
+    const second = await controller.confirmMexcFill({ quantity: '10', averagePrice: '0.40', orderId: 'mexc-parked-2', manualAcknowledged: true })
+    expect(second.state).toBe('RECOVERY_REQUIRED')
+
+    allowFill = true
+    const recovered = await controller.retryPolymarketHedge({ orderId: first.id })
+    expect(recovered.id).toBe(first.id)
+    expect(recovered.state).toBe('HEDGED')
+    expect(Number(recovered.polymarketFill?.quantity)).toBe(10)
+    const orders = controller.getSnapshot().orderHistory
+    expect(orders.find((order) => order.id === first.id)?.status).toBe('OPEN')
+    expect(orders.find((order) => order.id === second.id)?.status).toBe('RECOVERY_REQUIRED')
+  })
+
   it('allows a disabled manual profit condition while automatic opening remains strict', async () => {
     vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
     const controller = await createAssistedExecutionController(async (order) => ({
