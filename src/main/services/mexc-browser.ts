@@ -30,6 +30,11 @@ const MEXC_EVENT_CACHE_MS = 10_000
 const MEXC_FEE_CACHE_MS = 10 * 60_000
 const MEXC_REST_FALLBACK_MS = 10_000
 const MEXC_PREFLIGHT_QUOTE_MS = 500
+const MEXC_RATE_LIMIT_COOLDOWN_MS = 60_000
+const MEXC_FORBIDDEN_COOLDOWN_MS = 15 * 60_000
+const MEXC_FILL_READBACK_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000, 8_000, 16_000] as const
+const MEXC_SYMBOL_MAP_TIMEOUT_MS = 5_000
+const MEXC_FILL_QUERY_TIMEOUT_MS = 5_000
 const execFileAsync = promisify(execFile)
 
 interface MexcSelectors {
@@ -75,6 +80,9 @@ interface AutomationResult {
   orderRequestBody?: string
   orderResponseBody?: string
   orderId?: string
+  currencyMappingMs?: number
+  cookieReadMs?: number
+  postMs?: number
 }
 
 interface HubstudioStartResponse {
@@ -119,6 +127,25 @@ interface MexcRawDepth {
 interface MexcRawIndexRange {
   data?: Array<{ p?: string; ts?: number }>
   timestamp?: number
+}
+
+interface MexcFetchOutcome {
+  status: number
+  httpOk: boolean
+  body: unknown
+  retryAfter?: string
+}
+
+interface MexcFetchInit {
+  method?: string
+  headers?: Record<string, string>
+  body?: string
+  timeoutMs?: number
+}
+
+function normalizeSourceTimestamp(value: number | undefined): number | undefined {
+  if (!Number.isFinite(value) || !value || value <= 0) return undefined
+  return value < 10_000_000_000 ? value * 1_000 : value
 }
 
 export interface MexcOutcomeQuote {
@@ -194,6 +221,8 @@ export class MexcBrowserManager {
   private symbolCurrencyMap?: { receivedAt: number; byId: Map<string, { cd: string; mcd: string }> }
   private symbolCurrencyMapRefreshPromise?: Promise<void>
   private arbFetchJsonPages = new WeakSet<Page>()
+  private arbFetchInitScriptPages = new WeakSet<Page>()
+  private mexcRequestsBlockedUntil = 0
 
   constructor(private readonly configPath: string) {
     this.selectorStore = this.loadSelectors()
@@ -390,7 +419,8 @@ export class MexcBrowserManager {
       const latestIndex = (fallback.indexRange?.data ?? [])
         .filter((point) => Number(point.p) > 0 && Number(point.ts) > 0)
         .sort((left, right) => Number(right.ts) - Number(left.ts))[0]
-      if (latestIndex?.p) this.latestMexcIndex = { price: String(latestIndex.p), receivedAt: Date.now() }
+      const latestIndexAt = normalizeSourceTimestamp(latestIndex?.ts)
+      if (latestIndex?.p && latestIndexAt) this.latestMexcIndex = { price: String(latestIndex.p), receivedAt: latestIndexAt }
       if (fallback.feeRows) {
         this.applyFeeCalibration(fallback.feeRows, Date.now(), true)
       }
@@ -497,7 +527,8 @@ export class MexcBrowserManager {
     const latestIndex = (result.indexRange?.data ?? [])
       .filter((point) => Number(point.p) > 0 && Number(point.ts) > 0)
       .sort((left, right) => Number(right.ts) - Number(left.ts))[0]
-    if (latestIndex?.p) this.applyMexcIndex(String(latestIndex.p), result.receivedAt)
+    const latestIndexAt = normalizeSourceTimestamp(latestIndex?.ts)
+    if (latestIndex?.p && latestIndexAt) this.applyMexcIndex(String(latestIndex.p), latestIndexAt)
     if (result.feeRows) this.applyFeeCalibration(result.feeRows, result.receivedAt, true)
   }
 
@@ -625,7 +656,7 @@ export class MexcBrowserManager {
     const outcome = await this.evaluateMexcFetchJson(
       page,
       '/api/platform/predict/asset/query/web/summaryLog?comboExclude=false&pageNum=1&pageSize=50',
-      { method: 'GET' }
+      { method: 'GET', timeoutMs: MEXC_FILL_QUERY_TIMEOUT_MS }
     )
     if (!outcome.httpOk) throw new Error(`MEXC history HTTP ${outcome.status}`)
     const body = outcome.body as { data?: { result?: MexcFillLogRow[] } }
@@ -633,33 +664,64 @@ export class MexcBrowserManager {
   }
 
   async waitForFill(match: MexcFillMatch, timeoutMs = 90_000): Promise<import('../../shared/types').Fill | undefined> {
+    const readbackStartedAt = Date.now()
+    let restQueries = 0
+    const measured = (fill: import('../../shared/types').Fill | undefined): import('../../shared/types').Fill | undefined => fill ? {
+      ...fill,
+      executionDetails: {
+        ...fill.executionDetails,
+        readbackMs: Date.now() - readbackStartedAt,
+        restQueries
+      }
+    } : undefined
     const deadline = Date.now() + timeoutMs
     const passiveFill = await this.waitForInterceptedFill(match, Math.min(200, timeoutMs))
-    if (passiveFill) return passiveFill
-    const fallbackDelays = [250, 250, 500, 750, 1_000]
-    let fallbackIndex = 0
-    while (Date.now() < deadline) {
-      const rows = this.mode === 'HUBSTUDIO' && this.hubstudioPage && !this.hubstudioPage.isClosed()
-        ? await this.fetchSummaryLogRows(this.hubstudioPage)
-        : await this.evaluateMexcPage(async () => {
-          const response = await fetch('/api/platform/predict/asset/query/web/summaryLog?comboExclude=false&pageNum=1&pageSize=50', {
-            headers: { accept: 'application/json' }, credentials: 'include'
+    if (passiveFill) return measured(passiveFill)
+    // REST只做有上限的成交核验。预算耗尽后继续等待页面/WS被动回执，
+    // 不会因一笔异常订单在90秒内持续每秒打history接口。
+    for (const delay of MEXC_FILL_READBACK_DELAYS_MS) {
+      if (Date.now() >= deadline) break
+      // 查询发出后仍保持页面响应监听；如果MEXC页面自己的成交回执先回来，
+      // 直接使用它，不会为“并行”再增加第二个HTTP请求。
+      const observer = this.observeInterceptedFill(match)
+      let rows: MexcFillLogRow[]
+      try {
+        restQueries += 1
+        if (this.mode === 'HUBSTUDIO' && this.hubstudioPage && !this.hubstudioPage.isClosed()) {
+          rows = await this.fetchSummaryLogRows(this.hubstudioPage)
+        } else {
+          this.assertMexcRequestsAvailable()
+          const outcome = await this.evaluateMexcPage(async () => {
+            const response = await fetch('/api/platform/predict/asset/query/web/summaryLog?comboExclude=false&pageNum=1&pageSize=50', {
+              headers: { accept: 'application/json' }, credentials: 'include',
+              signal: AbortSignal.timeout(5_000)
+            })
+            let body: unknown
+            try { body = await response.json() } catch { body = undefined }
+            return {
+              status: response.status,
+              httpOk: response.ok,
+              retryAfter: response.headers.get('retry-after') ?? undefined,
+              body
+            }
           })
-          if (!response.ok) throw new Error(`MEXC history HTTP ${response.status}`)
-          const body = await response.json() as { data?: { result?: MexcFillLogRow[] } }
-          return body.data?.result ?? []
-        })
-      const receivedAt = Date.now()
-      this.applyFeeCalibration(rows as MexcAssetLogRow[], receivedAt, false)
-      this.applyInterceptedFillRows(rows, receivedAt)
-      const fill = parseMexcFill(rows, match)
-      if (fill) return fill
-      const delay = fallbackDelays[Math.min(fallbackIndex, fallbackDelays.length - 1)]
-      fallbackIndex += 1
+          this.applyMexcResponseProtection(outcome)
+          if (!outcome.httpOk) throw new Error(`MEXC history HTTP ${outcome.status}`)
+          const body = outcome.body as { data?: { result?: MexcFillLogRow[] } }
+          rows = body.data?.result ?? []
+        }
+        const receivedAt = Date.now()
+        this.applyFeeCalibration(rows as MexcAssetLogRow[], receivedAt, false)
+        this.applyInterceptedFillRows(rows, receivedAt)
+        const fill = observer.current() ?? parseMexcFill(rows, match)
+        if (fill) return measured(fill)
+      } finally {
+        observer.stop()
+      }
       const intercepted = await this.waitForInterceptedFill(match, Math.min(delay, Math.max(0, deadline - Date.now())))
-      if (intercepted) return intercepted
+      if (intercepted) return measured(intercepted)
     }
-    return undefined
+    return measured(await this.waitForInterceptedFill(match, Math.max(0, deadline - Date.now())))
   }
 
   async calibrate(kind: MexcCalibrationKind): Promise<MexcBrowserStatus> {
@@ -904,6 +966,7 @@ export class MexcBrowserManager {
       if (!page.url().endsWith(`/${target.eventId}`)) {
         await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 30_000 })
       }
+      await this.installMexcFetchJson(page).catch(() => undefined)
       await page.locator('[data-tutorial-id="detail-tutorial-amount"] input, input[placeholder="0"]')
         .first()
         .waitFor({ state: 'visible', timeout: 15_000 })
@@ -944,59 +1007,100 @@ export class MexcBrowserManager {
   private async evaluateMexcFetchJson(
     page: Page,
     url: string,
-    init: { method?: string; headers?: Record<string, string>; body?: string }
-  ): Promise<{ status: number; httpOk: boolean; body: unknown }> {
-    interface FetchOutcome { status: number; httpOk: boolean; body: unknown }
-    const oneShot = async (): Promise<FetchOutcome> => await page.evaluate(async (argument: { url: string; init: { method?: string; headers?: Record<string, string>; body?: string } }) => {
+    init: MexcFetchInit
+  ): Promise<MexcFetchOutcome> {
+    this.assertMexcRequestsAvailable()
+    const oneShot = async (): Promise<MexcFetchOutcome> => await page.evaluate(async (argument: { url: string; init: MexcFetchInit }) => {
       const response = await fetch(argument.url, {
         method: argument.init.method ?? 'GET',
         credentials: 'include',
         headers: { accept: 'application/json', ...(argument.init.headers ?? {}) },
-        body: argument.init.body
+        body: argument.init.body,
+        signal: argument.init.timeoutMs ? AbortSignal.timeout(argument.init.timeoutMs) : undefined
       })
       let body: unknown
       try { body = await response.json() } catch { body = undefined }
-      return { status: response.status, httpOk: response.ok, body }
+      return { status: response.status, httpOk: response.ok, retryAfter: response.headers.get('retry-after') ?? undefined, body }
     }, { url, init })
     if (!this.arbFetchJsonPages.has(page)) {
       try {
-        await page.evaluate(() => {
-          const scope = window as unknown as {
-            __arbFetchJson?: (url: string, init: { method?: string; headers?: Record<string, string>; body?: string }) => Promise<{ status: number; httpOk: boolean; body: unknown }>
-          }
-          scope.__arbFetchJson = async (url, init) => {
-            const response = await fetch(url, {
-              method: init.method ?? 'GET',
-              credentials: 'include',
-              headers: { accept: 'application/json', ...(init.headers ?? {}) },
-              body: init.body
-            })
-            let body: unknown
-            try { body = await response.json() } catch { body = undefined }
-            return { status: response.status, httpOk: response.ok, body }
-          }
-        })
-        this.arbFetchJsonPages.add(page)
+        await this.installMexcFetchJson(page)
       } catch {
-        return await oneShot()
+        const result = await oneShot()
+        this.applyMexcResponseProtection(result)
+        return result
       }
     }
     try {
-      const result = await page.evaluate((argument: { url: string; init: { method?: string; headers?: Record<string, string>; body?: string } }) => {
+      const result = await page.evaluate((argument: { url: string; init: MexcFetchInit }) => {
         const scope = window as unknown as {
-          __arbFetchJson?: (url: string, init: { method?: string; headers?: Record<string, string>; body?: string }) => Promise<{ status: number; httpOk: boolean; body: unknown }>
+          __arbFetchJson?: (url: string, init: MexcFetchInit) => Promise<MexcFetchOutcome>
         }
         return scope.__arbFetchJson?.(argument.url, argument.init)
       }, { url, init })
-      if (result) return result
+      if (result) {
+        this.applyMexcResponseProtection(result)
+        return result
+      }
     } catch { /* 回落到一次性注入 */ }
     this.arbFetchJsonPages.delete(page)
-    return await oneShot()
+    const result = await oneShot()
+    this.applyMexcResponseProtection(result)
+    return result
+  }
+
+  private assertMexcRequestsAvailable(): void {
+    const remainingMs = this.mexcRequestsBlockedUntil - Date.now()
+    if (remainingMs <= 0) return
+    throw new Error(`MEXC请求保护已触发，暂停自动请求约${Math.ceil(remainingMs / 1_000)}秒；不会自动重试下单`)
+  }
+
+  private applyMexcResponseProtection(outcome: Pick<MexcFetchOutcome, 'status' | 'retryAfter'>): void {
+    if (outcome.status !== 403 && outcome.status !== 429) return
+    const retryAfterMs = this.parseRetryAfterMs(outcome.retryAfter)
+    const fallback = outcome.status === 429 ? MEXC_RATE_LIMIT_COOLDOWN_MS : MEXC_FORBIDDEN_COOLDOWN_MS
+    this.mexcRequestsBlockedUntil = Math.max(this.mexcRequestsBlockedUntil, Date.now() + (retryAfterMs ?? fallback))
+  }
+
+  private parseRetryAfterMs(value: string | undefined): number | undefined {
+    if (!value) return undefined
+    const seconds = Number(value)
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.max(1_000, seconds * 1_000)
+    const dateMs = Date.parse(value)
+    return Number.isFinite(dateMs) ? Math.max(1_000, dateMs - Date.now()) : undefined
+  }
+
+  private async installMexcFetchJson(page: Page): Promise<void> {
+    const install = (): void => {
+      const scope = window as unknown as {
+          __arbFetchJson?: (url: string, init: MexcFetchInit) => Promise<MexcFetchOutcome>
+      }
+      if (scope.__arbFetchJson) return
+      scope.__arbFetchJson = async (url, init) => {
+        const response = await fetch(url, {
+          method: init.method ?? 'GET',
+          credentials: 'include',
+          headers: { accept: 'application/json', ...(init.headers ?? {}) },
+          body: init.body,
+          signal: init.timeoutMs ? AbortSignal.timeout(init.timeoutMs) : undefined
+        })
+        let body: unknown
+        try { body = await response.json() } catch { body = undefined }
+        return { status: response.status, httpOk: response.ok, retryAfter: response.headers.get('retry-after') ?? undefined, body }
+      }
+    }
+    if (!this.arbFetchInitScriptPages.has(page)) {
+      await page.addInitScript(install)
+      this.arbFetchInitScriptPages.add(page)
+    }
+    await page.evaluate(install)
+    this.arbFetchJsonPages.add(page)
   }
 
   private instrumentHubstudioPage(page: Page): void {
     if (this.instrumentedHubstudioPages.has(page)) return
     this.instrumentedHubstudioPages.add(page)
+    void this.installMexcFetchJson(page).catch(() => undefined)
     const isOrderEndpoint = (url: string): boolean => /\/api\/platform\/predict\/orderCenter\/web\/order\/(?:place\/(?:market|limit)|cancel)/.test(url)
     const objectFields = (value: unknown): string[] => {
       if (!value || typeof value !== 'object' || Array.isArray(value)) return []
@@ -1058,7 +1162,8 @@ export class MexcBrowserManager {
             .filter((point) => Number(point.p) > 0 && Number(point.ts) > 0)
             .sort((left, right) => Number(right.ts) - Number(left.ts))[0]
           if (!latest?.p) return
-          this.applyMexcIndex(String(latest.p), Date.now())
+          const latestAt = normalizeSourceTimestamp(latest.ts)
+          if (latestAt) this.applyMexcIndex(String(latest.p), latestAt)
         }).catch(() => undefined)
       }
       if (/\/api\/platform\/predict\/asset\/query\/web\/summaryLog/.test(responseUrl)) {
@@ -1096,6 +1201,21 @@ export class MexcBrowserManager {
   private applyInterceptedFillRows(rows: MexcFillLogRow[], receivedAt: number): void {
     this.latestFillRows = { rows, receivedAt }
     for (const listener of this.fillRowListeners) listener(rows)
+  }
+
+  private observeInterceptedFill(match: MexcFillMatch): {
+    current: () => import('../../shared/types').Fill | undefined
+    stop: () => void
+  } {
+    let fill = this.latestFillRows ? parseMexcFill(this.latestFillRows.rows, match) : undefined
+    const listener = (rows: MexcFillLogRow[]): void => {
+      fill ??= parseMexcFill(rows, match)
+    }
+    this.fillRowListeners.add(listener)
+    return {
+      current: () => fill,
+      stop: () => this.fillRowListeners.delete(listener)
+    }
   }
 
   private async waitForInterceptedFill(match: MexcFillMatch, timeoutMs: number): Promise<import('../../shared/types').Fill | undefined> {
@@ -1421,22 +1541,37 @@ export class MexcBrowserManager {
       return this.symbolCurrencyMap?.byId
     }
     try {
-      const rows = await this.evaluateMexcPage(async () => {
+      this.assertMexcRequestsAvailable()
+      const outcome = await this.evaluateMexcPage(async (timeoutMs: number) => {
         const response = await fetch('/api/platform/predict/market/web/symbolsV2', {
-          headers: { accept: 'application/json' }
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(timeoutMs)
         })
-        if (!response.ok) return []
+        let rows: Array<{ id: string; cd: string; mcd: string }> = []
+        if (!response.ok) return {
+          status: response.status,
+          httpOk: false,
+          retryAfter: response.headers.get('retry-after') ?? undefined,
+          rows
+        }
         const body = await response.json() as {
           data?: { symbols?: Record<string, Array<{ id?: string; cd?: string; mcd?: string }>> }
         }
-        const out: Array<{ id: string; cd: string; mcd: string }> = []
+        rows = []
         for (const items of Object.values(body.data?.symbols ?? {})) {
           for (const item of items) {
-            if (item.id && item.cd && item.mcd) out.push({ id: item.id, cd: item.cd, mcd: item.mcd })
+            if (item.id && item.cd && item.mcd) rows.push({ id: item.id, cd: item.cd, mcd: item.mcd })
           }
         }
-        return out
-      })
+        return {
+          status: response.status,
+          httpOk: response.ok,
+          retryAfter: response.headers.get('retry-after') ?? undefined,
+          rows
+        }
+      }, MEXC_SYMBOL_MAP_TIMEOUT_MS)
+      this.applyMexcResponseProtection(outcome)
+      const rows = outcome.rows
       if (!Array.isArray(rows) || rows.length === 0) return this.symbolCurrencyMap?.byId
       const byId = new Map(rows.map((row) => [row.id, { cd: row.cd, mcd: row.mcd }]))
       this.symbolCurrencyMap = { receivedAt: Date.now(), byId }
@@ -1471,12 +1606,14 @@ export class MexcBrowserManager {
     if (!outcome) return undefined
     const symbolId = String(outcome.si ?? '')
     if (!symbolId) return undefined
+    const currencyMappingStartedAt = Date.now()
     const currency = (await this.fetchSymbolCurrencyMap())?.get(symbolId)
       // 仅当上面的调用确实用了旧缓存（而非刚拉取过）时才强制重拉，
       // 避免热路径上背靠背两次5MB请求（曾造成29秒卡顿）。
       ?? (Date.now() - (this.symbolCurrencyMap?.receivedAt ?? 0) >= 5_000
         ? (await this.fetchSymbolCurrencyMap(true))?.get(symbolId)
         : undefined)
+    const currencyMappingMs = Date.now() - currencyMappingStartedAt
     if (!currency) return undefined
     // 逐档深度检查：卖档从低到高累计可成交金额，提交价=恰好覆盖下单金额的那一档。
     // 旧逻辑只报最优档价，多档计划会被价格保护截断成部分成交（申请10成交8.46的根因）。
@@ -1509,7 +1646,9 @@ export class MexcBrowserManager {
       }
     }
     if (!price) return undefined
+    const cookieReadStartedAt = Date.now()
     const cookies = await page.context().cookies(['https://prediction.mexc.com'])
+    const cookieReadMs = Date.now() - cookieReadStartedAt
     const token = cookies.find((cookie) => cookie.name === 'uc_token')?.value
       ?? cookies.find((cookie) => cookie.name === 'u_id')?.value
     if (!token) return undefined
@@ -1545,6 +1684,9 @@ export class MexcBrowserManager {
         submissionUncertain: true,
         submittedAt,
         responseAt: Date.now(),
+        currencyMappingMs,
+        cookieReadMs,
+        postMs: Date.now() - submittedAt,
         message: `MEXC直连下单网络异常：${error instanceof Error ? error.message : String(error)}；为避免重复下单不再改走页面操作`,
         matched: {}
       }
@@ -1564,6 +1706,9 @@ export class MexcBrowserManager {
         responseAt,
         orderResponseUrl,
         orderRequestBody,
+        currencyMappingMs,
+        cookieReadMs,
+        postMs: responseAt - submittedAt,
         message: 'MEXC直连下单返回非JSON响应，接收状态不确定；不再改走页面操作',
         matched: {}
       }
@@ -1578,6 +1723,9 @@ export class MexcBrowserManager {
         orderResponseUrl,
         orderRequestBody,
         orderResponseBody,
+        currencyMappingMs,
+        cookieReadMs,
+        postMs: responseAt - submittedAt,
         message: `MEXC直连下单被拒绝：${reason}；未启动Polymarket对冲`,
         matched: {}
       }
@@ -1591,6 +1739,9 @@ export class MexcBrowserManager {
       orderResponseUrl,
       orderRequestBody,
       orderResponseBody,
+      currencyMappingMs,
+      cookieReadMs,
+      postMs: responseAt - submittedAt,
       // place响应data即订单号，与成交流水行的si字段一致，用于精确匹配成交。
       orderId: typeof record?.data === 'string' ? record.data : undefined,
       message: 'MEXC直连下单已确认接收（跳过页面操作），正在等待该笔实际成交',

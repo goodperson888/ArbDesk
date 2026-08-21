@@ -174,6 +174,7 @@ export interface ArbitrageOrderRecord {
   updatedAt: number
   mexc: OrderLegRecord
   polymarket: OrderLegRecord
+  timings?: ExecutionTimings
   hedgeOutcome?: HedgeOutcomeSummary
   closeOperation?: CloseOperation
 }
@@ -209,15 +210,25 @@ export interface ExecutionSession {
 
 export interface ExecutionTimings {
   executeRequestedAt: number
+  preflightMs?: number
   quotesConfirmedAt?: number
   planConfirmedAt?: number
+  mexcCurrencyMappingMs?: number
+  mexcCookieReadMs?: number
+  mexcPostMs?: number
   mexcPageReadyAt?: number
   mexcDirectionReadyAt?: number
   mexcButtonReadyAt?: number
   mexcSubmittedAt?: number
   mexcAcceptedAt?: number
   mexcFillDetectedAt?: number
+  mexcFillReadbackMs?: number
+  mexcFillRestQueries?: number
   polymarketStartedAt?: number
+  polymarketMetadataMs?: number
+  polymarketSigningMs?: number
+  polymarketPostMs?: number
+  polymarketConfirmationMs?: number
   polymarketCompletedAt?: number
   hedgedAt?: number
 }

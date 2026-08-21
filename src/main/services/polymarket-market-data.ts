@@ -56,6 +56,7 @@ export interface PolymarketOutcomeQuote {
 }
 
 export interface PolymarketWindowQuote {
+  conditionId?: string
   durationMinutes: MarketDuration
   startTime: number
   endTime: number
@@ -94,6 +95,11 @@ function parseStringArray(value: string | string[] | undefined): string[] {
 
 function timeoutSignal(ms: number): AbortSignal {
   return AbortSignal.timeout(ms)
+}
+
+function normalizeSourceTimestamp(value: number | undefined): number | undefined {
+  if (!Number.isFinite(value) || !value || value <= 0) return undefined
+  return value < 10_000_000_000 ? value * 1_000 : value
 }
 
 export function applyPolymarketStreamEvent(
@@ -389,6 +395,7 @@ export class PolymarketMarketData {
       this.fetchReference(window).catch(() => undefined)
     ])
     return {
+      conditionId: market.conditionId,
       durationMinutes: window.durationMinutes,
       startTime: window.startTime,
       endTime: window.endTime,
@@ -460,7 +467,7 @@ export class PolymarketMarketData {
     return {
       baselinePrice: Number(price.openPrice) > 0 ? String(price.openPrice) : undefined,
       indexPrice: Number(current?.value) > 0 ? String(current?.value) : undefined,
-      indexReceivedAt: Number(current?.value) > 0 ? Date.now() : undefined
+      indexReceivedAt: Number(current?.value) > 0 ? normalizeSourceTimestamp(current?.timestamp) : undefined
     }
   }
 

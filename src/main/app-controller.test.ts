@@ -250,6 +250,51 @@ describe('AppController simulation', () => {
     expect((await store.loadOrderHistory())[0].status).toBe('EXPIRED')
   })
 
+  it('rebuilds a live recovery session from persisted fills after restart', async () => {
+    const now = Date.now()
+    const directory = await mkdtemp(join(tmpdir(), 'arbdesk-restart-recovery-test-'))
+    temporaryDirectories.push(directory)
+    const store = new EventStore(directory)
+    await store.initialize()
+    const mexcFill: Fill = {
+      venue: 'MEXC', direction: 'UP', quantity: '10', averagePrice: '0.40',
+      orderId: 'mexc-persisted', filledAt: now, verificationSource: 'PLATFORM_READBACK'
+    }
+    const polyFill: Fill = {
+      venue: 'POLYMARKET', direction: 'DOWN', quantity: '4', averagePrice: '0.50',
+      orderId: 'poly-persisted', filledAt: now, verificationSource: 'PLATFORM_READBACK'
+    }
+    await store.saveOrderHistory([{
+      id: 'restart-recovery', opportunityId: 'restart-opportunity', symbol: 'BTC/USD', durationMinutes: 5,
+      startTime: now - 60_000, endTime: now + 240_000, mode: 'ASSISTED', status: 'RECOVERY_REQUIRED',
+      executionState: 'RECOVERY_REQUIRED', requestedQuantity: '10', expectedCapital: '9', expectedProfit: '1',
+      createdAt: now - 30_000, updatedAt: now - 10_000,
+      mexc: { venue: 'MEXC', direction: 'UP', entryFill: mexcFill, closeFills: [], openQuantity: '10' },
+      polymarket: {
+        venue: 'POLYMARKET', direction: 'DOWN', entryFill: polyFill, entryFills: [polyFill],
+        targetQuantity: '10', closeFills: [], openQuantity: '4'
+      }
+    }])
+    const mexcBrowser = {
+      configure: () => undefined,
+      getStatus: () => ({
+        mode: 'HUBSTUDIO', open: false, authenticated: false, automationAvailable: false, monitoring: false,
+        calibrated: { amountInput: false, upButton: false, downButton: false, submitButton: false }, message: 'test'
+      })
+    } as unknown as MexcBrowserManager
+    const controller = new AppController(store, mexcBrowser)
+
+    await controller.initialize()
+
+    expect(controller.getSnapshot().recoverySessions).toEqual([
+      expect.objectContaining({
+        id: 'restart-recovery', state: 'RECOVERY_REQUIRED', remainingHedgeQuantity: '6',
+        mexcFill: expect.objectContaining({ orderId: 'mexc-persisted' }),
+        polymarketFill: expect.objectContaining({ orderId: 'poly-persisted' })
+      })
+    ])
+  })
+
   it('matches 5m and 15m quotes only within the same duration and round', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'arbdesk-duration-match-test-'))
     temporaryDirectories.push(directory)
@@ -695,6 +740,71 @@ describe('AppController simulation', () => {
     expect(session.error).toContain('POLY_SUBMISSION_UNCERTAIN')
   })
 
+  it.each([
+    'Polymarket余额不足：需要约10.00，可用1.00',
+    'Polymarket最小下单量为5份；剩余目标3份',
+    'Polymarket价格保护已触发：当前最优卖价0.60已超过最高可接受价0.55'
+  ])('does not retry a permanent hedge rejection: %s', async (message) => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const hedge = vi.fn(async () => { throw new Error(message) })
+    const controller = await createAssistedExecutionController(hedge)
+    await controller.updateSettings({ polymarketHedgeRetryCount: 20 })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+
+    const session = await controller.confirmMexcFill({
+      quantity: '10', averagePrice: '0.40', orderId: 'mexc-permanent-rejection', manualAcknowledged: true
+    })
+
+    expect(hedge).toHaveBeenCalledOnce()
+    expect(session.state).toBe('RECOVERY_REQUIRED')
+    expect(session.error).toContain(message)
+  })
+
+  it('persists granular execution timings into the order record', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const hedge = vi.fn(async (order: HedgeOrder) => ({
+      venue: 'POLYMARKET' as const,
+      direction: order.direction,
+      quantity: order.quantity,
+      averagePrice: '0.50',
+      orderId: 'poly-timed',
+      filledAt: Date.now(),
+      verificationSource: 'PLATFORM_READBACK' as const,
+      executionDetails: { bookAndBalanceMs: 11, signingMs: 12, submissionMs: 13, confirmationMs: 14 }
+    }))
+    const readbackFill: Fill = {
+      venue: 'MEXC', direction: 'UP', quantity: '10', averagePrice: '0.40', orderId: 'mexc-timed',
+      filledAt: Date.now(), verificationSource: 'PLATFORM_READBACK',
+      executionDetails: { readbackMs: 21, restQueries: 1 }
+    }
+    const controller = await createAssistedExecutionController(
+      hedge,
+      readbackFill,
+      undefined,
+      {
+        ok: true, orderAccepted: true, message: 'submitted', submittedAt: Date.now(), responseAt: Date.now() + 5,
+        currencyMappingMs: 2, cookieReadMs: 3, postMs: 5, orderId: 'mexc-timed'
+      }
+    )
+    await controller.updateSettings({ mexcAutomationEnabled: true, preHedgeRatioPct: 0 })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+    await vi.waitFor(() => expect(controller.getSnapshot().activeSession?.state).toBe('HEDGED'))
+
+    expect(controller.getSnapshot().orderHistory[0].timings).toMatchObject({
+      mexcCurrencyMappingMs: 2,
+      mexcCookieReadMs: 3,
+      mexcPostMs: 5,
+      mexcFillReadbackMs: 21,
+      mexcFillRestQueries: 1,
+      polymarketMetadataMs: 11,
+      polymarketSigningMs: 12,
+      polymarketPostMs: 13,
+      polymarketConfirmationMs: 14
+    })
+  })
+
   it('forces a fresh Polymarket book after a FAK no-match before retrying', async () => {
     vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
     const confirmOutcomeQuote = vi.fn(async () => undefined)
@@ -753,6 +863,29 @@ describe('AppController simulation', () => {
     expect(hedge.mock.calls.map((call) => call[0].quantity)).toEqual(['5', '5'])
     expect(session.state).toBe('HEDGED')
     expect(Number(session.polymarketFill?.quantity)).toBe(10)
+  })
+
+  it('does not use the recovery-loss price while the MEXC fill is still only planned', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const hedge = vi.fn(async (order: HedgeOrder) => {
+      if (hedge.mock.calls.length === 1) throw new Error('Polymarket盘口已变化：FAK没有撮合到可用卖盘')
+      return {
+        venue: 'POLYMARKET' as const, direction: order.direction, quantity: order.quantity,
+        averagePrice: '0.52', orderId: 'planned-normal-price', filledAt: Date.now()
+      }
+    })
+    const controller = await createAssistedExecutionController(
+      hedge,
+      undefined,
+      undefined,
+      { ok: true, orderAccepted: true, message: 'submitted', submittedAt: Date.now() }
+    )
+    await controller.updateSettings({ mexcAutomationEnabled: true, preHedgeRatioPct: 50, polymarketHedgeRetryCount: 1 })
+    const opportunity = controller.getSnapshot().opportunities[0]
+    await controller.execute({ opportunityId: opportunity.id, quantity: '10' })
+    await vi.waitFor(() => expect(hedge).toHaveBeenCalledTimes(2))
+
+    expect(hedge.mock.calls[1][0].maximumPrice).toBe(hedge.mock.calls[0][0].maximumPrice)
   })
 
   it('submits the full Polymarket leg at the 0.99 cap immediately in unprotected mode', async () => {

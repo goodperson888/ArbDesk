@@ -71,6 +71,10 @@ const MEXC_MIN_NOTIONAL = new Decimal(1)
 const POLYMARKET_MIN_BUY_AMOUNT = new Decimal(1)
 const POLYMARKET_MAX_ORDER_PRICE = new Decimal('0.99')
 
+function isNonRetryablePolymarketError(message: string): boolean {
+  return /余额不足|授权不足|最小下单量|最低.*单量|至少需要1抵押资产|低于1 USDC最小值|价格保护已触发|已超过最高可接受价|请求保护已触发|HTTP (?:403|429)/i.test(message)
+}
+
 function aggregateFills(fills: Fill[], direction: Direction): Fill | undefined {
   if (fills.length === 0) return undefined
   const quantity = Decimal.sum(0, ...fills.map((fill) => new Decimal(fill.quantity || 0)))
@@ -180,6 +184,31 @@ export class AppController {
       }
       return this.expireOrderIfElapsed(normalized)
     })
+    for (const order of this.orderHistory) {
+      if (order.status !== 'RECOVERY_REQUIRED' || order.endTime <= Date.now() || !order.mexc.entryFill) continue
+      const polymarketFills = order.polymarket.entryFills?.length
+        ? order.polymarket.entryFills
+        : order.polymarket.entryFill ? [order.polymarket.entryFill] : []
+      const filledQuantity = Decimal.sum(0, ...polymarketFills.map((fill) => new Decimal(fill.quantity || 0)))
+      const targetQuantity = new Decimal(order.polymarket.targetQuantity || order.mexc.entryFill.quantity || order.requestedQuantity)
+      this.parkedRecoverySessions.set(order.id, {
+        id: order.id,
+        opportunityId: order.opportunityId,
+        requestedQuantity: order.requestedQuantity,
+        state: 'RECOVERY_REQUIRED',
+        mode: order.mode,
+        startedAt: order.createdAt,
+        updatedAt: order.updatedAt,
+        mexcFill: order.mexc.entryFill,
+        polymarketFill: order.polymarket.entryFill,
+        polymarketFills,
+        polymarketTargetQuantity: order.polymarket.targetQuantity ?? targetQuantity.toDecimalPlaces(6).toString(),
+        remainingHedgeQuantity: Decimal.max(targetQuantity.minus(filledQuantity), 0).toDecimalPlaces(6).toString(),
+        hedgeOutcome: order.hedgeOutcome,
+        timings: order.timings,
+        error: '应用重启后已从持久化成交记录恢复；重试前请再次核对两边实际持仓'
+      })
+    }
     await this.store.saveOrderHistory(this.orderHistory)
     this.opportunities = []
     this.syncCapacityRefreshTimer()
@@ -521,7 +550,8 @@ export class AppController {
       timings: {
         executeRequestedAt,
         quotesConfirmedAt,
-        planConfirmedAt: Date.now()
+        planConfirmedAt: Date.now(),
+        preflightMs: Date.now() - executeRequestedAt
       }
     }
     this.activeOpportunity = opportunity
@@ -541,6 +571,7 @@ export class AppController {
       expectedProfit: executionPlan.expectedProfit,
       createdAt: this.activeSession.startedAt,
       updatedAt: this.activeSession.updatedAt,
+      timings: this.activeSession.timings,
       mexc: {
         venue: 'MEXC', direction: opportunity.mexcDirection, eventId: opportunity.mexcEventId,
         symbolId: opportunity.mexcSymbolId, closeFills: [], openQuantity: '0'
@@ -557,9 +588,8 @@ export class AppController {
       await this.store.saveSettings(this.settings)
       this.broadcast(this.getSnapshot())
     }
-    await this.transition('MEXC_OPENING', '正在准备MEXC第一腿')
-
     if (this.settings.mode === 'SIMULATION') {
+      await this.transition('MEXC_OPENING', '正在准备MEXC第一腿')
       await this.transition('MEXC_SUBMITTING', '模拟发送MEXC订单')
       await new Promise((resolve) => setTimeout(resolve, 260))
       const fill: Fill = {
@@ -577,7 +607,10 @@ export class AppController {
       return this.activeSession
     }
 
-    await this.transition('MEXC_SUBMITTING', '正在打开MEXC监督窗口并准备网页订单')
+    // 初始OPENING订单已经持久化，足以在崩溃后进入人工恢复。这里两次纯准备
+    // 状态只更新内存，避免四次同步文件IO挡在真正的MEXC请求前面。
+    this.transitionInMemory('MEXC_OPENING')
+    this.transitionInMemory('MEXC_SUBMITTING')
     const result = await this.mexcBrowser.prepareOrder({
       direction: opportunity.mexcDirection,
       amount: executionPlan.mexcSpend,
@@ -593,10 +626,15 @@ export class AppController {
       mexcDirectionReadyAt: result.directionReadyAt,
       mexcButtonReadyAt: result.buttonReadyAt,
       mexcSubmittedAt: result.submittedAt,
-      mexcAcceptedAt: result.responseAt ?? Date.now()
+      mexcAcceptedAt: result.responseAt ?? Date.now(),
+      mexcCurrencyMappingMs: result.currencyMappingMs,
+      mexcCookieReadMs: result.cookieReadMs,
+      mexcPostMs: result.postMs ?? (
+        result.submittedAt && result.responseAt ? result.responseAt - result.submittedAt : undefined
+      )
     }
     if (result.orderResponseBody !== undefined) {
-      await this.recordActiveExecutionEvent(
+      void this.recordActiveExecutionEvent(
         'MEXC_SUBMITTING',
         '已捕获MEXC下单接口完整请求与响应，用于成交确认提速分析',
         {
@@ -604,7 +642,7 @@ export class AppController {
           orderRequestBody: (result.orderRequestBody ?? '').slice(0, 500),
           orderResponseBody: (result.orderResponseBody ?? '').slice(0, 4_000)
         }
-      )
+      ).catch(() => undefined)
     }
     const automaticSubmissionFailed = this.settings.mexcAutomationEnabled && (!result.ok || !result.orderAccepted)
     if (automaticSubmissionFailed) {
@@ -619,27 +657,22 @@ export class AppController {
       )
       return this.activeSession
     }
+    const automaticAccepted = this.settings.mexcAutomationEnabled && result.ok && result.orderAccepted
+    if (this.settings.polymarketLiveEnabled) {
+      void this.prefetchPolymarketMarketsFor([opportunity.polymarketTokenId ?? ''])
+      // MEXC回执已经确认后立即发起并行腿；审计落盘和状态广播不再挡在
+      // Polymarket提交前面，从下单关键路径移除两次文件写入等待。
+      if (automaticAccepted && this.settings.mode === 'ASSISTED') this.launchParallelHedge(opportunity)
+    }
     await this.transition('MEXC_SUBMITTED', result.message, {
       automationMatched: result.ok,
       orderAccepted: result.orderAccepted ?? false
     })
     if (this.settings.polymarketLiveEnabled) {
-      const automaticAccepted = this.settings.mexcAutomationEnabled && result.ok && result.orderAccepted
       const awaitingManualClick = !this.settings.mexcAutomationEnabled
       if (automaticAccepted || awaitingManualClick) {
         const submittedAfter = (result.submittedAt ?? Date.now()) - 2_000
         void this.monitorMexcFill(opportunity, submittedAfter, awaitingManualClick ? 120_000 : 90_000, result.orderId)
-      }
-      // 把Polymarket侧的准备请求藏在MEXC成交等待窗口内：服务器时间偏移与
-      // 盘口元数据预热完成后，对冲下单路径可少付1-2个CLOB往返。
-      if (opportunity.polymarketTokenId) {
-        void this.liveBroker?.prefetchServerTime?.()
-        void this.liveBroker?.prefetchOrderBooks?.([opportunity.polymarketTokenId])
-      }
-      // MEXC下单被接受后立即并行启动Polymarket腿：无保护模式全量同时下，
-      // 保护模式按preHedgeRatioPct比例预对冲，等MEXC真实成交回报后补齐差额。
-      if (automaticAccepted && this.settings.mode === 'ASSISTED') {
-        this.launchParallelHedge(opportunity)
       }
     }
     return this.activeSession
@@ -709,7 +742,7 @@ export class AppController {
   }
 
   private async completeMexcFill(
-    fill: Pick<Fill, 'quantity' | 'averagePrice' | 'orderId'> & Partial<Pick<Fill, 'filledAt'>>,
+    fill: Pick<Fill, 'quantity' | 'averagePrice' | 'orderId'> & Partial<Pick<Fill, 'filledAt' | 'executionDetails'>>,
     trustedReadback: boolean
   ): Promise<ExecutionSession> {
     if (!this.activeSession) throw new Error('当前没有等待确认的套利组')
@@ -730,10 +763,17 @@ export class AppController {
       averagePrice: new Decimal(fill.averagePrice).toFixed(4),
       orderId: fill.orderId.trim(),
       filledAt: fill.filledAt ?? Date.now(),
-      verificationSource: trustedReadback ? 'PLATFORM_READBACK' : 'MANUAL_ENTRY'
+      verificationSource: trustedReadback ? 'PLATFORM_READBACK' : 'MANUAL_ENTRY',
+      executionDetails: fill.executionDetails
     }
     this.activeSession.mexcFill = mexcFill
-    if (this.activeSession.timings) this.activeSession.timings.mexcFillDetectedAt = Date.now()
+    if (this.activeSession.timings) {
+      this.activeSession.timings.mexcFillDetectedAt = Date.now()
+      const readbackMs = Number(fill.executionDetails?.readbackMs)
+      const restQueries = Number(fill.executionDetails?.restQueries)
+      if (Number.isFinite(readbackMs)) this.activeSession.timings.mexcFillReadbackMs = readbackMs
+      if (Number.isFinite(restQueries)) this.activeSession.timings.mexcFillRestQueries = restQueries
+    }
     const state: ExecutionState = quantity.eq(this.activeSession.requestedQuantity) ? 'MEXC_FILLED' : 'MEXC_PARTIAL'
     const sourceLabel = trustedReadback ? 'MEXC平台回读' : '人工强制录入（未经平台回读）'
     await this.transition(state, `${sourceLabel}：${state === 'MEXC_FILLED' ? '完全成交' : '部分成交'}`)
@@ -1091,10 +1131,7 @@ export class AppController {
       void Promise.all([
         this.mexcBrowser.ensureAccountBalance?.(30_000),
         this.liveBroker?.ensureTradingCapacity(0),
-        this.liveBroker?.prefetchServerTime?.(),
-        this.liveBroker?.prefetchOrderBooks?.(
-          this.opportunities.map((opportunity) => opportunity.polymarketTokenId ?? '')
-        )
+        this.prefetchPolymarketMarketsFor(this.opportunities.map((opportunity) => opportunity.polymarketTokenId ?? ''))
       ])
         .then(() => this.broadcast(this.getSnapshot()))
         .catch(() => undefined)
@@ -1212,9 +1249,13 @@ export class AppController {
 
     for (let attempt = 0; attempt < totalAttempts && remainingQuantity.gt('0.000001'); attempt += 1) {
       const recoveryMaximumPrice = this.calculateRecoveryMaximumPrice(opportunity, mexcFill, fills, remainingQuantity)
+      // 计划预对冲发生在MEXC真实成交确认之前，只能使用普通滑点保护；
+      // 平台回读/人工核对MEXC成交后，自动补剩余份额才允许使用整组恢复亏损上限。
+      const automaticRecoveryPriceAllowed = !options.parallel && mexcFill.verificationSource !== 'PLANNED'
+      const useRecoveryPrice = recoveryMode || (attempt > 0 && automaticRecoveryPriceAllowed)
       const maximumPrice = options.unprotected
         ? POLYMARKET_MAX_ORDER_PRICE
-        : recoveryMode || attempt > 0 ? recoveryMaximumPrice : normalMaximumPrice
+        : useRecoveryPrice ? recoveryMaximumPrice : normalMaximumPrice
       if (!options.unprotected && maximumPrice.lte(0)) {
         lastError = `恢复损失上限${this.settings.maxRecoveryLossUsdt} USDT内没有可接受的Polymarket价格`
         break
@@ -1256,6 +1297,21 @@ export class AppController {
           allowTailOverhedge: recoveryMode && tailOverhedge.gt(0) && tailOverhedge.lt(remainingQuantity)
         })
         fills.push(fill)
+        if (this.activeSession.timings && fill.executionDetails) {
+          const accumulate = (
+            key: 'polymarketMetadataMs' | 'polymarketSigningMs' | 'polymarketPostMs' | 'polymarketConfirmationMs',
+            detailKey: string
+          ): void => {
+            const value = Number(fill.executionDetails?.[detailKey])
+            if (Number.isFinite(value) && value >= 0) {
+              this.activeSession!.timings![key] = (this.activeSession!.timings![key] ?? 0) + value
+            }
+          }
+          accumulate('polymarketMetadataMs', 'bookAndBalanceMs')
+          accumulate('polymarketSigningMs', 'signingMs')
+          accumulate('polymarketPostMs', 'submissionMs')
+          accumulate('polymarketConfirmationMs', 'confirmationMs')
+        }
         filledQuantity = Decimal.sum(0, ...fills.map((item) => new Decimal(item.quantity || 0)))
         remainingQuantity = Decimal.max(targetQuantity.minus(filledQuantity), 0)
         this.activeSession.polymarketFills = fills
@@ -1282,6 +1338,7 @@ export class AppController {
         lastError = error instanceof Error ? error.message : String(error)
         const quoteMoved = /盘口已变化|no orders found to match|no match is found/i.test(lastError)
         const priceProtectionTriggered = /价格保护已触发|已超过最高可接受价/i.test(lastError)
+        const nonRetryable = isNonRetryablePolymarketError(lastError)
         forceQuoteRefresh = quoteMoved
         console.error(`[Polymarket hedge attempt ${attempt + 1} failed] ${lastError}`)
         await this.recordActiveExecutionEvent('POLY_HEDGING', `Polymarket FAK第${attempt + 1}次未成交：${lastError}`, {
@@ -1290,7 +1347,7 @@ export class AppController {
           maximumPrice: Decimal.min(maximumPrice, POLYMARKET_MAX_ORDER_PRICE).toFixed(4),
           remainingQuantity: remainingQuantity.toDecimalPlaces(6).toString()
         })
-        if (lastError.startsWith('POLY_SUBMISSION_UNCERTAIN:') || priceProtectionTriggered) break
+        if (lastError.startsWith('POLY_SUBMISSION_UNCERTAIN:') || priceProtectionTriggered || nonRetryable) break
       }
     }
 
@@ -1489,6 +1546,15 @@ export class AppController {
     await this.recordActiveExecutionEvent(next, message, details)
   }
 
+  private transitionInMemory(next: ExecutionState): void {
+    if (!this.activeSession) throw new Error('没有活动执行会话')
+    assertTransition(this.activeSession.state, next)
+    this.activeSession.state = next
+    this.activeSession.updatedAt = Date.now()
+    void this.syncActiveOrderRecord(false)
+    this.broadcast(this.getSnapshot())
+  }
+
   private async recordActiveExecutionEvent(
     state: ExecutionState,
     message: string,
@@ -1508,7 +1574,7 @@ export class AppController {
     this.broadcast(this.getSnapshot())
   }
 
-  private async syncActiveOrderRecord(): Promise<void> {
+  private async syncActiveOrderRecord(persist = true): Promise<void> {
     const session = this.activeSession
     if (!session) return
     const index = this.orderHistory.findIndex((order) => order.id === session.id)
@@ -1544,10 +1610,11 @@ export class AppController {
       updatedAt: session.updatedAt,
       mexc,
       polymarket,
+      timings: session.timings,
       hedgeOutcome: session.hedgeOutcome ?? current.hedgeOutcome
     }
     this.orderHistory = this.orderHistory.map((order, orderIndex) => orderIndex === index ? updated : order)
-    await this.store.saveOrderHistory(this.orderHistory)
+    if (persist) await this.store.saveOrderHistory(this.orderHistory)
   }
 
   private async loadLiveOpportunities(): Promise<AppSnapshot> {
@@ -1580,9 +1647,9 @@ export class AppController {
       this.polymarketDataMessage = this.polymarketData.getStatus().message
       this.opportunities = this.combineLiveQuotes(mexcWindows, polymarketWindows)
       if (this.licenseActive && this.settings.polymarketLiveEnabled) {
-        void this.liveBroker?.prefetchOrderBooks?.(
+        void this.prefetchPolymarketMarketsFor(
           this.opportunities.map((opportunity) => opportunity.polymarketTokenId ?? '')
-        ).catch(() => undefined)
+        )
       }
       this.evaluateAutoOpen()
     } catch (error) {
@@ -1592,6 +1659,32 @@ export class AppController {
     const snapshot = this.getSnapshot()
     this.broadcast(snapshot)
     return snapshot
+  }
+
+  private async prefetchPolymarketMarketsFor(tokenIds: string[]): Promise<void> {
+    if (!this.liveBroker) return
+    const broker = this.liveBroker as PolymarketLiveBroker & {
+      prefetchServerTime?: () => Promise<void>
+      prefetchMarkets?: (markets: Array<{ conditionId?: string; tokenIds: string[] }>) => Promise<void>
+      prefetchOrderBooks?: (tokenIds: string[]) => Promise<void>
+    }
+    const wanted = new Set(tokenIds.filter(Boolean))
+    const markets = this.latestPolymarketWindows
+      .map((window) => ({
+        conditionId: window.conditionId,
+        tokenIds: Object.values(window.outcomes)
+          .map((outcome) => outcome?.tokenId ?? '')
+          .filter((tokenId) => wanted.has(tokenId))
+      }))
+      .filter((market) => market.tokenIds.length > 0)
+    const requests: Promise<void>[] = []
+    if (typeof broker.prefetchServerTime === 'function') requests.push(broker.prefetchServerTime())
+    if (markets.length > 0 && typeof broker.prefetchMarkets === 'function') {
+      requests.push(broker.prefetchMarkets(markets))
+    } else if (typeof broker.prefetchOrderBooks === 'function') {
+      requests.push(broker.prefetchOrderBooks([...wanted]))
+    }
+    await Promise.allSettled(requests)
   }
 
   private scheduleStreamingSnapshot(): void {

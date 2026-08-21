@@ -34,6 +34,8 @@ const POLYGON_RPC = 'https://polygon-rpc.com'
 const TOKEN_SCALE = new Decimal(1_000_000)
 const MIN_MARKETABLE_BUY_AMOUNT = new Decimal(1)
 const CLOB_REQUEST_TIMEOUT_MS = 3_000
+const CLOB_RATE_LIMIT_COOLDOWN_MS = 60_000
+const CLOB_FORBIDDEN_COOLDOWN_MS = 15 * 60_000
 
 class RequestTimeoutError extends Error {}
 
@@ -73,10 +75,17 @@ export class PolymarketLiveBroker implements PolymarketBroker {
   private cachedTradingCapacity?: PolymarketTradingCapacity
   private cachedBalanceAllowance?: BalanceAllowanceResponse
   private orderBookCache = new Map<string, { checkedAt: number; book: OrderBookSummary }>()
+  private orderBookRequests = new Map<string, Promise<OrderBookSummary>>()
+  private warmedConditionIds = new Set<string>()
+  private conditionInfoRequests = new Map<string, Promise<void>>()
+  private tradingCapacityRequest?: Promise<PolymarketTradingCapacity>
   private cachedClient?: ClobClient
   private cachedClientKey?: string
+  private cachedCredentials?: PolymarketCredentials
+  private cachedSigner?: WalletClient
   private serverTimeOffsetMs?: number
   private serverTimeSyncedAt = 0
+  private clobRequestsBlockedUntil = 0
   private proxyUrl = ''
 
   constructor(
@@ -94,6 +103,10 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     this.cachedTradingCapacity = undefined
     this.cachedBalanceAllowance = undefined
     this.orderBookCache.clear()
+    this.orderBookRequests.clear()
+    this.warmedConditionIds.clear()
+    this.conditionInfoRequests.clear()
+    this.tradingCapacityRequest = undefined
     if (normalized) {
       this.proxyAgent = new HttpsProxyAgent(normalized)
       axios.defaults.httpAgent = this.proxyAgent
@@ -142,7 +155,13 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     this.cachedBalanceAllowance = undefined
     this.cachedClient = undefined
     this.cachedClientKey = undefined
+    this.cachedCredentials = undefined
+    this.cachedSigner = undefined
     this.orderBookCache.clear()
+    this.orderBookRequests.clear()
+    this.warmedConditionIds.clear()
+    this.conditionInfoRequests.clear()
+    this.tradingCapacityRequest = undefined
     return updated
   }
 
@@ -156,41 +175,54 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       return !cached || Date.now() - cached.checkedAt > maximumAgeMs
     })
     if (missing.length === 0) return
-    const credentials = await this.credentialStore.getCredentials()
-    const signer = this.createSigner(credentials.signerPrivateKey)
-    const client = this.getAuthenticatedClient(credentials, signer)
-    await Promise.all(missing.map(async (tokenId) => {
-      const book = await client.getOrderBook(tokenId)
-      this.orderBookCache.set(tokenId, { checkedAt: Date.now(), book })
-    }))
+    const { client } = await this.getTradingContext()
+    await Promise.all(missing.map((tokenId) => this.fetchOrderBook(client, tokenId, 'Polymarket盘口预热')))
+  }
+
+  async prefetchMarkets(
+    markets: Array<{ conditionId?: string; tokenIds: string[] }>,
+    maximumAgeMs = 20_000
+  ): Promise<void> {
+    const tokenIds = [...new Set(markets.flatMap((market) => market.tokenIds).filter(Boolean))]
+    const conditionIds = [...new Set(markets.map((market) => market.conditionId).filter((id): id is string => Boolean(id)))]
+    const { client } = await this.getTradingContext()
+    await Promise.all([
+      this.prefetchOrderBooks(tokenIds, maximumAgeMs),
+      ...conditionIds.map((conditionId) => this.prefetchConditionInfo(client, conditionId))
+    ])
   }
 
   async ensureTradingCapacity(maximumAgeMs = 30_000): Promise<PolymarketTradingCapacity> {
     if (this.cachedTradingCapacity && Date.now() - this.cachedTradingCapacity.checkedAt <= maximumAgeMs) {
       return this.cachedTradingCapacity
     }
-    const credentials = await this.credentialStore.getCredentials()
-    const signer = this.createSigner(credentials.signerPrivateKey)
-    const client = this.getAuthenticatedClient(credentials, signer)
-    const [balance, closedOnlyResult] = await Promise.all([
-      client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }),
-      client.getClosedOnlyMode()
-    ])
-    this.cachedBalanceAllowance = balance
-    const capacity = {
-      checkedAt: Date.now(),
-      collateralBalance: formatCollateral(balance.balance),
-      allowanceReady: allowanceValues(balance).some((value) => value.gt(0)),
-      closedOnly: Boolean(closedOnlyResult.closed_only)
+    if (this.tradingCapacityRequest) return await this.tradingCapacityRequest
+    const { client } = await this.getTradingContext()
+    const request = (async () => {
+      const [balance, closedOnlyResult] = await Promise.all([
+        this.withClobProtection(() => client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })),
+        this.withClobProtection(() => client.getClosedOnlyMode())
+      ])
+      this.cachedBalanceAllowance = balance
+      const capacity = {
+        checkedAt: Date.now(),
+        collateralBalance: formatCollateral(balance.balance),
+        allowanceReady: allowanceValues(balance).some((value) => value.gt(0)),
+        closedOnly: Boolean(closedOnlyResult.closed_only)
+      }
+      this.cachedTradingCapacity = capacity
+      return capacity
+    })()
+    this.tradingCapacityRequest = request
+    try {
+      return await request
+    } finally {
+      if (this.tradingCapacityRequest === request) this.tradingCapacityRequest = undefined
     }
-    this.cachedTradingCapacity = capacity
-    return capacity
   }
 
   async validateIdentity(tokenId?: string): Promise<PolymarketIdentityValidation> {
-    const credentials = await this.credentialStore.getCredentials()
-    const signer = this.createSigner(credentials.signerPrivateKey)
-    const client = this.getAuthenticatedClient(credentials, signer)
+    const { credentials, signer, client } = await this.getTradingContext()
     await createL1Headers(signer, Chain.POLYGON)
 
     const [, closedOnlyResult, balance, openOrders, trades] = await Promise.all([
@@ -280,9 +312,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     }
 
     const startedAt = Date.now()
-    const credentials = await this.credentialStore.getCredentials()
-    const signer = this.createSigner(credentials.signerPrivateKey)
-    const client = this.getAuthenticatedClient(credentials, signer)
+    const { client } = await this.getTradingContext()
     const cachedBook = this.orderBookCache.get(order.tokenId)
     const liveLevelsFresh = Boolean(
       order.levels?.length && order.quoteReceivedAt && Date.now() - order.quoteReceivedAt <= 4_000
@@ -291,18 +321,15 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     const bookStartedAt = Date.now()
     const bookPromise = cachedBook && (liveLevelsFresh || cachedBookFresh)
       ? Promise.resolve(cachedBook.book)
-      : withTimeout(client.getOrderBook(order.tokenId), CLOB_REQUEST_TIMEOUT_MS, 'Polymarket盘口元数据读取').then((book) => {
-        this.orderBookCache.set(order.tokenId!, { checkedAt: Date.now(), book })
-        return book
-      })
+      : this.fetchOrderBook(client, order.tokenId, 'Polymarket盘口元数据读取')
     const balanceStartedAt = Date.now()
     const balancePromise = this.cachedBalanceAllowance && this.cachedTradingCapacity && Date.now() - this.cachedTradingCapacity.checkedAt <= 30_000
       ? Promise.resolve(this.cachedBalanceAllowance)
-      : withTimeout(
+      : this.withClobProtection(() => withTimeout(
         client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }),
         CLOB_REQUEST_TIMEOUT_MS,
         'Polymarket余额读取'
-      ).then((balance) => {
+      )).then((balance) => {
         this.cachedBalanceAllowance = balance
         return balance
       })
@@ -388,21 +415,25 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       price: submissionPrice.toNumber(),
       amount: spendAmount.toNumber(),
       side: Side.BUY,
-      orderType: OrderType.FAK
+      orderType: OrderType.FAK,
+      userUSDCBalance: Number(formatCollateral(balance.balance))
     }, {
       tickSize: book.tick_size as TickSize,
-      negRisk: book.neg_risk
+      negRisk: book.neg_risk,
+      version: 2
     }), CLOB_REQUEST_TIMEOUT_MS, 'Polymarket订单签名')
     const signedAt = Date.now()
     if (!liveLevelsFresh) this.orderBookCache.delete(order.tokenId)
     let response: OrderResponse
+    let responseAt = 0
     let verificationMs = 0
     try {
       response = await withTimeout(
-        client.postOrder(signedOrder, OrderType.FAK, false, true),
+        this.withClobProtection(() => client.postOrder(signedOrder, OrderType.FAK, false, true)),
         CLOB_REQUEST_TIMEOUT_MS + 500,
         'Polymarket FAK提交'
       )
+      responseAt = Date.now()
     } catch (error) {
       if (!this.isTimeoutLike(error)) {
         if (this.isNoMatchLike(error)) {
@@ -428,7 +459,8 @@ export class PolymarketLiveBroker implements PolymarketBroker {
             levelsUsed,
             bookAndBalanceMs: metadataAndBalanceCompletedAt - Math.min(bookStartedAt, balanceStartedAt),
             signingMs: signedAt - signingStartedAt,
-            submissionMs: Date.now() - signedAt,
+            submissionMs: verificationStartedAt - signedAt,
+            confirmationMs: verificationMs,
             timeoutVerificationMs: verificationMs,
             timeoutRecovered: true
           }
@@ -444,28 +476,25 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       throw new Error(`Polymarket FAK失败：${reason}`)
     }
 
-    // The order response returns human-readable token/collateral amounts. Balance and
-    // allowance responses use 6-decimal integers, but applying that scale here
-    // turns a valid 4.26-share fill into 0.00000426 shares.
-    const filledQuantity = new Decimal(response.takingAmount || 0)
-    const spent = new Decimal(response.makingAmount || 0)
-    if (filledQuantity.lte(0)) throw new Error('Polymarket FAK当前没有成交任何份额')
-    if (!response.orderID) throw new Error('Polymarket FAK成交但未返回orderID')
+    const confirmationStartedAt = Date.now()
+    const confirmedFill = await this.confirmPostedBuy(
+      client,
+      response,
+      order.tokenId,
+      startedAt,
+      submissionPrice,
+      order.direction
+    )
     return {
-      venue: 'POLYMARKET',
-      direction: order.direction,
-      quantity: filledQuantity.toDecimalPlaces(6).toString(),
-      averagePrice: spent.div(filledQuantity).toDecimalPlaces(6).toString(),
-      orderId: response.orderID,
-      filledAt: Date.now(),
-      verificationSource: 'PLATFORM_READBACK',
+      ...confirmedFill,
       executionDetails: {
         quoteSource: liveLevelsFresh ? 'WEBSOCKET' : 'REST',
         levelsUsed,
         committedSpend: spendAmount.toFixed(2),
         bookAndBalanceMs: metadataAndBalanceCompletedAt - Math.min(bookStartedAt, balanceStartedAt),
         signingMs: signedAt - signingStartedAt,
-        submissionMs: Date.now() - signedAt,
+        submissionMs: responseAt - signedAt,
+        confirmationMs: Date.now() - confirmationStartedAt,
         timeoutVerificationMs: verificationMs,
         timeoutRecovered: false
       }
@@ -483,6 +512,95 @@ export class PolymarketLiveBroker implements PolymarketBroker {
     return /no orders found to match|no match is found|没有撮合到|没有成交任何份额/i.test(message)
   }
 
+  private async confirmPostedBuy(
+    client: ClobClient,
+    response: OrderResponse,
+    tokenId: string,
+    startedAt: number,
+    maximumPrice: Decimal,
+    direction: HedgeOrder['direction']
+  ): Promise<Fill> {
+    const status = String(response.status || '').trim().toUpperCase()
+    if (status === 'MATCHED') {
+      // Order responses use human-readable token/collateral amounts. Balance and
+      // allowance responses use 6-decimal integers, so no token scaling belongs here.
+      let filledQuantity = new Decimal(0)
+      let spent = new Decimal(0)
+      try {
+        filledQuantity = new Decimal(response.takingAmount || 0)
+        spent = new Decimal(response.makingAmount || 0)
+      } catch { /* malformed async response falls through to authoritative trade readback */ }
+      if (filledQuantity.gt(0) && spent.gt(0) && response.orderID) {
+        return {
+          venue: 'POLYMARKET', direction,
+          quantity: filledQuantity.toDecimalPlaces(6).toString(),
+          averagePrice: spent.div(filledQuantity).toDecimalPlaces(6).toString(),
+          orderId: response.orderID,
+          filledAt: Date.now(),
+          verificationSource: 'PLATFORM_READBACK'
+        }
+      }
+    }
+
+    if (!response.orderID) {
+      throw new Error(`POLY_SUBMISSION_UNCERTAIN: Polymarket异步提交返回${status || '未知状态'}且缺少orderID；请核对平台成交记录`)
+    }
+    let lastReadbackError: unknown
+    const confirmationDeadline = Date.now() + 3_200
+    for (const delay of [0, 75, 200, 500, 900]) {
+      if (delay > 0) {
+        const remainingBeforeDelay = confirmationDeadline - Date.now()
+        if (remainingBeforeDelay <= delay) break
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      }
+      const remaining = confirmationDeadline - Date.now()
+      if (remaining <= 0) break
+      let trades: Trade[]
+      try {
+        trades = await withTimeout(
+          this.withClobProtection(() => client.getTrades({ asset_id: tokenId, after: new Date(startedAt - 1_000).toISOString() }, true)),
+          Math.min(CLOB_REQUEST_TIMEOUT_MS, remaining),
+          'Polymarket异步成交核验'
+        )
+      } catch (error) {
+        lastReadbackError = error
+        continue
+      }
+      const matching = trades.filter((trade) =>
+        trade.taker_order_id === response.orderID &&
+        this.matchesConfirmedBuy(trade, tokenId, maximumPrice)
+      )
+      if (matching.length === 0) continue
+      const quantity = Decimal.sum(0, ...matching.map((trade) => new Decimal(trade.size || 0)))
+      const spend = Decimal.sum(0, ...matching.map((trade) => new Decimal(trade.size || 0).mul(trade.price || 0)))
+      if (quantity.lte(0) || spend.lte(0)) continue
+      return {
+        venue: 'POLYMARKET', direction,
+        quantity: quantity.toDecimalPlaces(6).toString(),
+        averagePrice: spend.div(quantity).toDecimalPlaces(6).toString(),
+        orderId: response.orderID,
+        filledAt: Math.max(...matching.map((trade) => Date.parse(trade.match_time) || Date.now())),
+        verificationSource: 'PLATFORM_READBACK'
+      }
+    }
+    const readbackReason = lastReadbackError
+      ? `；最近一次成交查询失败：${lastReadbackError instanceof Error ? lastReadbackError.message : String(lastReadbackError)}`
+      : ''
+    throw new Error(`POLY_SUBMISSION_UNCERTAIN: Polymarket订单${response.orderID}返回${status || '未知状态'}，成交查询未发现明确回执${readbackReason}；已停止自动重复下单`)
+  }
+
+  private matchesConfirmedBuy(trade: Trade, tokenId: string, maximumPrice: Decimal): boolean {
+    const status = String(trade.status || '').toUpperCase()
+    try {
+      return trade.asset_id === tokenId &&
+        String(trade.side).toUpperCase() === 'BUY' &&
+        ['MATCHED', 'MINED', 'CONFIRMED'].includes(status) &&
+        new Decimal(trade.price || 0).lte(maximumPrice)
+    } catch {
+      return false
+    }
+  }
+
   private async findRecentTimedOutBuy(
     client: ClobClient,
     tokenId: string,
@@ -496,7 +614,7 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       await new Promise((resolve) => setTimeout(resolve, delay))
       try {
         const trades = await withTimeout(
-          client.getTrades({ asset_id: tokenId, after: new Date(startedAt - 1_000).toISOString() }, true),
+          this.withClobProtection(() => client.getTrades({ asset_id: tokenId, after: new Date(startedAt - 1_000).toISOString() }, true)),
           CLOB_REQUEST_TIMEOUT_MS,
           'Polymarket超时成交核验'
         )
@@ -556,12 +674,10 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       throw new Error('Polymarket 平仓滑点设置无效')
     }
 
-    const credentials = await this.credentialStore.getCredentials()
-    const signer = this.createSigner(credentials.signerPrivateKey)
-    const client = this.getAuthenticatedClient(credentials, signer)
+    const { client } = await this.getTradingContext()
     const [book, balance] = await Promise.all([
-      client.getOrderBook(order.tokenId),
-      client.getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: order.tokenId })
+      this.fetchOrderBook(client, order.tokenId, 'Polymarket平仓盘口读取'),
+      this.withClobProtection(() => client.getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: order.tokenId }))
     ])
     const minimumSize = new Decimal(book.min_order_size || 1)
     if (quantity.lt(minimumSize)) throw new Error(`Polymarket当前最小卖出量为${minimumSize.toString()}份`)
@@ -583,8 +699,11 @@ export class PolymarketLiveBroker implements PolymarketBroker {
       tickSize: book.tick_size as TickSize,
       negRisk: book.neg_risk
     })
-    const response = await client.postOrder(signedOrder, OrderType.FOK)
+    const response = await this.withClobProtection(() => client.postOrder(signedOrder, OrderType.FOK))
     if (!response.success) throw new Error(`Polymarket SELL FOK失败：${response.errorMsg || response.status || '未知原因'}`)
+    if (String(response.status || '').toUpperCase() !== 'MATCHED') {
+      throw new Error(`POLY_SUBMISSION_UNCERTAIN: Polymarket SELL FOK返回${response.status || '未知状态'}；请核对平台成交记录`)
+    }
     const filledQuantity = new Decimal(response.makingAmount || 0)
     const proceeds = new Decimal(response.takingAmount || 0)
     if (filledQuantity.lt(quantity)) {
@@ -604,6 +723,93 @@ export class PolymarketLiveBroker implements PolymarketBroker {
   private createSigner(privateKey: string): WalletClient {
     const account = privateKeyToAccount(privateKey as `0x${string}`)
     return createWalletClient({ account, transport: http(POLYGON_RPC) })
+  }
+
+  private fetchOrderBook(client: ClobClient, tokenId: string, label: string): Promise<OrderBookSummary> {
+    const active = this.orderBookRequests.get(tokenId)
+    if (active) return active
+    let request: Promise<OrderBookSummary>
+    request = this.withClobProtection(() => withTimeout(
+      client.getOrderBook(tokenId),
+      CLOB_REQUEST_TIMEOUT_MS,
+      label
+    )).then((book) => {
+      this.orderBookCache.set(tokenId, { checkedAt: Date.now(), book })
+      return book
+    }).finally(() => {
+      if (this.orderBookRequests.get(tokenId) === request) this.orderBookRequests.delete(tokenId)
+    })
+    this.orderBookRequests.set(tokenId, request)
+    return request
+  }
+
+  private prefetchConditionInfo(client: ClobClient, conditionId: string): Promise<void> {
+    if (this.warmedConditionIds.has(conditionId)) return Promise.resolve()
+    const active = this.conditionInfoRequests.get(conditionId)
+    if (active) return active
+    let request: Promise<void>
+    request = this.withClobProtection(() => client.getClobMarketInfo(conditionId))
+      .then(() => { this.warmedConditionIds.add(conditionId) })
+      .finally(() => {
+        if (this.conditionInfoRequests.get(conditionId) === request) this.conditionInfoRequests.delete(conditionId)
+      })
+    this.conditionInfoRequests.set(conditionId, request)
+    return request
+  }
+
+  private assertClobRequestsAvailable(): void {
+    const remainingMs = this.clobRequestsBlockedUntil - Date.now()
+    if (remainingMs <= 0) return
+    throw new Error(`Polymarket请求保护已触发，暂停自动请求约${Math.ceil(remainingMs / 1_000)}秒；不会自动重试下单`)
+  }
+
+  private async withClobProtection<T>(request: () => Promise<T>): Promise<T> {
+    this.assertClobRequestsAvailable()
+    try {
+      return await request()
+    } catch (error) {
+      const status = this.httpStatus(error)
+      if (status !== 403 && status !== 429) throw error
+      const retryAfterMs = this.retryAfterMs(error)
+      const fallback = status === 429 ? CLOB_RATE_LIMIT_COOLDOWN_MS : CLOB_FORBIDDEN_COOLDOWN_MS
+      this.clobRequestsBlockedUntil = Math.max(this.clobRequestsBlockedUntil, Date.now() + (retryAfterMs ?? fallback))
+      throw new Error(`Polymarket返回HTTP ${status}，已暂停自动请求且不会快速重试`)
+    }
+  }
+
+  private httpStatus(error: unknown): number | undefined {
+    if (!error || typeof error !== 'object') return undefined
+    const candidate = error as { status?: unknown; response?: { status?: unknown } }
+    const status = Number(candidate.response?.status ?? candidate.status)
+    return Number.isFinite(status) ? status : undefined
+  }
+
+  private retryAfterMs(error: unknown): number | undefined {
+    if (!error || typeof error !== 'object') return undefined
+    const response = (error as { response?: { headers?: unknown } }).response
+    const headers = response?.headers as { get?: (name: string) => unknown; [key: string]: unknown } | undefined
+    const raw = headers?.get?.('retry-after') ?? headers?.['retry-after']
+    if (typeof raw !== 'string' && typeof raw !== 'number') return undefined
+    const seconds = Number(raw)
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.max(1_000, seconds * 1_000)
+    const dateMs = Date.parse(String(raw))
+    return Number.isFinite(dateMs) ? Math.max(1_000, dateMs - Date.now()) : undefined
+  }
+
+  private async getTradingContext(): Promise<{
+    credentials: PolymarketCredentials
+    signer: WalletClient
+    client: ClobClient
+  }> {
+    if (!this.cachedCredentials || !this.cachedSigner) {
+      this.cachedCredentials = await this.credentialStore.getCredentials()
+      this.cachedSigner = this.createSigner(this.cachedCredentials.signerPrivateKey)
+    }
+    return {
+      credentials: this.cachedCredentials,
+      signer: this.cachedSigner,
+      client: this.getAuthenticatedClient(this.cachedCredentials, this.cachedSigner)
+    }
   }
 
   private createAuthenticatedClient(credentials: PolymarketCredentials, signer: WalletClient): ClobClient {
@@ -658,10 +864,9 @@ export class PolymarketLiveBroker implements PolymarketBroker {
   async prefetchServerTime(): Promise<void> {
     if (this.serverTimeOffsetMs !== undefined && Date.now() - this.serverTimeSyncedAt < 120_000) return
     try {
-      const credentials = await this.credentialStore.getCredentials()
+      const { credentials, client } = await this.getTradingContext()
       if (!credentials.apiKey || !credentials.signerPrivateKey) return
-      const signer = this.createSigner(credentials.signerPrivateKey)
-      await this.getAuthenticatedClient(credentials, signer).getServerTime()
+      await this.withClobProtection(() => client.getServerTime())
     } catch {
       // 预热失败不影响下单路径：真实下单时会再次请求服务器时间
     }

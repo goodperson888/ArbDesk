@@ -201,6 +201,60 @@ describe('PolymarketLiveBroker', () => {
     expect(getBalanceAllowance).toHaveBeenCalledTimes(1)
   })
 
+  it('prefetches V2 market metadata by condition id on the authenticated execution client', async () => {
+    const getClobMarketInfo = vi.fn(async () => ({ condition_id: 'condition-1' }))
+    const client = {
+      getOrderBook: vi.fn(async () => orderBook()),
+      getClobMarketInfo
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    await broker.prefetchMarkets([{ conditionId: 'condition-1', tokenIds: ['token'] }])
+
+    expect(getClobMarketInfo).toHaveBeenCalledWith('condition-1')
+    expect(client.getOrderBook).toHaveBeenCalledWith('token')
+  })
+
+  it('deduplicates concurrent prefetches and keeps condition metadata warm for the market lifetime', async () => {
+    let releaseMarketInfo!: () => void
+    const marketInfoPending = new Promise<void>((resolve) => { releaseMarketInfo = resolve })
+    const getClobMarketInfo = vi.fn(async () => {
+      await marketInfoPending
+      return { condition_id: 'condition-1' }
+    })
+    const getOrderBook = vi.fn(async () => orderBook())
+    const client = { getOrderBook, getClobMarketInfo } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    const first = broker.prefetchMarkets([{ conditionId: 'condition-1', tokenIds: ['token'] }])
+    const second = broker.prefetchMarkets([{ conditionId: 'condition-1', tokenIds: ['token'] }])
+    releaseMarketInfo()
+    await Promise.all([first, second])
+    await broker.prefetchMarkets([{ conditionId: 'condition-1', tokenIds: ['token'] }])
+
+    expect(getClobMarketInfo).toHaveBeenCalledTimes(1)
+    expect(getOrderBook).toHaveBeenCalledTimes(1)
+  })
+
+  it('opens a cooldown circuit after a CLOB 429 instead of immediately requesting again', async () => {
+    const rateLimited = Object.assign(new Error('rate limited'), {
+      response: { status: 429, headers: { 'retry-after': '60' } }
+    })
+    const getClobMarketInfo = vi.fn(async () => { throw rateLimited })
+    const client = {
+      getOrderBook: vi.fn(async () => orderBook()),
+      getClobMarketInfo
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    await expect(broker.prefetchMarkets([{ conditionId: 'condition-1', tokenIds: ['token'] }]))
+      .rejects.toThrow('已暂停自动请求')
+    await expect(broker.prefetchMarkets([{ conditionId: 'condition-2', tokenIds: [] }]))
+      .rejects.toThrow('请求保护已触发')
+
+    expect(getClobMarketInfo).toHaveBeenCalledTimes(1)
+  })
+
   it('caches the CLOB server-time offset and reuses the authenticated client', async () => {
     const getServerTime = vi.fn(async () => Date.now() + 1_234)
     const client = {
@@ -277,7 +331,8 @@ describe('PolymarketLiveBroker', () => {
         expect(order).toEqual(expect.objectContaining({
           amount: 5.5,
           price: 0.55,
-          orderType: OrderType.FAK
+          orderType: OrderType.FAK,
+          userUSDCBalance: 100
         }))
         return { version: 2 }
       }),
@@ -294,7 +349,32 @@ describe('PolymarketLiveBroker', () => {
       averagePrice: '0.55',
       orderId: 'poly-order-1'
     }))
+    expect(client.createMarketOrder).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ version: 2 }))
     expect(postOrder).toHaveBeenCalledOnce()
+  })
+
+  it('does not trust a delayed async response amount and reads the actual fill back by order id', async () => {
+    const getTrades = vi.fn(async () => [{
+      id: 'trade-delayed', taker_order_id: 'delayed-order', asset_id: 'token', side: 'BUY',
+      size: '4', price: '0.55', status: 'MATCHED', match_time: new Date().toISOString()
+    }])
+    const client = {
+      getOrderBook: vi.fn(async () => orderBook()),
+      getBalanceAllowance: vi.fn(async () => ({
+        balance: '100000000', allowances: { '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e': '1000000000' }
+      })),
+      createMarketOrder: vi.fn(async () => ({ version: 2 })),
+      postOrder: vi.fn(async () => ({
+        success: true, orderID: 'delayed-order', status: 'delayed', takingAmount: '10', makingAmount: '5.5'
+      })),
+      getTrades
+    } as unknown as ClobClient
+    const broker = new PolymarketLiveBroker(credentialStore(), () => client)
+
+    const fill = await broker.hedge({ tokenId: 'token', direction: 'DOWN', quantity: '10', maximumPrice: '0.57' })
+
+    expect(getTrades).toHaveBeenCalledOnce()
+    expect(fill).toMatchObject({ orderId: 'delayed-order', quantity: '4', averagePrice: '0.55' })
   })
 
   it('returns the actual partial FAK fill instead of treating it as a failed all-or-none hedge', async () => {

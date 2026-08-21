@@ -48,6 +48,7 @@ describe('PolymarketMarketData', () => {
     const windows = await service.fetchWindows([{ durationMinutes: 5, startTime: 1_800_000, endTime: 2_100_000 }])
 
     expect(windows[0].outcomes.UP!.tokenId).toBe('token-up')
+    expect(windows[0].conditionId).toBe('condition-1')
     expect(windows[0].outcomes.UP!.bestAsk).toBe('0.50')
     expect(windows[0].outcomes.DOWN!.askSize).toBe('6')
     expect(windows[0].outcomes.UP!.feeRate).toBe('0.07')
@@ -57,6 +58,29 @@ describe('PolymarketMarketData', () => {
     upPrice = '0.47'
     await service.confirmOutcomeQuote('token-up', -1)
     expect(service.getLatestWindows()[0].outcomes.UP?.bestAsk).toBe('0.47')
+  })
+
+  it('keeps the official reference-price source timestamp instead of masking stale data as fresh', async () => {
+    const sourceSeconds = 1_800_000_123
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.includes('gamma-api')) return Response.json({ markets: [{
+        conditionId: 'condition-1', active: true, closed: false,
+        outcomes: '["Up","Down"]', clobTokenIds: '["token-up","token-down"]'
+      }] })
+      if (url.includes('/clob-markets/')) return Response.json({ fd: { r: 0.07, e: 1 } })
+      if (url.includes('/book?')) return Response.json({ asks: [{ price: '0.5', size: '10' }] })
+      if (url.includes('/api/crypto/crypto-price?')) {
+        return Response.json({ openPrice: 60_000, closePrice: 60_010, timestamp: sourceSeconds })
+      }
+      if (url.includes('/api/crypto/price-history?')) return Response.json([])
+      return Response.json({})
+    }))
+    const service = new PolymarketMarketData({ enableStreaming: false })
+
+    const [window] = await service.fetchWindows([{ durationMinutes: 5, startTime: 1_800_000, endTime: 2_100_000 }])
+
+    expect(window.indexReceivedAt).toBe(sourceSeconds * 1_000)
   })
 
   it('reports disconnected instead of generating fallback quotes', async () => {

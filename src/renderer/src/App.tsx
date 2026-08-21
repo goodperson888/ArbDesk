@@ -183,8 +183,24 @@ function executionTimingSummary(session: ExecutionSession): string | undefined {
     (!timings.mexcFillDetectedAt || timings.polymarketStartedAt < timings.mexcFillDetectedAt)
   )
   if (preflight) segments.push(`复核 ${preflight}`)
+  const mexcHotPath = [
+    timings.mexcCurrencyMappingMs !== undefined ? `映射${timings.mexcCurrencyMappingMs}ms` : undefined,
+    timings.mexcCookieReadMs !== undefined ? `Cookie${timings.mexcCookieReadMs}ms` : undefined,
+    timings.mexcPostMs !== undefined ? `POST ${timings.mexcPostMs}ms` : undefined
+  ].filter(Boolean).join('/')
+  const polyHotPath = [
+    timings.polymarketMetadataMs !== undefined ? `元数据${timings.polymarketMetadataMs}ms` : undefined,
+    timings.polymarketSigningMs !== undefined ? `签名${timings.polymarketSigningMs}ms` : undefined,
+    timings.polymarketPostMs !== undefined ? `POST ${timings.polymarketPostMs}ms` : undefined,
+    timings.polymarketConfirmationMs !== undefined ? `确认${timings.polymarketConfirmationMs}ms` : undefined
+  ].filter(Boolean).join('/')
   if (page) segments.push(`页面/按钮 ${page}`)
+  if (mexcHotPath) segments.push(`MEXC ${mexcHotPath}`)
   if (fill) segments.push(`MEXC成交 ${fill}`)
+  if (timings.mexcFillReadbackMs !== undefined) {
+    segments.push(`成交回读 ${timings.mexcFillReadbackMs}ms/${timings.mexcFillRestQueries ?? 0}次REST`)
+  }
+  if (polyHotPath) segments.push(`Poly ${polyHotPath}`)
   if (hedge) segments.push(`Poly对冲${hedgeOverlapsFill ? '(并行) ' : ' '}${hedge}`)
   if (total) segments.push(`总计(墙钟) ${total}`)
   return segments.length > 0 ? segments.join(' · ') : undefined
@@ -1757,7 +1773,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
               </button>
               <fieldset className="hedge-mode-fieldset">
                 <legend>第二腿对冲速度</legend>
-                <small>选择“价格更稳”还是“尽快完成对冲”；两种都受收益保护价和恢复亏损上限约束。</small>
+                <small>普通首轮受最大加价保护；MEXC确认成交后的自动补单改由整组恢复亏损上限保护。</small>
                 <div className="segmented-control browser-mode-control" aria-label="第二腿对冲速度">
                   <button type="button" aria-pressed={hedgeModeDraft === 'PROTECTED_LIMIT'} className={hedgeModeDraft === 'PROTECTED_LIMIT' ? 'active' : ''} onClick={() => setHedgeModeDraft('PROTECTED_LIMIT')}>稳健</button>
                   <button type="button" aria-pressed={hedgeModeDraft === 'PROTECTED_MARKET'} className={hedgeModeDraft === 'PROTECTED_MARKET' ? 'active' : ''} onClick={() => setHedgeModeDraft('PROTECTED_MARKET')}>快速（推荐）</button>
@@ -1777,9 +1793,11 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 </label>
                 <label className="settings-field" htmlFor="recovery-max-loss">恢复最多接受亏损（USDT）
                   <input id="recovery-max-loss" value={maxRecoveryLossDraft} onChange={(event) => setMaxRecoveryLossDraft(event.target.value)} inputMode="decimal" />
+                  <small>MEXC确认成交后补剩余份额时生效；可能突破普通最大加价，但整组最坏预计亏损不得超过此值。</small>
                 </label>
                 <label className="settings-field" htmlFor="hedge-retry-count">自动补单次数
                   <input id="hedge-retry-count" type="number" min="0" max="20" step="1" value={hedgeRetryCountDraft} onChange={(event) => setHedgeRetryCountDraft(event.target.value)} inputMode="numeric" />
+                  <small>只补尚未成交的剩余份额；余额、授权、最低单量、价格保护和回执不确定不会自动重试。</small>
                 </label>
                 <label className="settings-field" htmlFor="pre-hedge-ratio">预对冲比例（%）
                   <input id="pre-hedge-ratio" type="number" min="0" max="100" step="5" value={preHedgeRatioDraft} onChange={(event) => setPreHedgeRatioDraft(event.target.value)} inputMode="numeric" />
