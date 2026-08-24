@@ -24,10 +24,17 @@ function transport(overrides: Partial<GateOrderTransport> = {}): GateOrderTransp
 }
 
 describe('GateVenueAdapter', () => {
+  it('allows page-click execution without a persisted request template', async () => {
+    const submit = vi.fn(async () => ({ orderId: 'gate-page-order', status: 'ACCEPTED' as const, filledQuantity: '0' }))
+    const adapter = new GateVenueAdapter(transport({ getSchema: () => undefined, canExecutePageOrders: () => true, submit }), { liveEnabled: true })
+    await expect(adapter.preflightOrder(baseRequest)).resolves.toBeUndefined()
+    expect(submit).not.toHaveBeenCalled()
+  })
+
   it('blocks real submission until a verified captured schema exists', async () => {
     const submit = vi.fn()
     const adapter = new GateVenueAdapter(transport({ getSchema: () => undefined, submit }))
-    await expect(adapter.preflightOrder(baseRequest)).rejects.toThrow('尚未捕获 Gate 事件合约订单结构')
+    await expect(adapter.preflightOrder(baseRequest)).rejects.toThrow('Gate 页面下单不可用')
     expect(submit).not.toHaveBeenCalled()
   })
 

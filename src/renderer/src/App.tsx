@@ -1366,11 +1366,11 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       return
     }
     if (enabling) {
-      if (!gateOrderCapture?.captured || !gateOrderCapture.executionReady) {
-        setMessage('请先在已接管的 Gate 指纹浏览器页面完成订单捕获；独立只读页面不能执行订单')
+      if (!gateOrderCapture?.executionReady) {
+        setMessage('请先在已接管的 Gate 指纹浏览器页面打开事件合约单页；独立只读页面不能执行订单')
         return
       }
-      const confirmed = window.confirm('Gate 订单结构已捕获。开启后，确认的 Gate 双腿机会才会允许发送一次真实订单；未知结果不会自动重试。确认开启？')
+      const confirmed = window.confirm('开启后，确认的 Gate 双腿机会会在后台操作已登录页面，点击一次买入并等待这一次响应；未知结果不会自动重试。确认开启？')
       if (!confirmed) return
     }
     const result = await run(() => window.arbApp.updateSettings({ gateLiveEnabled: enabling }))
@@ -2287,17 +2287,17 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 </details>
                 <button className="wide-secondary" onClick={() => void openGatePage()} disabled={busy}><ExternalLink aria-hidden="true" />打开 Gate 事件合约单页面</button>
                 <button className="wide-secondary" onClick={() => void stopGatePage()} disabled={busy}><Square aria-hidden="true" />停止 Gate 监听并释放页面</button>
-                <div className="credential-notice"><Network aria-hidden="true" /><span>配置 Hubstudio 环境后会接管已登录的 Gate 标签页；未配置时才使用独立只读页面。默认不下单，必须先手动捕获真实订单结构。</span></div>
+                <div className="credential-notice"><Network aria-hidden="true" /><span>配置 Hubstudio 环境后会接管已登录的 Gate 标签页；未配置时才使用独立只读页面。无 API Key 时也可通过后台控件点击下单；订单捕获仅用于诊断和校验。</span></div>
                 {gatePageStatus && <div className="browser-status-detail"><span>GATE页</span><p>{gatePageStatus.message}</p></div>}
                 {gateOrderCapture && <div className="browser-status-detail"><span>订单捕获</span><p>{gateOrderCapture.message}{gateOrderCapture.endpoint ? ` · ${gateOrderCapture.method} ${gateOrderCapture.endpoint}` : ''}{gateOrderCapture.requestFields?.length ? ` · 字段 ${gateOrderCapture.requestFields.join(', ')}` : ''}{gateOrderCapture.traceEntryCount !== undefined ? ` · 链路 ${gateOrderCapture.traceEntryCount}（请求 ${gateOrderCapture.candidateCount ?? 0} / 响应 ${gateOrderCapture.responseCount ?? 0} / WS ${gateOrderCapture.webSocketCount ?? 0}）` : ''}</p></div>}
                 {gateCredentials?.message && <div className="browser-status-detail"><span>GATE</span><p>{gateCredentials.message}{gateCredentials.apiKeyMasked ? ` · ${gateCredentials.apiKeyMasked}` : ''}</p></div>}
                 <button className="wide-secondary" onClick={() => void startGateOrderCapture()} disabled={busy}><ShieldAlert aria-hidden="true" />开启 Gate 订单捕获模式（只等你手动下单）</button>
                 {gateOrderCapture?.capturing && <button className="wide-secondary" onClick={() => void stopGateOrderCapture()} disabled={busy}><Square aria-hidden="true" />停止链路采集（保留脱敏元数据）</button>}
                 <button className="wide-secondary" onClick={() => void exportGateOrderCapture()} disabled={busy || !gateOrderCapture?.traceEntryCount}><Download aria-hidden="true" />导出脱敏订单链路供分析</button>
-                <button className={`wide-secondary ${snapshot.settings.gateLiveEnabled ? 'live-toggle enabled' : ''}`} onClick={() => void toggleGateLive()} disabled={busy || (!snapshot.settings.gateLiveEnabled && (gateOrderCapture?.capturing === true || !gateOrderCapture?.captured || !gateOrderCapture.executionReady))}>
+                <button className={`wide-secondary ${snapshot.settings.gateLiveEnabled ? 'live-toggle enabled' : ''}`} onClick={() => void toggleGateLive()} disabled={busy || (!snapshot.settings.gateLiveEnabled && (gateOrderCapture?.capturing === true || !gateOrderCapture?.executionReady))}>
                   {snapshot.settings.gateLiveEnabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}Gate 事件合约实盘：{snapshot.settings.gateLiveEnabled ? '已开启（点击关闭）' : '默认关闭'}
                 </button>
-                {gateOrderCapture?.captured && <button className="wide-secondary" onClick={() => void clearGateOrderCapture()} disabled={busy}><Trash2 aria-hidden="true" />清除捕获结构并恢复只读</button>}
+                {gateOrderCapture?.captured && <button className="wide-secondary" onClick={() => void clearGateOrderCapture()} disabled={busy}><Trash2 aria-hidden="true" />清除诊断捕获结构</button>}
                 <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>捕获模式不会自动提交订单；实盘开关默认关闭。订单 POST 超时或状态不明时只做回读，不会重复发送。</span></div>
                 <button className="wide-secondary safe-preparation-button" onClick={() => void prepareGateWithoutSubmitting()} disabled={busy || !gateCredentials?.configured}><ShieldCheck aria-hidden="true" />完整联调 Gate（绝不下单）</button>
                 {gatePreparation && <PreparationReportView report={gatePreparation} />}

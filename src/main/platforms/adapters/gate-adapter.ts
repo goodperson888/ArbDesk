@@ -14,6 +14,7 @@ export interface GateOrderResult {
 
 export interface GateOrderTransport {
   getSchema(): GateOrderSchema | undefined
+  canExecutePageOrders?(): boolean
   submit(request: VenueExecutionRequest): Promise<GateOrderResult>
   reconcile(orderId: string): Promise<GateOrderResult | undefined>
 }
@@ -42,12 +43,15 @@ export class GateVenueAdapter implements VenueAdapter {
   async preflightOrder(request: VenueExecutionRequest): Promise<void> {
     assertVenueCanExecute(this, request)
     const schema = this.transport.getSchema()
-    if (!schema) throw new Error('尚未捕获 Gate 事件合约订单结构；请先在指纹浏览器中开启捕获模式并手动完成一次最小订单')
-    if (schema.method !== 'POST' && schema.method !== 'PUT' && schema.method !== 'PATCH') throw new Error('Gate 捕获到的订单方法不受支持')
-    if (!hasField(schema.requestFields, ['market_id', 'marketId', 'event_id', 'eventId', 'contract_id', 'contractId'])) throw new Error('Gate 订单结构缺少市场字段，未允许下单')
-    if (!hasField(schema.requestFields, ['outcome_id', 'outcomeId', 'token_id', 'tokenId', 'contract_token_id', 'contractTokenId'])) throw new Error('Gate 订单结构缺少结果字段，未允许下单')
-    if (!hasField(schema.requestFields, ['quantity', 'qty', 'size', 'amount'])) throw new Error('Gate 订单结构缺少数量字段，未允许下单')
-    if (!hasField(schema.requestFields, ['price', 'limit_price', 'limitPrice', 'outcome_price', 'outcomePrice'])) throw new Error('Gate 订单结构缺少价格字段，未允许下单')
+    const pageOrderReady = this.transport.canExecutePageOrders?.() ?? false
+    if (!schema && !pageOrderReady) throw new Error('Gate 页面下单不可用；请先接管已登录的指纹浏览器 Gate 标签页')
+    if (schema) {
+      if (schema.method !== 'POST' && schema.method !== 'PUT' && schema.method !== 'PATCH') throw new Error('Gate 捕获到的订单方法不受支持')
+      if (!hasField(schema.requestFields, ['market_id', 'marketId', 'event_id', 'eventId', 'contract_id', 'contractId'])) throw new Error('Gate 订单结构缺少市场字段，未允许下单')
+      if (!hasField(schema.requestFields, ['outcome_id', 'outcomeId', 'token_id', 'tokenId', 'contract_token_id', 'contractTokenId'])) throw new Error('Gate 订单结构缺少结果字段，未允许下单')
+      if (!hasField(schema.requestFields, ['quantity', 'qty', 'size', 'amount'])) throw new Error('Gate 订单结构缺少数量字段，未允许下单')
+      if (!hasField(schema.requestFields, ['price', 'limit_price', 'limitPrice', 'outcome_price', 'outcomePrice', 'total_cost', 'totalCost', 'cost'])) throw new Error('Gate 订单结构缺少价格或总成本字段，未允许下单')
+    }
     if (!(this.options.liveEnabledProvider?.() ?? this.options.liveEnabled ?? false)) throw new Error('Gate 实盘下单开关尚未开启')
     if (!request.confirmed) throw new Error('Gate 双腿执行未完成二次确认')
     const quantity = new Decimal(request.quantity)

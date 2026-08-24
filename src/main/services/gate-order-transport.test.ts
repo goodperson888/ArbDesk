@@ -5,6 +5,20 @@ import { GateBrowserOrderTransport } from './gate-order-transport'
 import type { GateCapturedRequest } from './gate-page-capture'
 
 describe('GateBrowserOrderTransport', () => {
+  it('prefers one background page click over replaying a captured POST', async () => {
+    const capture = new GateOrderCapture()
+    const executeCapturedOrder = vi.fn()
+    const executePageOrder = vi.fn(async () => ({
+      status: 200,
+      body: JSON.stringify({ order_id: 'gate-page-1', status: 'accepted', filled_quantity: '0' })
+    }))
+    const transport = new GateBrowserOrderTransport(capture, { executeCapturedOrder, executePageOrder, canExecutePageOrders: () => true })
+    const result = await transport.submit({ marketId: 'event-1', outcomeId: 'token-up', direction: 'UP', quantity: '2', limitPrice: '0.5', startTime: Date.now(), endTime: Date.now() + 300_000, quoteReceivedAt: Date.now(), timeInForce: 'FOK', clientOrderId: 'client-page-1' })
+    expect(result).toMatchObject({ orderId: 'gate-page-1', status: 'ACCEPTED', filledQuantity: '0' })
+    expect(executePageOrder).toHaveBeenCalledTimes(1)
+    expect(executeCapturedOrder).not.toHaveBeenCalled()
+  })
+
   it('submits the captured template through the bound page and returns the verified order result', async () => {
     const capture = new GateOrderCapture()
     capture.startCapture()

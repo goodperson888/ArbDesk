@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { app, BrowserWindow, ipcMain, powerMonitor, shell } from 'electron'
 import { AppController } from './app-controller'
@@ -136,6 +136,14 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   )
   const gatePageCapture = new GatePageCapture(fingerprintRuntime)
   const gateOrderCapture = new GateOrderCapture(gatePageCapture, () => gatePageCapture.canExecuteOrders())
+  try {
+    const persisted = JSON.parse(await readFile(join(dataDirectory, 'gate-order-capture-trace.json'), 'utf8')) as {
+      summary?: { endpoint?: string; method?: string; requestFields?: string[]; pageUrl?: string; capturedAt?: number }
+    }
+    gateOrderCapture.restoreSchema(persisted.summary)
+  } catch {
+    // No prior sanitized trace is normal on first run. Page monitoring remains available.
+  }
   const gateOrderTransport = new GateBrowserOrderTransport(gateOrderCapture, gatePageCapture)
   const gateMarketData = new GateMarketData(gatePageCapture, { autoStartPageCapture: true })
   const kalshiPageCapture = new KalshiPageCapture()

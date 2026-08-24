@@ -1,4 +1,5 @@
 import { app, BrowserWindow, shell } from 'electron'
+import Decimal from 'decimal.js'
 import type { CDPSession, Page } from 'playwright-core'
 import type { GatePageCaptureStatus } from '../../shared/types'
 import type { FingerprintBrowserRuntime } from './fingerprint-browser-runtime'
@@ -47,6 +48,17 @@ export interface GatePreparedOrderRequest {
   method: string
   body: string
   pageUrl?: string
+}
+
+export interface GatePageOrderIntent {
+  marketId: string
+  outcomeId: string
+  direction: 'UP' | 'DOWN'
+  quantity: string
+  limitPrice: string
+  clientOrderId: string
+  durationMinutes?: 5 | 15
+  allowSubmit?: boolean
 }
 
 export interface GateCapturedHttpResponse {
@@ -144,6 +156,61 @@ export class GatePageCapture implements GatePageCaptureSource {
 
   getStatus(): GatePageCaptureStatus { return { ...this.status } }
   canExecuteOrders(): boolean { return Boolean(this.fingerprintPage && !this.fingerprintPage.isClosed()) }
+
+  canExecutePageOrders(): boolean { return this.canExecuteOrders() }
+
+  /**
+   * Use the logged-in Gate page's own controls for exactly one order attempt.
+   * This deliberately does not bring the tab to the foreground and never
+   * replays the captured POST with fetch, so a timeout cannot create a second
+   * request. The caller must reconcile an uncertain response before retrying.
+   */
+  async executePageOrder(intent: GatePageOrderIntent): Promise<GateCapturedHttpResponse> {
+    const page = this.fingerprintPage
+    if (!page || page.isClosed()) throw new Error('Gate 指纹浏览器标签页不可用，未操作订单')
+    const quantity = new Decimal(intent.quantity)
+    const price = new Decimal(intent.limitPrice)
+    if (!quantity.isFinite() || quantity.lte(0) || !price.isFinite() || price.lte(0) || price.gte(1)) {
+      throw new Error('Gate 页面下单数量或价格无效，未操作订单')
+    }
+    const currentEventId = (() => {
+      try { return new URL(page.url()).searchParams.get('eventId') ?? undefined } catch { return undefined }
+    })()
+    if (currentEventId && intent.marketId && currentEventId !== intent.marketId) {
+      const duration = intent.durationMinutes
+      if (duration !== 5 && duration !== 15) throw new Error(`Gate 页面当前 eventId=${currentEventId} 与目标市场 ${intent.marketId} 不一致，且无法识别目标周期`)
+      const outcome = intent.direction === 'UP' ? 'Up' : 'Down'
+      const targetUrl = `https://www.gate.com/zh/trade-events/btc-updown-${duration}m?eventId=${encodeURIComponent(intent.marketId)}&outcome=${outcome}`
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 10_000 })
+    }
+    const cost = quantity.mul(price).toFixed()
+    const directionPattern = intent.direction === 'UP' ? /^看涨\s+\d+(?:\.\d+)?%$/ : /^看跌\s+\d+(?:\.\d+)?%$/
+    const outcomeButton = page.getByRole('button', { name: directionPattern }).first()
+    const costInput = page.locator('label').filter({ hasText: /成本\s*\(USDT\)/ }).last().locator('input[inputmode="decimal"]').first()
+    await Promise.all([
+      outcomeButton.waitFor({ state: 'visible', timeout: 15_000 }),
+      costInput.waitFor({ state: 'visible', timeout: 15_000 })
+    ]).catch(() => undefined)
+    if (!await outcomeButton.isVisible().catch(() => false)) throw new Error('Gate 页面未识别当前涨跌按钮，未操作订单')
+    if (!await costInput.isVisible().catch(() => false)) throw new Error('Gate 页面未识别成本输入框，未操作订单')
+
+    await outcomeButton.click()
+    await costInput.fill(cost)
+    const submitButton = page.getByRole('button', { name: intent.direction === 'UP' ? /^买入看涨$/ : /^买入看跌$/ }).first()
+    await submitButton.waitFor({ state: 'visible', timeout: 5_000 }).catch(() => undefined)
+    if (!await submitButton.isVisible().catch(() => false)) throw new Error('Gate 页面未识别买入按钮，未操作订单')
+    if (!await submitButton.isEnabled().catch(() => false)) throw new Error(`Gate 买入按钮不可用（成本 ${cost} USDT），未提交订单`)
+    if (intent.allowSubmit === false) return { status: 200, body: JSON.stringify({ status: 'prepared', order_id: '' }) }
+
+    const responsePromise = page.waitForResponse(
+      (response) => response.request().method().toUpperCase() === 'POST' && /\/apiw\/v2\/event-contract\/place-order(?:$|\?)/.test(response.url()),
+      { timeout: 8_000 }
+    ).catch(() => undefined)
+    await submitButton.click()
+    const response = await responsePromise
+    if (!response) throw new Error('已点击 Gate 买入，但 8 秒内没有捕获 place-order 响应；订单状态不明，禁止重试')
+    return { status: response.status(), body: await response.text() }
+  }
 
   async executeCapturedOrder(request: GatePreparedOrderRequest): Promise<GateCapturedHttpResponse> {
     const method = request.method.toUpperCase()

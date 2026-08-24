@@ -20,6 +20,20 @@ function request(overrides: Partial<GateCapturedRequest> = {}): GateCapturedRequ
 }
 
 describe('GateOrderCapture', () => {
+  it('restores only the safe schema from an exported trace', () => {
+    const capture = new GateOrderCapture()
+    expect(capture.restoreSchema({
+      endpoint: 'https://www.gate.com/apiw/v2/event-contract/place-order', method: 'POST',
+      requestFields: ['event_id', 'market_id', 'token_id', 'size', 'total_cost'], capturedAt: Date.now()
+    })).toBe(true)
+    expect(capture.getSchema()).toMatchObject({ method: 'POST', requestFields: ['event_id', 'market_id', 'token_id', 'size', 'total_cost'] })
+    expect(() => capture.buildRequest({
+      marketId: 'm', outcomeId: 'o', direction: 'UP', quantity: '1', limitPrice: '0.5', startTime: Date.now(),
+      endTime: Date.now() + 300_000, quoteReceivedAt: Date.now(), timeInForce: 'FOK', clientOrderId: 'c'
+    })).toThrow('尚未捕获 Gate 可复用的订单请求体')
+    expect(capture.restoreSchema({ endpoint: 'https://evil.example/place-order', method: 'POST', requestFields: ['market_id'] })).toBe(false)
+  })
+
   it('captures only an explicit manual order request and redacts secrets', () => {
     const capture = new GateOrderCapture()
     capture.observe(request())
@@ -80,6 +94,17 @@ describe('GateOrderCapture', () => {
       receivedAt: Date.now()
     })
     expect(capture.getResult('gate-1')).toMatchObject({ orderId: 'gate-1', status: 'FILLED', filledQuantity: '2', averagePrice: '0.50' })
+  })
+
+  it('uses the passive Gate WebSocket stream for fill readback', () => {
+    const frames: Array<(event: GateCapturedWebSocketFrame) => void> = []
+    const capture = new GateOrderCapture({
+      onRequest: () => () => undefined,
+      onResponse: () => () => undefined,
+      onWebSocketFrame: (listener) => { frames.push(listener); return () => undefined }
+    })
+    frames[0]?.({ url: 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web', direction: 'RECEIVED', payload: JSON.stringify({ order_id: 'gate-ws-1', status: 'filled', filled_quantity: '2', avg_price: '0.49' }), receivedAt: Date.now() })
+    expect(capture.getResult('gate-ws-1')).toMatchObject({ status: 'FILLED', filledQuantity: '2', averagePrice: '0.49' })
   })
 
   it('records a complete sanitized request/response/websocket trace until capture is stopped', () => {

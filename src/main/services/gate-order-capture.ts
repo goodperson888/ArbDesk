@@ -1,3 +1,4 @@
+import Decimal from 'decimal.js'
 import type { GateOrderCaptureSummary } from '../../shared/types'
 import type { VenueExecutionRequest } from '../platforms/venue-adapter'
 import { isGateHost, type GateCapturedRequest, type GateCapturedResponse, type GateCapturedWebSocketFrame, type GatePageCaptureSource } from './gate-page-capture'
@@ -46,7 +47,7 @@ export interface GateOrderTraceEntry {
   receivedAt: number
 }
 
-type GateOrderCaptureSource = Pick<GatePageCaptureSource, 'onRequest' | 'onResponse'> & Partial<Pick<GatePageCaptureSource, 'onNetworkRequest' | 'onNetworkResponse' | 'onRawWebSocketFrame'>>
+type GateOrderCaptureSource = Pick<GatePageCaptureSource, 'onRequest' | 'onResponse'> & Partial<Pick<GatePageCaptureSource, 'onWebSocketFrame' | 'onNetworkRequest' | 'onNetworkResponse' | 'onRawWebSocketFrame'>>
 
 const MAX_TRACE_ENTRIES = 500
 
@@ -154,7 +155,8 @@ export class GateOrderCapture {
     if (source) {
       const stopRequest = source.onRequest((event) => this.observe(event))
       const stopResponse = source.onResponse((event) => this.observeResponse(event))
-      this.unsubscribe = () => { stopRequest(); stopResponse(); this.stopNetworkCapture?.(); this.stopNetworkCapture = undefined }
+      const stopWebSocket = source.onWebSocketFrame?.((event) => this.observeResponse({ url: event.url, body: event.payload, receivedAt: event.receivedAt }))
+      this.unsubscribe = () => { stopRequest(); stopResponse(); stopWebSocket?.(); this.stopNetworkCapture?.(); this.stopNetworkCapture = undefined }
     }
   }
 
@@ -260,6 +262,7 @@ export class GateOrderCapture {
     if (!schema || !this.templateBody || typeof this.templateBody !== 'object') throw new Error('尚未捕获 Gate 可复用的订单请求体')
     const replaced = new Set<string>()
     const replace = (key: string, value: string): string => { replaced.add(key); return value }
+    const totalCost = new Decimal(request.quantity).mul(new Decimal(request.limitPrice)).toFixed()
     const visit = (value: unknown): unknown => {
       if (Array.isArray(value)) return value.map(visit)
       if (!value || typeof value !== 'object') return value
@@ -270,6 +273,7 @@ export class GateOrderCapture {
         if (['outcomeid', 'tokenid', 'contracttokenid'].includes(normalized)) return [key, replace(key, request.outcomeId)]
         if (['quantity', 'qty', 'size', 'amount'].includes(normalized)) return [key, replace(key, request.quantity)]
         if (['price', 'limitprice', 'outcomeprice'].includes(normalized)) return [key, replace(key, request.limitPrice)]
+        if (['totalcost', 'cost', 'totalamount'].includes(normalized)) return [key, replace(key, totalCost)]
         if (normalized === 'direction' || normalized === 'outcome') return [key, replace(key, request.direction)]
         if (normalized === 'clientorderid') return [key, replace(key, request.clientOrderId)]
         if (normalized === 'timeinforce') return [key, replace(key, request.timeInForce)]
@@ -280,13 +284,36 @@ export class GateOrderCapture {
     const keys = [...replaced].map((key) => key.toLowerCase().replace(/[-_]/g, ''))
     const required = [
       ['marketid', 'eventid', 'contractid'], ['outcomeid', 'tokenid', 'contracttokenid'],
-      ['quantity', 'qty', 'size', 'amount'], ['price', 'limitprice', 'outcomeprice']
+      ['quantity', 'qty', 'size', 'amount'], ['price', 'limitprice', 'outcomeprice', 'totalcost', 'cost', 'totalamount']
     ]
     if (required.some((group) => !group.some((field) => keys.includes(field)))) throw new Error('Gate 捕获订单缺少可安全替换的市场、结果、数量或价格字段')
     return { endpoint: this.replayEndpoint ?? schema.endpoint, method: schema.method, body: JSON.stringify(body), pageUrl: schema.pageUrl }
   }
 
   getSchema(): GateOrderSchema | undefined { return this.schema ? { ...this.schema, requestFields: [...this.schema.requestFields] } : undefined }
+
+  /** Restore only the sanitized order schema exported by a prior capture.
+   * The request body, cookies and signatures are intentionally never restored;
+   * page-click execution does not need them and the replay fallback remains
+   * blocked until a fresh in-memory template is captured.
+   */
+  restoreSchema(schema: Partial<GateOrderSchema> | undefined): boolean {
+    if (!schema || typeof schema.endpoint !== 'string' || !isGateHost(schema.endpoint)) return false
+    let url: URL
+    try { url = new URL(schema.endpoint) } catch { return false }
+    if (url.protocol !== 'https:' || url.pathname !== '/apiw/v2/event-contract/place-order') return false
+    const method = String(schema.method ?? '').toUpperCase()
+    const requestFields = Array.isArray(schema.requestFields) ? schema.requestFields.filter((field): field is string => typeof field === 'string') : []
+    if (method !== 'POST' || !requestFields.length) return false
+    this.schema = {
+      endpoint: url.toString(), method, requestFields,
+      pageUrl: typeof schema.pageUrl === 'string' ? schema.pageUrl : undefined,
+      capturedAt: Number.isFinite(Number(schema.capturedAt)) ? Number(schema.capturedAt) : Date.now()
+    }
+    this.replayEndpoint = undefined
+    this.templateBody = undefined
+    return true
+  }
   getTrace(): GateOrderTraceEntry[] {
     return this.trace.map((entry) => ({
       ...entry,
@@ -300,7 +327,7 @@ export class GateOrderCapture {
     const schema = this.getSchema()
     return schema
       ? { captured: true, capturing: this.capturing, executionReady: this.executionReady?.() ?? false, endpoint: schema.endpoint, method: schema.method, requestFields: schema.requestFields, pageUrl: schema.pageUrl, capturedAt: schema.capturedAt, traceEntryCount: this.trace.length, candidateCount: this.trace.filter((entry) => entry.kind === 'REQUEST').length, responseCount: this.trace.filter((entry) => entry.kind === 'RESPONSE').length, webSocketCount: this.trace.filter((entry) => entry.kind === 'WEBSOCKET').length, message: this.executionReady?.() ? '已捕获 Gate 订单候选；链路仍在内存采集，可停止后导出脱敏元数据' : '已捕获订单候选，但当前不是可执行的指纹浏览器页面' }
-      : { captured: false, capturing: this.capturing, executionReady: this.executionReady?.() ?? false, traceEntryCount: this.trace.length, candidateCount: this.trace.filter((entry) => entry.kind === 'REQUEST').length, responseCount: this.trace.filter((entry) => entry.kind === 'RESPONSE').length, webSocketCount: this.trace.filter((entry) => entry.kind === 'WEBSOCKET').length, message: this.capturing ? '正在采集 Gate 页面所有脱敏网络元数据；请手动完成一次最小订单' : '尚未捕获 Gate 事件合约订单结构' }
+      : { captured: false, capturing: this.capturing, executionReady: this.executionReady?.() ?? false, traceEntryCount: this.trace.length, candidateCount: this.trace.filter((entry) => entry.kind === 'REQUEST').length, responseCount: this.trace.filter((entry) => entry.kind === 'RESPONSE').length, webSocketCount: this.trace.filter((entry) => entry.kind === 'WEBSOCKET').length, message: this.capturing ? '正在采集 Gate 页面所有脱敏网络元数据；请手动完成一次最小订单' : this.executionReady?.() ? 'Gate 指纹页面已接管；实盘订单将通过后台控件点击，不需要 API Key 或保存请求体' : '尚未接管可执行的 Gate 指纹浏览器页面' }
   }
   getResult(orderId: string): GateCapturedOrderResult | undefined {
     const result = this.results.get(orderId)
