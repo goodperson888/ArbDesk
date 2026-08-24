@@ -106,7 +106,7 @@ function outcomeQuote(source: JsonRecord, fallbackDirection: string | undefined,
   const bestAsk = levels[0]?.price ?? decimal(firstValue(source, ['bestAsk', 'best_ask', 'askPrice', 'ask_price', 'sellPrice', 'sell_price', 'price']))
   const askSize = levels[0]?.size ?? stringValue(firstValue(source, ['askSize', 'ask_size', 'availableQuantity', 'available_quantity', 'quantity', 'qty', 'size']))
   if (!bestAsk || !askSize || Number(askSize) <= 0) return undefined
-  const outcomeId = stringValue(firstValue(source, ['outcomeId', 'outcome_id', 'contractId', 'contract_id', 'symbolId', 'symbol_id', 'tokenId', 'token_id', 'assetId', 'asset_id', 'id'])) ?? parsedDirection
+  const outcomeId = stringValue(firstValue(source, ['outcomeId', 'outcome_id', 'contractId', 'contract_id', 'symbolId', 'symbol_id', 'tokenId', 'token_id', 'assetId', 'asset_id', 'aid', 'id'])) ?? parsedDirection
   return { direction: parsedDirection, outcomeId, bestAsk, askSize, levels, receivedAt }
 }
 
@@ -143,18 +143,24 @@ interface GateParseContext {
   sourceUrl?: string
 }
 
-function urlContext(context: GateParseContext): { duration?: 5 | 15; marketId?: string; isBtc?: boolean } {
+function urlContext(context: GateParseContext): { duration?: 5 | 15; marketId?: string; isBtc?: boolean; outcomeDirection?: Direction } {
   const raw = `${context.pageUrl ?? ''}\n${context.sourceUrl ?? ''}`
   const durationMatch = raw.match(/btc(?:[-_]?up[-_]?down)?[-_](5|15)m/i)
   const duration = durationMatch ? Number(durationMatch[1]) as 5 | 15 : undefined
   const isBtc = /btc/i.test(raw)
-  try {
-    const page = new URL(context.pageUrl ?? context.sourceUrl ?? '')
-    const marketId = page.searchParams.get('eventId') ?? page.searchParams.get('event_id') ?? undefined
-    return { duration, marketId, isBtc }
-  } catch {
-    return { duration, isBtc }
+  const parsedUrl = (value?: string): URL | undefined => {
+    try { return value ? new URL(value) : undefined } catch { return undefined }
   }
+  const source = parsedUrl(context.sourceUrl)
+  const page = parsedUrl(context.pageUrl)
+  const marketId = source?.searchParams.get('event_id') ?? source?.searchParams.get('eventId') ??
+    page?.searchParams.get('eventId') ?? page?.searchParams.get('event_id') ?? undefined
+  // Only the REST request URL's outcome parameter identifies the returned
+  // book. The page's selected outcome must not be applied to both compact
+  // WebSocket asset streams.
+  const rawOutcome = source?.searchParams.get('outcome') ?? undefined
+  const outcomeDirection = rawOutcome ? direction({}, rawOutcome) : undefined
+  return { duration, marketId, isBtc, outcomeDirection }
 }
 
 export function parseGateMarketObject(source: JsonRecord, receivedAt: number, context: GateParseContext = {}): GateMarketContext | undefined {
@@ -196,7 +202,11 @@ export function parseGateMarketObject(source: JsonRecord, receivedAt: number, co
     const quote = outcomeQuote(candidate.value, candidate.fallback, receivedAt)
     if (quote) outcomes[quote.direction] = quote
   }
-  const direct = outcomeQuote(source, undefined, receivedAt)
+  // Gate's /event-contract/book response carries the direction only in the
+  // request query while its body carries the actual asset_id and asks. Apply
+  // the URL direction only to an object that contains a book, never to nested
+  // price/size rows walked later.
+  const direct = outcomeQuote(source, askLevels(source).length ? pageContext.outcomeDirection : undefined, receivedAt)
   if (direct) outcomes[direct.direction] = direct
   return { marketId: id, asset: parsedAsset, durationMinutes: parsedDuration, ...range, outcomes }
 }
@@ -340,7 +350,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
       }
       const explicitTokenId = stringValue(firstValue(item, [
         'tokenId', 'token_id', 'clobTokenId', 'clob_token_id', 'assetId', 'asset_id',
-        'symbolId', 'symbol_id', 'outcomeId', 'outcome_id', 'contractTokenId', 'contract_token_id'
+        'symbolId', 'symbol_id', 'outcomeId', 'outcome_id', 'contractTokenId', 'contract_token_id', 'aid'
       ]))
       // Gate's event socket has used market_id for the individual outcome
       // token in some page releases. Only accept it when it matches a token

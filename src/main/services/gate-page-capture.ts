@@ -4,10 +4,13 @@ import type { CDPSession, Page } from 'playwright-core'
 import type { GatePageCaptureStatus } from '../../shared/types'
 import type { FingerprintBrowserRuntime } from './fingerprint-browser-runtime'
 
-// Gate's event-contract index currently opens the most recently featured
-// asset (often ETH), which leaves BTC rows stale. Start from the BTC route;
-// the page itself rolls the event id and can expose the current 5m/15m data.
-const GATE_PAGE_URL = 'https://www.gate.com/zh/trade-events/btc-updown-5m'
+// Gate only subscribes the order book for the duration shown by a page. Keep
+// one passive page per supported duration inside the same logged-in profile.
+const GATE_PAGE_URLS = {
+  5: 'https://www.gate.com/zh/trade-events/btc-updown-5m',
+  15: 'https://www.gate.com/zh/trade-events/btc-updown-15m'
+} as const
+const GATE_PAGE_URL = GATE_PAGE_URLS[5]
 const PAGE_START_TIMEOUT_MS = 25_000
 const PAGE_ROLL_INTERVAL_MS = 5 * 60_000
 
@@ -115,12 +118,23 @@ export function isGateHost(rawUrl: string): boolean {
 }
 
 export function isGateBtcEventUrl(rawUrl: string): boolean {
+  return gatePageDuration(rawUrl) !== undefined
+}
+
+export function gatePageDuration(rawUrl: string): 5 | 15 | undefined {
   try {
     const url = new URL(rawUrl)
-    return isGateHost(rawUrl) && /^\/zh\/trade-events\/btc-updown-(?:5|15)m(?:$|\/)/i.test(url.pathname)
+    if (!isGateHost(rawUrl)) return undefined
+    const match = url.pathname.match(/^\/zh\/trade-events\/btc-updown-(5|15)m(?:$|\/)/i)
+    return match ? Number(match[1]) as 5 | 15 : undefined
   } catch {
-    return false
+    return undefined
   }
+}
+
+export function selectGatePageDuration(available: readonly (5 | 15)[], requested?: 5 | 15): 5 | 15 | undefined {
+  if (requested !== undefined) return available.includes(requested) ? requested : undefined
+  return available.includes(5) ? 5 : available[0]
 }
 
 export function isGateEventResponse(rawUrl: string): boolean {
@@ -136,8 +150,10 @@ export function isGateEventResponse(rawUrl: string): boolean {
 export class GatePageCapture implements GatePageCaptureSource {
   private window?: BrowserWindow
   private fingerprintPage?: Page
-  private fingerprintNetworkSession?: CDPSession
+  private fingerprintPages = new Map<5 | 15, Page>()
+  private fingerprintNetworkSessions = new Map<5 | 15, CDPSession>()
   private startPromise?: Promise<void>
+  private captureGeneration = 0
   private stopping = false
   private destroying = false
   private status: GatePageCaptureStatus = { state: 'IDLE', message: 'Gate 事件合约网页被动行情尚未启动' }
@@ -164,7 +180,7 @@ export class GatePageCapture implements GatePageCaptureSource {
   }
 
   getStatus(): GatePageCaptureStatus { return { ...this.status } }
-  canExecuteOrders(): boolean { return Boolean(this.fingerprintPage && !this.fingerprintPage.isClosed()) }
+  canExecuteOrders(): boolean { return [...this.fingerprintPages.values()].some((page) => !page.isClosed()) || Boolean(this.fingerprintPage && !this.fingerprintPage.isClosed()) }
 
   canExecutePageOrders(): boolean { return this.canExecuteOrders() }
 
@@ -175,7 +191,14 @@ export class GatePageCapture implements GatePageCaptureSource {
    * request. The caller must reconcile an uncertain response before retrying.
    */
   async executePageOrder(intent: GatePageOrderIntent): Promise<GateCapturedHttpResponse> {
-    const page = this.fingerprintPage
+    const availableDurations = [...this.fingerprintPages.entries()]
+      .filter(([, candidate]) => !candidate.isClosed())
+      .map(([duration]) => duration)
+    const selectedDuration = selectGatePageDuration(availableDurations, intent.durationMinutes)
+    const page = intent.durationMinutes !== undefined
+      ? selectedDuration ? this.fingerprintPages.get(selectedDuration) : undefined
+      : this.fingerprintPage
+    if (intent.durationMinutes !== undefined && !page) throw new Error(`Gate ${intent.durationMinutes}m 页面不可用，未操作订单`)
     if (!page || page.isClosed()) throw new Error('Gate 指纹浏览器标签页不可用，未操作订单')
     const quantity = new Decimal(intent.quantity)
     const price = new Decimal(intent.limitPrice)
@@ -224,7 +247,15 @@ export class GatePageCapture implements GatePageCaptureSource {
   async executeCapturedOrder(request: GatePreparedOrderRequest): Promise<GateCapturedHttpResponse> {
     const method = request.method.toUpperCase()
     if (!isGateHost(request.endpoint) || !['POST', 'PUT', 'PATCH'].includes(method)) throw new Error('Gate 页面订单请求不受安全范围允许')
-    const page = this.fingerprintPage
+    const duration = gatePageDuration(request.pageUrl ?? '')
+    const availableDurations = [...this.fingerprintPages.entries()]
+      .filter(([, candidate]) => !candidate.isClosed())
+      .map(([availableDuration]) => availableDuration)
+    const selectedDuration = selectGatePageDuration(availableDurations, duration)
+    const page = duration !== undefined
+      ? selectedDuration ? this.fingerprintPages.get(selectedDuration) : undefined
+      : this.fingerprintPage
+    if (duration !== undefined && !page) throw new Error(`Gate ${duration}m 页面不可用，未发送订单`)
     if (!page || page.isClosed()) throw new Error('Gate 指纹浏览器标签页不可用，未发送订单')
     return await page.evaluate(async (input: { endpoint: string; method: string; body: string }) => {
       const response = await fetch(input.endpoint, {
@@ -274,13 +305,18 @@ export class GatePageCapture implements GatePageCaptureSource {
   }
 
   async start(show = false): Promise<void> {
-    if (this.fingerprintPage && !this.fingerprintPage.isClosed()) {
+    const liveFingerprintDurations = ([5, 15] as const).filter((duration) => {
+      const page = this.fingerprintPages.get(duration)
+      return Boolean(page && !page.isClosed() && this.fingerprintNetworkSessions.has(duration))
+    })
+    if (this.fingerprintPage && !this.fingerprintPage.isClosed() && liveFingerprintDurations.length === 2) {
       if (show) await this.fingerprintPage.bringToFront()
       return
     }
     if (this.fingerprintRuntime?.isConfigured()) {
       if (this.startPromise) { await this.startPromise; if (show) await this.fingerprintPage?.bringToFront(); return }
-      this.startPromise = this.createFingerprintPage(show)
+      const generation = ++this.captureGeneration
+      this.startPromise = this.createFingerprintPage(show, generation)
       try { await this.startPromise } finally { this.startPromise = undefined }
       return
     }
@@ -303,14 +339,17 @@ export class GatePageCapture implements GatePageCaptureSource {
   }
 
   stop(): void {
-    if (this.fingerprintPage && !this.fingerprintPage.isClosed()) {
+    const fingerprintStartup = Boolean(this.fingerprintRuntime?.isConfigured() && this.startPromise)
+    if (this.fingerprintPage || this.fingerprintPages.size > 0 || fingerprintStartup) {
+      this.captureGeneration += 1
       this.destroying = true
-      void this.fingerprintNetworkSession?.detach().catch(() => undefined)
-      this.fingerprintNetworkSession = undefined
+      for (const session of this.fingerprintNetworkSessions.values()) void session.detach().catch(() => undefined)
+      this.fingerprintNetworkSessions.clear()
+      this.fingerprintPages.clear()
       // This page belongs to the user's fingerprint browser. Detach CDP but
-      // never close the logged-in tab when only monitoring is stopped.
+      // never close the logged-in tabs when only monitoring is stopped.
       this.fingerprintPage = undefined
-      this.setStatus('IDLE', 'Gate 指纹浏览器页面监听已停止')
+      this.setStatus('IDLE', 'Gate 指纹浏览器 5m/15m 页面监听已停止')
       return
     }
     const window = this.window
@@ -332,11 +371,11 @@ export class GatePageCapture implements GatePageCaptureSource {
     this.window.focus()
   }
 
-  private async createFingerprintPage(show: boolean): Promise<void> {
-    this.setStatus('STARTING', '正在接管已登录的 Gate 指纹浏览器标签页；只监听页面自身请求')
-    let page: Page
+  private async createFingerprintPage(show: boolean, generation: number): Promise<void> {
+    this.setStatus('STARTING', '正在接管已登录的 Gate 指纹浏览器 5m/15m 标签页；只监听页面自身请求')
+    let seedPage: Page
     try {
-      page = await this.fingerprintRuntime!.attach('GATE', {
+      seedPage = await this.fingerprintRuntime!.attach('GATE', {
         hosts: ['gate.com', 'gate.io', 'gateio.ws', 'gateio.live'],
         createIfMissing: true,
         startupUrl: GATE_PAGE_URL
@@ -345,47 +384,85 @@ export class GatePageCapture implements GatePageCaptureSource {
       this.setStatus('DISCONNECTED', `Gate 指纹浏览器接管失败：${error instanceof Error ? error.message : String(error)}`)
       return
     }
-    this.fingerprintPage = page
-    page.on('close', () => {
-      if (this.fingerprintPage !== page) return
-      this.fingerprintPage = undefined
-      this.fingerprintNetworkSession = undefined
-      this.setStatus('DISCONNECTED', 'Gate 指纹浏览器标签页已关闭')
-    })
-    if (show) await page.bringToFront()
+    if (generation !== this.captureGeneration) return
     try {
-      const session = await page.context().newCDPSession(page)
-      this.fingerprintNetworkSession = session
+      const context = seedPage.context()
+      const pagesByDuration = new Map<5 | 15, Page>()
+      for (const candidate of context.pages()) {
+        const duration = gatePageDuration(candidate.url())
+        if (duration && !candidate.isClosed() && !pagesByDuration.has(duration)) pagesByDuration.set(duration, candidate)
+      }
+      if (!pagesByDuration.has(5) && !gatePageDuration(seedPage.url())) pagesByDuration.set(5, seedPage)
+      for (const duration of [5, 15] as const) {
+        if (generation !== this.captureGeneration) return
+        const page = pagesByDuration.get(duration) ?? await context.newPage()
+        if (!await this.bindFingerprintPage(page, duration, generation)) return
+      }
+      if (generation !== this.captureGeneration) return
+      this.fingerprintPage = this.fingerprintPages.get(5) ?? this.fingerprintPages.get(15)
+      if (show) await this.fingerprintPage?.bringToFront()
+      this.setStatus('CONNECTED', this.captureStatusMessage('5m/15m 已接管指纹浏览器'))
+    } catch (error) {
+      this.setStatus('DISCONNECTED', `Gate 指纹浏览器网络监听失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private async bindFingerprintPage(page: Page, duration: 5 | 15, generation: number): Promise<boolean> {
+    const current = this.fingerprintPages.get(duration)
+    if (current === page && !page.isClosed() && this.fingerprintNetworkSessions.has(duration)) return true
+    if (generation !== this.captureGeneration) return false
+    const session = await page.context().newCDPSession(page)
+    if (generation !== this.captureGeneration) {
+      await session.detach().catch(() => undefined)
+      return false
+    }
+    const socketUrls = new Map<string, string>()
+    this.fingerprintPages.set(duration, page)
+    this.fingerprintNetworkSessions.set(duration, session)
+    page.on('close', () => {
+      if (this.fingerprintPages.get(duration) !== page) return
+      this.fingerprintPages.delete(duration)
+      this.fingerprintNetworkSessions.delete(duration)
+      if (this.fingerprintPage === page) this.fingerprintPage = this.fingerprintPages.get(duration === 5 ? 15 : 5)
+      const remaining = [...this.fingerprintPages.values()].some((candidate) => !candidate.isClosed())
+      this.setStatus(remaining ? 'CONNECTED' : 'DISCONNECTED', remaining
+        ? `Gate ${duration}m 页面已关闭；另一周期仍在监听`
+        : `Gate ${duration}m 指纹浏览器标签页已关闭`)
+    })
+    try {
       await session.send('Network.enable')
       session.on('Network.requestWillBeSent', (rawParams) => this.handleRequest(rawParams as CdpRequestWillBeSent, page.url()))
       session.on('Network.responseReceived', (rawParams) => { void this.handlePlaywrightResponse(session, page, rawParams as CdpResponseReceived) })
       session.on('Network.webSocketCreated', (rawParams) => {
         const event = rawParams as CdpWebSocketCreated
-        if (event.requestId && event.url && isGateHost(event.url)) this.socketUrls.set(event.requestId, event.url)
+        if (event.requestId && event.url && isGateHost(event.url)) socketUrls.set(event.requestId, event.url)
       })
       session.on('Network.webSocketClosed', (rawParams) => {
         const requestId = (rawParams as { requestId?: string }).requestId
-        if (requestId) this.socketUrls.delete(requestId)
+        if (requestId) socketUrls.delete(requestId)
       })
-      session.on('Network.webSocketFrameReceived', (rawParams) => this.handleFrame(rawParams as CdpWebSocketFrame, page.url(), 'RECEIVED'))
-      session.on('Network.webSocketFrameSent', (rawParams) => this.handleFrame(rawParams as CdpWebSocketFrame, page.url(), 'SENT'))
-      // Install CDP listeners before changing the page. Otherwise the initial
-      // BTC catalogue response and socket handshake can be missed, leaving the
-      // board with a price captured before attach and an apparently stale quote.
-      const alreadyBtcPage = isGateBtcEventUrl(page.url())
-      if (!alreadyBtcPage) {
-        this.setStatus('STARTING', 'Gate 已接管；当前标签页不是 BTC 事件页，正在后台切换到 BTC 5m')
-        await page.goto(GATE_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_START_TIMEOUT_MS })
-      } else if (this.responseCount === 0 && this.webSocketFrameCount === 0) {
-        // A running tab may have established its socket before CDP attached;
-        // reload once on initial adoption so the passive listener observes the
-        // catalogue and subscription handshake. This is not a polling loop.
-        this.setStatus('STARTING', 'Gate BTC 页面已接管；正在后台刷新一次以捕获当前盘口流')
+      session.on('Network.webSocketFrameReceived', (rawParams) => {
+        const event = rawParams as CdpWebSocketFrame
+        this.handleFrame(event, page.url(), 'RECEIVED', event.requestId ? socketUrls.get(event.requestId) : undefined)
+      })
+      session.on('Network.webSocketFrameSent', (rawParams) => {
+        const event = rawParams as CdpWebSocketFrame
+        this.handleFrame(event, page.url(), 'SENT', event.requestId ? socketUrls.get(event.requestId) : undefined)
+      })
+      this.setStatus('STARTING', `Gate ${duration}m 已接管；正在后台刷新一次以捕获当前盘口流`)
+      if (generation !== this.captureGeneration) return false
+      if (gatePageDuration(page.url()) === duration) {
         await page.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_START_TIMEOUT_MS })
+      } else {
+        await page.goto(GATE_PAGE_URLS[duration], { waitUntil: 'domcontentloaded', timeout: PAGE_START_TIMEOUT_MS })
       }
-      this.setStatus('CONNECTED', this.captureStatusMessage('已接管指纹浏览器'))
+      if (generation !== this.captureGeneration) return false
+      return true
     } catch (error) {
-      this.setStatus('DISCONNECTED', `Gate 指纹浏览器网络监听失败：${error instanceof Error ? error.message : String(error)}`)
+      if (this.fingerprintPages.get(duration) === page) this.fingerprintPages.delete(duration)
+      if (this.fingerprintNetworkSessions.get(duration) === session) this.fingerprintNetworkSessions.delete(duration)
+      await session.detach().catch(() => undefined)
+      throw error
     }
   }
 
@@ -550,9 +627,14 @@ export class GatePageCapture implements GatePageCaptureSource {
     if (['POST', 'PUT', 'PATCH'].includes(method)) for (const listener of this.requestListeners) listener(captured)
   }
 
-  private handleFrame(event: CdpWebSocketFrame, pageUrl = this.window?.webContents.getURL(), direction: 'SENT' | 'RECEIVED' = 'RECEIVED'): void {
+  private handleFrame(
+    event: CdpWebSocketFrame,
+    pageUrl = this.window?.webContents.getURL(),
+    direction: 'SENT' | 'RECEIVED' = 'RECEIVED',
+    knownSocketUrl?: string
+  ): void {
     if (!event.requestId) return
-    const url = this.socketUrls.get(event.requestId)
+    const url = knownSocketUrl ?? this.socketUrls.get(event.requestId)
     if (!url) return
     const frame = direction === 'SENT' ? event.request : event.response
     if (frame?.opcode !== 1 || typeof frame.payloadData !== 'string') return

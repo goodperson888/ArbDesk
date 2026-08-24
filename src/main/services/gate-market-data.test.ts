@@ -125,6 +125,43 @@ describe('GateMarketData', () => {
     expect(source.getStatus().message).toContain('未额外请求接口')
   })
 
+  it('binds the live Gate book query and compact orderbook frames to each outcome', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-24T13:17:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-5m?eventId=895711&outcome=Up'
+
+    source.ingest(JSON.stringify({ code: 0, data: {
+      asks: [{ price: '0.68', size: '98.283' }], bids: [{ price: '0.52', size: '89.85' }],
+      asset_id: 'up-asset', market: 'ge_895711_3807530'
+    } }), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/book?event_id=895711&market_id=3807530&outcome=Up', pageUrl)
+    source.ingest(JSON.stringify({ code: 0, data: {
+      asks: [{ price: '0.48', size: '89.85' }], bids: [{ price: '0.32', size: '98.283' }],
+      asset_id: 'down-asset', market: 'ge_895711_3807530'
+    } }), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/book?event_id=895711&market_id=3807530&outcome=Down', pageUrl)
+
+    expect(source.getLatestWindows()[0]).toMatchObject({
+      marketId: '895711',
+      outcomes: {
+        UP: { outcomeId: 'up-asset', bestAsk: '0.68', askSize: '98.283' },
+        DOWN: { outcomeId: 'down-asset', bestAsk: '0.48', askSize: '89.85' }
+      }
+    })
+
+    vi.setSystemTime(new Date('2026-08-24T13:17:02.000Z'))
+    source.ingest(JSON.stringify({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      mk: '0xmarket', aid: 'up-asset', a: [['0.67', '44.17']], b: [['0.66', '162']]
+    } }), Date.now(), 'WebSocket', 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web', pageUrl)
+    source.ingest(JSON.stringify({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      mk: '0xmarket', aid: 'down-asset', a: [['0.34', '162']], b: [['0.33', '44.17']]
+    } }), Date.now(), 'WebSocket', 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web', pageUrl)
+
+    expect(source.getLatestWindows()[0].outcomes.UP).toMatchObject({ bestAsk: '0.67', askSize: '44.17', receivedAt: Date.now() })
+    expect(source.getLatestWindows()[0].outcomes.DOWN).toMatchObject({ bestAsk: '0.34', askSize: '162', receivedAt: Date.now() })
+  })
+
   it('maps Gate websocket market_id tokens and removes an expired round on refresh', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-23T12:32:00.000Z'))
