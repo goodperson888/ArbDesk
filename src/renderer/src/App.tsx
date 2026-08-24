@@ -624,6 +624,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [selectionMode, setSelectionMode] = useState<OpportunitySelectionMode>('FOLLOW_BEST')
   const [durationFilter, setDurationFilter] = useState<DurationFilter>('ALL')
   const [quantity, setQuantity] = useState('50')
+  const [multiVenueQuantity, setMultiVenueQuantity] = useState('1')
   const [now, setNow] = useState(Date.now())
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<string>()
@@ -773,6 +774,21 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     () => selectedComparison?.legs.find((leg) => leg.venueId === 'KALSHI'),
     [selectedComparison]
   )
+  const selectedOtherVenueLeg = useMemo(
+    () => selectedComparison?.legs.find((leg) => leg.venueId !== 'KALSHI'),
+    [selectedComparison]
+  )
+  const multiVenueMaxQuantity = selectedComparison && selectedKalshiLeg && selectedOtherVenueLeg
+    ? Math.floor(Math.min(
+      Number(selectedComparison.executableQuantity),
+      Number(selectedKalshiLeg.availableQuantity),
+      Number(selectedOtherVenueLeg.availableQuantity)
+    ) * 100) / 100
+    : 0
+  const multiVenueRequestedQuantity = Number(multiVenueQuantity)
+  const multiVenueRequestedCapital = selectedComparison && Number.isFinite(multiVenueRequestedQuantity)
+    ? Number(selectedComparison.allInCostPerShare) * multiVenueRequestedQuantity
+    : 0
   const opportunityById = useMemo(() => new Map(
     snapshot?.opportunities.map((opportunity) => [opportunity.id, opportunity]) ?? []
   ), [snapshot?.opportunities])
@@ -1315,22 +1331,32 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       setMessage('Gate↔Kalshi 双腿执行需要开启 Gate 实盘下单，并先完成订单结构捕获')
       return
     }
-    const quantity = Math.floor(Math.min(
+    const requestedQuantity = Number(multiVenueQuantity)
+    const maxQuantity = Math.floor(Math.min(
       Number(selectedComparison.executableQuantity),
       Number(selectedKalshiLeg.availableQuantity),
       Number(otherLeg.availableQuantity)
     ) * 100) / 100
-    if (!Number.isFinite(quantity) || quantity < 1) {
+    if (!Number.isFinite(requestedQuantity) || requestedQuantity < 1) {
+      setMessage('请输入至少 1 份的双腿执行数量，未发送订单')
+      return
+    }
+    if (!Number.isFinite(maxQuantity) || maxQuantity < 1) {
       setMessage('两边盘口不足 1 份，未发送双腿订单')
       return
     }
+    const orderQuantity = Math.floor(requestedQuantity * 100) / 100
+    if (orderQuantity > maxQuantity) {
+      setMessage(`输入 ${orderQuantity.toFixed(2)} 份超过当前两边可执行上限 ${maxQuantity.toFixed(2)} 份`)
+      return
+    }
     const confirmation = window.confirm(
-      `即将执行双腿真实订单（不是原子交易）：\n\n${otherLeg.venueLabel} ${otherLeg.direction} ${quantity.toFixed(2)}份 @ ${Number(otherLeg.price).toFixed(4)}\n→ 成交回读后再发送\nKalshi ${selectedKalshiLeg.direction} ${quantity.toFixed(2)}份 @ ${Number(selectedKalshiLeg.price).toFixed(4)}\n\n如果第一腿成交、第二腿失败，会进入恢复态，不会自动重复下单。确认继续？`
+      `即将执行双腿真实订单（不是原子交易）：\n\n${otherLeg.venueLabel} ${otherLeg.direction} ${orderQuantity.toFixed(2)}份 @ ${Number(otherLeg.price).toFixed(4)}\n→ 成交回读后再发送\nKalshi ${selectedKalshiLeg.direction} ${orderQuantity.toFixed(2)}份 @ ${Number(selectedKalshiLeg.price).toFixed(4)}\n\n如果第一腿成交、第二腿失败，会进入恢复态，不会自动重复下单。确认继续？`
     )
     if (!confirmation) return
     const request: MultiVenueExecutionRequest = {
       comparisonId: selectedComparison.id,
-      quantity: quantity.toFixed(2),
+      quantity: orderQuantity.toFixed(2),
       startTime: selectedComparison.startTime,
       endTime: selectedComparison.endTime,
       confirmed: true,
@@ -1936,6 +1962,21 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   <span>两腿成本<strong>{money(selectedComparison.allInCostPerShare, 4)}</strong></span>
                   <span>参考毛边际<strong className={Number(selectedComparison.netEdgePerShare) > 0 ? 'profit' : ''}>{Number(selectedComparison.netEdgePerShare) >= 0 ? '+' : ''}{money(selectedComparison.netEdgePerShare, 4)}</strong></span>
                   <span>参考收益率<strong>{Number(selectedComparison.conditionalReturnPct) >= 0 ? '+' : ''}{money(selectedComparison.conditionalReturnPct, 2)}%</strong></span>
+                </div>
+                <label className="field-label ticket-quantity-label" htmlFor="multi-venue-quantity">双腿计划份额</label>
+                <div className="quantity-control">
+                  <input id="multi-venue-quantity" value={multiVenueQuantity} inputMode="decimal" onChange={(event) => {
+                    setSelectionMode('LOCKED')
+                    setMultiVenueQuantity(event.target.value)
+                  }} />
+                  <button onClick={() => {
+                    setSelectionMode('LOCKED')
+                    if (multiVenueMaxQuantity > 0) setMultiVenueQuantity(multiVenueMaxQuantity.toFixed(2))
+                  }} disabled={busy || multiVenueMaxQuantity < 1}>最大</button>
+                </div>
+                <div className="capacity-summary">
+                  <span>当前可执行上限 <strong>{multiVenueMaxQuantity.toFixed(2)}</strong>份</span>
+                  <span>预计两腿本金 <strong>${Number.isFinite(multiVenueRequestedCapital) ? multiVenueRequestedCapital.toFixed(2) : '—'}</strong></span>
                 </div>
                 <div className="read-only-notice"><Info aria-hidden="true" /><span>{grossComparisonNotice(selectedComparison.status)}</span></div>
                 {selectedComparison.blockReasons.length > 0 && <ul className="read-only-reasons">{selectedComparison.blockReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}

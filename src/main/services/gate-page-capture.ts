@@ -341,10 +341,6 @@ export class GatePageCapture implements GatePageCaptureSource {
         createIfMissing: true,
         startupUrl: GATE_PAGE_URL
       })
-      if (!isGateBtcEventUrl(page.url())) {
-        this.setStatus('STARTING', 'Gate 已接管；当前标签页不是 BTC 事件页，正在后台切换到 BTC 5m')
-        await page.goto(GATE_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_START_TIMEOUT_MS })
-      }
     } catch (error) {
       this.setStatus('DISCONNECTED', `Gate 指纹浏览器接管失败：${error instanceof Error ? error.message : String(error)}`)
       return
@@ -373,6 +369,20 @@ export class GatePageCapture implements GatePageCaptureSource {
       })
       session.on('Network.webSocketFrameReceived', (rawParams) => this.handleFrame(rawParams as CdpWebSocketFrame, page.url(), 'RECEIVED'))
       session.on('Network.webSocketFrameSent', (rawParams) => this.handleFrame(rawParams as CdpWebSocketFrame, page.url(), 'SENT'))
+      // Install CDP listeners before changing the page. Otherwise the initial
+      // BTC catalogue response and socket handshake can be missed, leaving the
+      // board with a price captured before attach and an apparently stale quote.
+      const alreadyBtcPage = isGateBtcEventUrl(page.url())
+      if (!alreadyBtcPage) {
+        this.setStatus('STARTING', 'Gate 已接管；当前标签页不是 BTC 事件页，正在后台切换到 BTC 5m')
+        await page.goto(GATE_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_START_TIMEOUT_MS })
+      } else if (this.responseCount === 0 && this.webSocketFrameCount === 0) {
+        // A running tab may have established its socket before CDP attached;
+        // reload once on initial adoption so the passive listener observes the
+        // catalogue and subscription handshake. This is not a polling loop.
+        this.setStatus('STARTING', 'Gate BTC 页面已接管；正在后台刷新一次以捕获当前盘口流')
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_START_TIMEOUT_MS })
+      }
       this.setStatus('CONNECTED', this.captureStatusMessage('已接管指纹浏览器'))
     } catch (error) {
       this.setStatus('DISCONNECTED', `Gate 指纹浏览器网络监听失败：${error instanceof Error ? error.message : String(error)}`)
