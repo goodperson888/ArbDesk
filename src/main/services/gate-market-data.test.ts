@@ -245,6 +245,7 @@ describe('GateMarketData', () => {
 
     expect(source.getStatus().message).toContain('15m 原始WS 0.0秒')
     expect(source.getStatus().message).toContain('映射无')
+    expect(source.getStatus().message).toContain('盘口无')
     expect(source.getStatus().message).toContain('未映射1')
   })
 

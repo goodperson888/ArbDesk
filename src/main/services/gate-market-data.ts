@@ -19,6 +19,7 @@ interface GatePipelineStats {
   unmappedBookFrames: number
   lastRawBookAt?: number
   lastMappedBookAt?: number
+  lastQuoteUpdateAt?: number
 }
 
 type JsonRecord = Record<string, unknown>
@@ -446,6 +447,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
             direction: tokenContext.direction, outcomeId: tokenId!, bestAsk: levels[0].price, askSize: levels[0].size,
             levels, receivedAt
           }
+          if (frameDuration) this.notePipelineQuoteUpdate(frameDuration, receivedAt)
           changed = true
         } else if (context && context.outcomes[tokenContext.direction] && isExplicitEmptyBookFrame(item)) {
           // Gate sends incremental order-book frames with empty `a`/`b`
@@ -456,6 +458,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
             ...context.outcomes[tokenContext.direction]!,
             receivedAt
           }
+          if (frameDuration) this.notePipelineQuoteUpdate(frameDuration, receivedAt)
           changed = true
         } else if (context && hasZeroAskUpdate(item)) {
           // A zero-size ask is a deletion, not a heartbeat. Be conservative
@@ -535,8 +538,15 @@ export class GateMarketData implements ReadOnlyVenueSource {
       const stats = this.pipelineStats.get(duration)
       const rawAge = stats?.lastRawBookAt === undefined ? '无' : `${((Math.max(0, now - stats.lastRawBookAt)) / 1_000).toFixed(1)}秒`
       const mappedAge = stats?.lastMappedBookAt === undefined ? '无' : `${((Math.max(0, now - stats.lastMappedBookAt)) / 1_000).toFixed(1)}秒`
-      return `${duration}m 原始WS ${rawAge} / 映射${mappedAge} / 未映射${stats?.unmappedBookFrames ?? 0}`
+      const quoteAge = stats?.lastQuoteUpdateAt === undefined ? '无' : `${((Math.max(0, now - stats.lastQuoteUpdateAt)) / 1_000).toFixed(1)}秒`
+      return `${duration}m 原始WS ${rawAge} / 映射${mappedAge} / 盘口${quoteAge} / 未映射${stats?.unmappedBookFrames ?? 0}`
     }).join('；')
+  }
+
+  private notePipelineQuoteUpdate(duration: 5 | 15, receivedAt: number): void {
+    const stats = this.pipelineStats.get(duration) ?? { rawBookFrames: 0, mappedBookFrames: 0, unmappedBookFrames: 0 }
+    stats.lastQuoteUpdateAt = receivedAt
+    this.pipelineStats.set(duration, stats)
   }
 
   private captureAccountCounts(payload: unknown, sourceUrl: string, receivedAt: number): void {
