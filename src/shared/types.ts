@@ -523,12 +523,17 @@ export interface GatePageCaptureStatus {
 
 export interface GateOrderCaptureSummary {
   captured: boolean
+  capturing?: boolean
   executionReady?: boolean
   endpoint?: string
   method?: string
   requestFields?: string[]
   pageUrl?: string
   capturedAt?: number
+  traceEntryCount?: number
+  candidateCount?: number
+  responseCount?: number
+  webSocketCount?: number
   message: string
 }
 
@@ -675,8 +680,10 @@ export interface ArbAppApi {
   stopGatePage(): Promise<void>
   getGatePageCaptureStatus(): Promise<GatePageCaptureStatus>
   startGateOrderCapture(): Promise<GateOrderCaptureSummary>
+  stopGateOrderCapture(): Promise<GateOrderCaptureSummary>
   getGateOrderCaptureSummary(): Promise<GateOrderCaptureSummary>
   clearGateOrderCapture(): Promise<GateOrderCaptureSummary>
+  exportGateOrderCapture(): Promise<string>
   prepareGateWithoutSubmitting(): Promise<VenuePreparationReport>
   getKalshiCredentialSummary(): Promise<KalshiCredentialSummary>
   updateKalshiCredentials(request: UpdateKalshiCredentialsRequest): Promise<KalshiCredentialSummary>

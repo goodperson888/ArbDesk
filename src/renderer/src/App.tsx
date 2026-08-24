@@ -12,6 +12,7 @@ import {
   ChevronRight,
   CircleHelp,
   Copy,
+  Download,
   ExternalLink,
   History,
   Info,
@@ -1219,9 +1220,19 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     if (result) setGateOrderCapture(result)
   }
 
+  async function stopGateOrderCapture(): Promise<void> {
+    const result = await run(() => window.arbApp.stopGateOrderCapture(), 'Gate 链路采集已停止；脱敏元数据仍保留，可先导出分析')
+    if (result) setGateOrderCapture(result)
+  }
+
   async function clearGateOrderCapture(): Promise<void> {
     const result = await run(() => window.arbApp.clearGateOrderCapture(), 'Gate 订单捕获结构已清除，恢复只读模式')
     if (result) setGateOrderCapture(result)
+  }
+
+  async function exportGateOrderCapture(): Promise<void> {
+    const path = await run(() => window.arbApp.exportGateOrderCapture(), '已导出脱敏 Gate 订单链路，可把该文件发给我分析')
+    if (path) setMessage(`Gate 脱敏订单链路已导出：${path}`)
   }
 
   async function prepareGateWithoutSubmitting(): Promise<void> {
@@ -1349,6 +1360,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   async function toggleGateLive(): Promise<void> {
     if (!snapshot) return
     const enabling = !snapshot.settings.gateLiveEnabled
+    if (enabling && gateOrderCapture?.capturing) {
+      setMessage('请先停止 Gate 链路采集并导出脱敏元数据，再考虑开启实盘开关')
+      return
+    }
     if (enabling) {
       if (!gateOrderCapture?.captured || !gateOrderCapture.executionReady) {
         setMessage('请先在已接管的 Gate 指纹浏览器页面完成订单捕获；独立只读页面不能执行订单')
@@ -2253,10 +2268,12 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <button className="wide-secondary" onClick={() => void stopGatePage()} disabled={busy}><Square aria-hidden="true" />停止 Gate 监听并释放页面</button>
                 <div className="credential-notice"><Network aria-hidden="true" /><span>配置 Hubstudio 环境后会接管已登录的 Gate 标签页；未配置时才使用独立只读页面。默认不下单，必须先手动捕获真实订单结构。</span></div>
                 {gatePageStatus && <div className="browser-status-detail"><span>GATE页</span><p>{gatePageStatus.message}</p></div>}
-                {gateOrderCapture && <div className="browser-status-detail"><span>订单捕获</span><p>{gateOrderCapture.message}{gateOrderCapture.endpoint ? ` · ${gateOrderCapture.method} ${gateOrderCapture.endpoint}` : ''}{gateOrderCapture.requestFields?.length ? ` · 字段 ${gateOrderCapture.requestFields.join(', ')}` : ''}</p></div>}
+                {gateOrderCapture && <div className="browser-status-detail"><span>订单捕获</span><p>{gateOrderCapture.message}{gateOrderCapture.endpoint ? ` · ${gateOrderCapture.method} ${gateOrderCapture.endpoint}` : ''}{gateOrderCapture.requestFields?.length ? ` · 字段 ${gateOrderCapture.requestFields.join(', ')}` : ''}{gateOrderCapture.traceEntryCount !== undefined ? ` · 链路 ${gateOrderCapture.traceEntryCount}（请求 ${gateOrderCapture.candidateCount ?? 0} / 响应 ${gateOrderCapture.responseCount ?? 0} / WS ${gateOrderCapture.webSocketCount ?? 0}）` : ''}</p></div>}
                 {gateCredentials?.message && <div className="browser-status-detail"><span>GATE</span><p>{gateCredentials.message}{gateCredentials.apiKeyMasked ? ` · ${gateCredentials.apiKeyMasked}` : ''}</p></div>}
                 <button className="wide-secondary" onClick={() => void startGateOrderCapture()} disabled={busy}><ShieldAlert aria-hidden="true" />开启 Gate 订单捕获模式（只等你手动下单）</button>
-                <button className={`wide-secondary ${snapshot.settings.gateLiveEnabled ? 'live-toggle enabled' : ''}`} onClick={() => void toggleGateLive()} disabled={busy || !gateOrderCapture?.captured || !gateOrderCapture.executionReady}>
+                {gateOrderCapture?.capturing && <button className="wide-secondary" onClick={() => void stopGateOrderCapture()} disabled={busy}><Square aria-hidden="true" />停止链路采集（保留脱敏元数据）</button>}
+                <button className="wide-secondary" onClick={() => void exportGateOrderCapture()} disabled={busy || !gateOrderCapture?.traceEntryCount}><Download aria-hidden="true" />导出脱敏订单链路供分析</button>
+                <button className={`wide-secondary ${snapshot.settings.gateLiveEnabled ? 'live-toggle enabled' : ''}`} onClick={() => void toggleGateLive()} disabled={busy || (!snapshot.settings.gateLiveEnabled && (gateOrderCapture?.capturing === true || !gateOrderCapture?.captured || !gateOrderCapture.executionReady))}>
                   {snapshot.settings.gateLiveEnabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}Gate 事件合约实盘：{snapshot.settings.gateLiveEnabled ? '已开启（点击关闭）' : '默认关闭'}
                 </button>
                 {gateOrderCapture?.captured && <button className="wide-secondary" onClick={() => void clearGateOrderCapture()} disabled={busy}><Trash2 aria-hidden="true" />清除捕获结构并恢复只读</button>}

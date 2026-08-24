@@ -40,7 +40,7 @@
 - `src/main/services/limitless-market-data.ts`：Limitless BTC 5m/15m 市场发现与盘口，只读。
 - `src/main/services/predict-fun-market-data.ts`：Predict.fun BTC 5m/15m 市场发现与盘口，只读。
 - `src/main/services/gate-market-data.ts`：Gate 事件合约网页响应/推送的容错解析和 BTC 5m/15m 双向盘口标准化。
-- `src/main/services/gate-page-capture.ts`、`gate-order-capture.ts`、`gate-order-transport.ts`：复用通用指纹浏览器页面，捕获用户手动订单结构并在显式门禁下执行一次页面会话订单。
+- `src/main/services/gate-page-capture.ts`、`gate-order-capture.ts`、`gate-order-transport.ts`：复用通用指纹浏览器页面，持续捕获用户手动订单期间的脱敏请求/响应/WebSocket 链路，导出后确认真实订单结构，再在显式门禁下执行页面会话订单。
 - `src/main/services/kalshi-market-data.ts`：读取 KXBTC15M 开放市场、YES/NO 互补盘口并接入默认只读扫描；当前不纳入 5 分钟周期。
 - `src/main/services/kalshi-preparation.ts`：Kalshi API 身份、余额、持仓、委托只读联调和本地 RSA-PSS 草稿签名；该准备流程仍保持只读。
 - `src/main/services/kalshi-trading.ts`：供双腿协调器调用的 Kalshi V2 FOK 第二腿；不再暴露独立单腿 IPC 入口。

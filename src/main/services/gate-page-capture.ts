@@ -14,6 +14,9 @@ export interface GateCapturedResponse {
   url: string
   body: string
   receivedAt: number
+  requestId?: string
+  status?: number
+  resourceType?: string
   /** The visible/hidden page URL that initiated the request. */
   pageUrl?: string
 }
@@ -22,6 +25,8 @@ export interface GateCapturedWebSocketFrame {
   url: string
   payload: string
   receivedAt: number
+  requestId?: string
+  direction?: 'SENT' | 'RECEIVED'
   /** The visible/hidden page URL that owns the socket. */
   pageUrl?: string
 }
@@ -32,6 +37,8 @@ export interface GateCapturedRequest {
   headers?: Record<string, string>
   body?: string
   receivedAt: number
+  requestId?: string
+  resourceType?: string
   pageUrl?: string
 }
 
@@ -51,7 +58,10 @@ export interface GatePageCaptureSource {
   getStatus(): GatePageCaptureStatus
   onRequest(listener: (event: GateCapturedRequest) => void): () => void
   onResponse(listener: (event: GateCapturedResponse) => void): () => void
+  onNetworkRequest?(listener: (event: GateCapturedRequest) => void): () => void
+  onNetworkResponse?(listener: (event: GateCapturedResponse) => void): () => void
   onWebSocketFrame(listener: (event: GateCapturedWebSocketFrame) => void): () => void
+  onRawWebSocketFrame?(listener: (event: GateCapturedWebSocketFrame) => void): () => void
   onStatus(listener: (status: GatePageCaptureStatus) => void): () => void
   start(show?: boolean): Promise<void>
   stop(): void
@@ -64,6 +74,8 @@ interface CdpResponseReceived {
 }
 
 interface CdpRequestWillBeSent {
+  requestId?: string
+  type?: string
   request?: { url?: string; method?: string; headers?: Record<string, string>; postData?: string }
 }
 
@@ -75,6 +87,7 @@ interface CdpWebSocketCreated {
 interface CdpWebSocketFrame {
   requestId?: string
   response?: { opcode?: number; payloadData?: string }
+  request?: { opcode?: number; payloadData?: string }
 }
 
 export function isGateHost(rawUrl: string): boolean {
@@ -116,7 +129,10 @@ export class GatePageCapture implements GatePageCaptureSource {
   private rollPromise?: Promise<void>
   private responseListeners = new Set<(event: GateCapturedResponse) => void>()
   private requestListeners = new Set<(event: GateCapturedRequest) => void>()
+  private networkResponseListeners = new Set<(event: GateCapturedResponse) => void>()
+  private networkRequestListeners = new Set<(event: GateCapturedRequest) => void>()
   private frameListeners = new Set<(event: GateCapturedWebSocketFrame) => void>()
+  private rawFrameListeners = new Set<(event: GateCapturedWebSocketFrame) => void>()
   private statusListeners = new Set<(status: GatePageCaptureStatus) => void>()
 
   constructor(private readonly fingerprintRuntime?: FingerprintBrowserRuntime) {
@@ -156,9 +172,24 @@ export class GatePageCapture implements GatePageCaptureSource {
     return () => this.requestListeners.delete(listener)
   }
 
+  onNetworkRequest(listener: (event: GateCapturedRequest) => void): () => void {
+    this.networkRequestListeners.add(listener)
+    return () => this.networkRequestListeners.delete(listener)
+  }
+
+  onNetworkResponse(listener: (event: GateCapturedResponse) => void): () => void {
+    this.networkResponseListeners.add(listener)
+    return () => this.networkResponseListeners.delete(listener)
+  }
+
   onWebSocketFrame(listener: (event: GateCapturedWebSocketFrame) => void): () => void {
     this.frameListeners.add(listener)
     return () => this.frameListeners.delete(listener)
+  }
+
+  onRawWebSocketFrame(listener: (event: GateCapturedWebSocketFrame) => void): () => void {
+    this.rawFrameListeners.add(listener)
+    return () => this.rawFrameListeners.delete(listener)
   }
 
   onStatus(listener: (status: GatePageCaptureStatus) => void): () => void {
@@ -259,7 +290,8 @@ export class GatePageCapture implements GatePageCaptureSource {
         const requestId = (rawParams as { requestId?: string }).requestId
         if (requestId) this.socketUrls.delete(requestId)
       })
-      session.on('Network.webSocketFrameReceived', (rawParams) => this.handleFrame(rawParams as CdpWebSocketFrame, page.url()))
+      session.on('Network.webSocketFrameReceived', (rawParams) => this.handleFrame(rawParams as CdpWebSocketFrame, page.url(), 'RECEIVED'))
+      session.on('Network.webSocketFrameSent', (rawParams) => this.handleFrame(rawParams as CdpWebSocketFrame, page.url(), 'SENT'))
       this.setStatus('CONNECTED', this.captureStatusMessage('已接管指纹浏览器'))
     } catch (error) {
       this.setStatus('DISCONNECTED', `Gate 指纹浏览器网络监听失败：${error instanceof Error ? error.message : String(error)}`)
@@ -380,6 +412,7 @@ export class GatePageCapture implements GatePageCaptureSource {
         return
       }
       if (method === 'Network.webSocketFrameReceived') this.handleFrame(rawParams as CdpWebSocketFrame)
+      if (method === 'Network.webSocketFrameSent') this.handleFrame(rawParams as CdpWebSocketFrame, undefined, 'SENT')
     })
     debug.on('detach', (_event, reason) => {
       if (!this.stopping) this.setStatus('DISCONNECTED', `Gate 网络监听已断开：${reason}`)
@@ -388,7 +421,7 @@ export class GatePageCapture implements GatePageCaptureSource {
 
   private async handleResponse(window: BrowserWindow, event: CdpResponseReceived): Promise<void> {
     const url = event.response?.url ?? ''
-    if (!event.requestId || !isGateEventResponse(url) || !['XHR', 'Fetch'].includes(event.type ?? '')) return
+    if (!event.requestId || !isGateHost(url) || !['XHR', 'Fetch'].includes(event.type ?? '') || (!isGateEventResponse(url) && this.networkResponseListeners.size === 0)) return
     try {
       const result = await window.webContents.debugger.sendCommand('Network.getResponseBody', { requestId: event.requestId }) as {
         body?: string
@@ -396,11 +429,12 @@ export class GatePageCapture implements GatePageCaptureSource {
       }
       if (!result.body) return
       const body = result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf8') : result.body
-      const captured = { url, body, receivedAt: Date.now(), pageUrl: window.webContents.getURL() }
+      const captured = { url, body, requestId: event.requestId, status: event.response?.status, resourceType: event.type, receivedAt: Date.now(), pageUrl: window.webContents.getURL() }
       this.responseCount += 1
       this.lastCaptureAt = captured.receivedAt
       this.setStatus('CONNECTED', this.captureStatusMessage())
-      for (const listener of this.responseListeners) listener(captured)
+      for (const listener of this.networkResponseListeners) listener(captured)
+      if (isGateEventResponse(url)) for (const listener of this.responseListeners) listener(captured)
     } catch {
       // Cached, redirected or evicted responses can disappear before CDP reads them.
     }
@@ -410,29 +444,35 @@ export class GatePageCapture implements GatePageCaptureSource {
     const request = event.request
     const url = request?.url ?? ''
     const method = request?.method?.toUpperCase() ?? 'GET'
-    if (!isGateHost(url) || !['POST', 'PUT', 'PATCH'].includes(method)) return
+    if (!isGateHost(url)) return
     const captured: GateCapturedRequest = {
       url,
       method,
       headers: request?.headers,
       body: request?.postData,
+      requestId: event.requestId,
+      resourceType: event.type,
       receivedAt: Date.now(),
       pageUrl
     }
-    for (const listener of this.requestListeners) listener(captured)
+    for (const listener of this.networkRequestListeners) listener(captured)
+    if (['POST', 'PUT', 'PATCH'].includes(method)) for (const listener of this.requestListeners) listener(captured)
   }
 
-  private handleFrame(event: CdpWebSocketFrame, pageUrl = this.window?.webContents.getURL()): void {
-    if (!event.requestId || event.response?.opcode !== 1 || typeof event.response.payloadData !== 'string') return
+  private handleFrame(event: CdpWebSocketFrame, pageUrl = this.window?.webContents.getURL(), direction: 'SENT' | 'RECEIVED' = 'RECEIVED'): void {
+    if (!event.requestId) return
     const url = this.socketUrls.get(event.requestId)
     if (!url) return
-    const payload = event.response.payloadData
+    const frame = direction === 'SENT' ? event.request : event.response
+    if (frame?.opcode !== 1 || typeof frame.payloadData !== 'string') return
+    const payload = frame.payloadData
     if (payload.length > 2_000_000) return
+    const captured = { url, payload, requestId: event.requestId, direction, receivedAt: Date.now(), pageUrl }
+    for (const listener of this.rawFrameListeners) listener(captured)
     // Regional Gate frontends use order_book, market/book, asks/bids and
     // ticker names interchangeably. Keep this broad enough for the actual
     // book stream while dropping heartbeats and UI telemetry.
     if (!/event|predict|contract|order[._-]?book|depth|market|book|asks|bids|ticker/i.test(`${url}\n${payload}`)) return
-    const captured = { url, payload, receivedAt: Date.now(), pageUrl }
     this.webSocketFrameCount += 1
     this.lastCaptureAt = captured.receivedAt
     this.setStatus('CONNECTED', this.captureStatusMessage())
@@ -441,16 +481,17 @@ export class GatePageCapture implements GatePageCaptureSource {
 
   private async handlePlaywrightResponse(session: CDPSession, page: Page, event: CdpResponseReceived): Promise<void> {
     const url = event.response?.url ?? ''
-    if (!event.requestId || !isGateEventResponse(url) || !['XHR', 'Fetch'].includes(event.type ?? '')) return
+    if (!event.requestId || !isGateHost(url) || !['XHR', 'Fetch'].includes(event.type ?? '') || (!isGateEventResponse(url) && this.networkResponseListeners.size === 0)) return
     try {
       const result = await session.send('Network.getResponseBody', { requestId: event.requestId }) as { body?: string; base64Encoded?: boolean }
       if (!result.body) return
       const body = result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf8') : result.body
-      const captured = { url, body, receivedAt: Date.now(), pageUrl: page.url() }
+      const captured = { url, body, requestId: event.requestId, status: event.response?.status, resourceType: event.type, receivedAt: Date.now(), pageUrl: page.url() }
       this.responseCount += 1
       this.lastCaptureAt = captured.receivedAt
       this.setStatus('CONNECTED', this.captureStatusMessage('已接管指纹浏览器'))
-      for (const listener of this.responseListeners) listener(captured)
+      for (const listener of this.networkResponseListeners) listener(captured)
+      if (isGateEventResponse(url)) for (const listener of this.responseListeners) listener(captured)
     } catch {
       // Cached, redirected or evicted responses can disappear before CDP reads them.
     }

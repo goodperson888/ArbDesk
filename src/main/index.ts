@@ -1,4 +1,4 @@
-import { writeFile } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { app, BrowserWindow, ipcMain, powerMonitor, shell } from 'electron'
 import { AppController } from './app-controller'
@@ -337,7 +337,15 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     await gateMarketData.openPageCapture()
     return gateOrderCapture.getSummary()
   }))
+  ipcMain.handle('gate:stop-order-capture', () => requireActiveLicense(() => { gateOrderCapture.stopCapture(); return gateOrderCapture.getSummary() }))
   ipcMain.handle('gate:order-capture-summary', () => requireActiveLicense(() => gateOrderCapture.getSummary()))
+  ipcMain.handle('gate:export-order-capture', () => requireActiveLicense(async () => {
+    const directory = join(app.getPath('userData'), 'data')
+    await mkdir(directory, { recursive: true })
+    const path = join(directory, 'gate-order-capture-trace.json')
+    await writeFile(path, JSON.stringify({ exportedAt: Date.now(), summary: gateOrderCapture.getSummary(), trace: gateOrderCapture.getTrace() }, null, 2), 'utf8')
+    return path
+  }))
   ipcMain.handle('gate:clear-order-capture', () => requireActiveLicense(() => { gateOrderCapture.clear(); return gateOrderCapture.getSummary() }))
   ipcMain.handle('gate:prepare-without-submit', () => requireActiveLicense(() => gatePreparation.prepare()))
   ipcMain.handle('gate:update-credentials', (_event, request) => requireActiveLicense(async () => {
