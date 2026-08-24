@@ -162,6 +162,38 @@ describe('GateMarketData', () => {
     expect(source.getLatestWindows()[0].outcomes.DOWN).toMatchObject({ bestAsk: '0.34', askSize: '162', receivedAt: Date.now() })
   })
 
+  it('maps compact websocket token IDs when Gate catalogue reports one side at 1.0', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-24T15:42:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-5m?eventId=896000&outcome=Up'
+    source.ingest(JSON.stringify({ code: 0, data: {
+      id: '896000', question: 'BTC 5 Min Up or Down 23:45 (UTC+8)',
+      game_start_time: '2026-08-24 15:40:00', end_date: 1787586300,
+      markets: [{
+        best_ask: 0.01, best_ask_token1: 1,
+        clob_token_id0: 'gate-up-token', clob_token_id1: 'gate-down-token'
+      }]
+    } }), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/events/896000?sub_website_id=0', pageUrl)
+
+    source.ingest(JSON.stringify({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      mk: '0xmarket', aid: 'gate-up-token', a: [['0.41', '98.22']]
+    } }), Date.now(), 'WebSocket', 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web', pageUrl)
+    source.ingest(JSON.stringify({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      mk: '0xmarket', aid: 'gate-down-token', a: [['0.61', '333.91']]
+    } }), Date.now(), 'WebSocket', 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web', pageUrl)
+
+    expect(source.getLatestWindows()[0]).toMatchObject({
+      marketId: '896000', durationMinutes: 5,
+      outcomes: {
+        UP: { outcomeId: 'gate-up-token', bestAsk: '0.41', askSize: '98.22' },
+        DOWN: { outcomeId: 'gate-down-token', bestAsk: '0.61', askSize: '333.91' }
+      }
+    })
+  })
+
   it('maps Gate websocket market_id tokens and removes an expired round on refresh', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-23T12:32:00.000Z'))

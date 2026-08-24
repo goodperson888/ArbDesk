@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { gatePageDuration, isGateBtcEventUrl, isGateEventResponse, isGateHost, selectGatePageDuration } from './gate-page-capture'
+import { gatePageDuration, gateRollDelayMs, isGateBtcEventUrl, isGateEventResponse, isGateHost, selectGatePageDuration } from './gate-page-capture'
 
 describe('Gate page routing', () => {
   it('accepts only Gate-owned hosts and event-contract responses', () => {
@@ -29,5 +29,11 @@ describe('Gate page routing', () => {
     expect(selectGatePageDuration([15], 5)).toBeUndefined()
     expect(selectGatePageDuration([5, 15], 15)).toBe(15)
     expect(selectGatePageDuration([15], undefined)).toBe(15)
+  })
+
+  it('schedules the next passive page roll at the next five-minute boundary', () => {
+    const now = new Date('2026-08-25T00:02:30.000Z').getTime()
+    expect(gateRollDelayMs(now)).toBe(150_000)
+    expect(gateRollDelayMs(new Date('2026-08-25T00:04:59.000Z').getTime())).toBe(1_000)
   })
 })

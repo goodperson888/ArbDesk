@@ -14,6 +14,11 @@ const GATE_PAGE_URL = GATE_PAGE_URLS[5]
 const PAGE_START_TIMEOUT_MS = 25_000
 const PAGE_ROLL_INTERVAL_MS = 5 * 60_000
 
+export function gateRollDelayMs(now = Date.now()): number {
+  const nextBoundary = (Math.floor(now / PAGE_ROLL_INTERVAL_MS) + 1) * PAGE_ROLL_INTERVAL_MS
+  return Math.max(1_000, nextBoundary - now)
+}
+
 export interface GateCapturedResponse {
   url: string
   body: string
@@ -164,6 +169,9 @@ export class GatePageCapture implements GatePageCaptureSource {
   private lastStatusNotifyAt = 0
   private loadedRollSlot?: number
   private rollPromise?: Promise<void>
+  private fingerprintRollTimer?: ReturnType<typeof setTimeout>
+  private fingerprintOrderInFlight = 0
+  private fingerprintRollInFlight = false
   private responseListeners = new Set<(event: GateCapturedResponse) => void>()
   private requestListeners = new Set<(event: GateCapturedRequest) => void>()
   private networkResponseListeners = new Set<(event: GateCapturedResponse) => void>()
@@ -191,6 +199,16 @@ export class GatePageCapture implements GatePageCaptureSource {
    * request. The caller must reconcile an uncertain response before retrying.
    */
   async executePageOrder(intent: GatePageOrderIntent): Promise<GateCapturedHttpResponse> {
+    if (this.fingerprintRollInFlight) throw new Error('Gate 正在切换当前轮次，未操作订单；请稍后重试')
+    this.fingerprintOrderInFlight += 1
+    try {
+      return await this.executePageOrderInternal(intent)
+    } finally {
+      this.fingerprintOrderInFlight = Math.max(0, this.fingerprintOrderInFlight - 1)
+    }
+  }
+
+  private async executePageOrderInternal(intent: GatePageOrderIntent): Promise<GateCapturedHttpResponse> {
     const availableDurations = [...this.fingerprintPages.entries()]
       .filter(([, candidate]) => !candidate.isClosed())
       .map(([duration]) => duration)
@@ -245,6 +263,16 @@ export class GatePageCapture implements GatePageCaptureSource {
   }
 
   async executeCapturedOrder(request: GatePreparedOrderRequest): Promise<GateCapturedHttpResponse> {
+    if (this.fingerprintRollInFlight) throw new Error('Gate 正在切换当前轮次，未发送订单；请稍后重试')
+    this.fingerprintOrderInFlight += 1
+    try {
+      return await this.executeCapturedOrderInternal(request)
+    } finally {
+      this.fingerprintOrderInFlight = Math.max(0, this.fingerprintOrderInFlight - 1)
+    }
+  }
+
+  private async executeCapturedOrderInternal(request: GatePreparedOrderRequest): Promise<GateCapturedHttpResponse> {
     const method = request.method.toUpperCase()
     if (!isGateHost(request.endpoint) || !['POST', 'PUT', 'PATCH'].includes(method)) throw new Error('Gate 页面订单请求不受安全范围允许')
     const duration = gatePageDuration(request.pageUrl ?? '')
@@ -310,6 +338,7 @@ export class GatePageCapture implements GatePageCaptureSource {
       return Boolean(page && !page.isClosed() && this.fingerprintNetworkSessions.has(duration))
     })
     if (this.fingerprintPage && !this.fingerprintPage.isClosed() && liveFingerprintDurations.length === 2) {
+      this.scheduleFingerprintRoll()
       if (show) await this.fingerprintPage.bringToFront()
       return
     }
@@ -343,6 +372,7 @@ export class GatePageCapture implements GatePageCaptureSource {
     if (this.fingerprintPage || this.fingerprintPages.size > 0 || fingerprintStartup) {
       this.captureGeneration += 1
       this.destroying = true
+      this.clearFingerprintRollTimer()
       for (const session of this.fingerprintNetworkSessions.values()) void session.detach().catch(() => undefined)
       this.fingerprintNetworkSessions.clear()
       this.fingerprintPages.clear()
@@ -400,6 +430,7 @@ export class GatePageCapture implements GatePageCaptureSource {
       }
       if (generation !== this.captureGeneration) return
       this.fingerprintPage = this.fingerprintPages.get(5) ?? this.fingerprintPages.get(15)
+      this.scheduleFingerprintRoll(generation)
       if (show) await this.fingerprintPage?.bringToFront()
       this.setStatus('CONNECTED', this.captureStatusMessage('5m/15m 已接管指纹浏览器'))
     } catch (error) {
@@ -425,6 +456,7 @@ export class GatePageCapture implements GatePageCaptureSource {
       this.fingerprintNetworkSessions.delete(duration)
       if (this.fingerprintPage === page) this.fingerprintPage = this.fingerprintPages.get(duration === 5 ? 15 : 5)
       const remaining = [...this.fingerprintPages.values()].some((candidate) => !candidate.isClosed())
+      if (!remaining) this.clearFingerprintRollTimer()
       this.setStatus(remaining ? 'CONNECTED' : 'DISCONNECTED', remaining
         ? `Gate ${duration}m 页面已关闭；另一周期仍在监听`
         : `Gate ${duration}m 指纹浏览器标签页已关闭`)
@@ -463,6 +495,56 @@ export class GatePageCapture implements GatePageCaptureSource {
       if (this.fingerprintNetworkSessions.get(duration) === session) this.fingerprintNetworkSessions.delete(duration)
       await session.detach().catch(() => undefined)
       throw error
+    }
+  }
+
+  private scheduleFingerprintRoll(generation = this.captureGeneration): void {
+    this.clearFingerprintRollTimer()
+    if (this.stopping || generation !== this.captureGeneration || this.fingerprintPages.size === 0) return
+    this.fingerprintRollTimer = setTimeout(() => {
+      this.fingerprintRollTimer = undefined
+      if (this.stopping || generation !== this.captureGeneration) return
+      void this.refreshFingerprintPages(generation).finally(() => this.scheduleFingerprintRoll(generation))
+    }, gateRollDelayMs())
+    this.fingerprintRollTimer.unref?.()
+  }
+
+  private clearFingerprintRollTimer(): void {
+    if (!this.fingerprintRollTimer) return
+    clearTimeout(this.fingerprintRollTimer)
+    this.fingerprintRollTimer = undefined
+  }
+
+  private async refreshFingerprintPages(generation: number): Promise<void> {
+    if (generation !== this.captureGeneration) return
+    // A page.goto() can invalidate a pending click and move it to another
+    // eventId. Let the current order finish, then retry the next boundary.
+    if (this.fingerprintOrderInFlight > 0) return
+    this.fingerprintRollInFlight = true
+    let refreshed = 0
+    let failed = 0
+    try {
+      this.setStatus('STARTING', 'Gate 5m/15m 正在切换到当前轮次；继续监听页面自身请求')
+      for (const duration of [5, 15] as const) {
+        if (generation !== this.captureGeneration) return
+        const page = this.fingerprintPages.get(duration)
+        if (!page || page.isClosed()) continue
+        try {
+          // Do not reload the old eventId URL. Gate can keep that event pinned;
+          // the duration entry URL resolves to the currently active round.
+          await page.goto(GATE_PAGE_URLS[duration], { waitUntil: 'domcontentloaded', timeout: PAGE_START_TIMEOUT_MS })
+          refreshed += 1
+        } catch {
+          failed += 1
+        }
+      }
+      if (refreshed > 0) {
+        this.setStatus('CONNECTED', `Gate 5m/15m 当前轮次已刷新；${failed ? `${failed} 个页面待重连` : '继续监听最新盘口'}`)
+      } else if (failed > 0) {
+        this.setStatus('DISCONNECTED', 'Gate 5m/15m 当前轮次刷新失败；等待下一次自动重试')
+      }
+    } finally {
+      this.fingerprintRollInFlight = false
     }
   }
 

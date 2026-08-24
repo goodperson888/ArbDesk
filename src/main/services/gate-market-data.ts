@@ -9,6 +9,8 @@ interface GateMarketContext {
   startTime: number
   endTime: number
   outcomes: Partial<Record<Direction, ReadOnlyOutcomeQuote>>
+  /** Token IDs learned from the event catalogue, including sides with no quote yet. */
+  catalogOutcomeIds?: Partial<Record<Direction, string>>
 }
 
 type JsonRecord = Record<string, unknown>
@@ -70,6 +72,33 @@ function decimal(value: unknown): string | undefined {
   const parsed = Number(value)
   if (!Number.isFinite(parsed) || parsed <= 0 || parsed >= 1) return undefined
   return parsed.toString()
+}
+
+/**
+ * Gate's event catalogue exposes the two WebSocket asset IDs even when one
+ * side has no asks yet (its catalogue price is commonly exactly 1). Keep the
+ * IDs independently from the price quotes so the first live orderbook update
+ * can still be attached to the correct UP/DOWN outcome.
+ */
+function catalogOutcomeIds(source: JsonRecord): Partial<Record<Direction, string>> {
+  const market = Array.isArray(source.markets) ? record(source.markets[0]) : undefined
+  const idsFrom = (target?: JsonRecord): Partial<Record<Direction, string>> => {
+    if (!target) return {}
+    const tokenList = firstValue(target, ['clob_token_ids', 'clobTokenIds', 'tokenIds', 'token_ids'])
+    const tokens = Array.isArray(tokenList) ? tokenList.map(stringValue) : []
+    return {
+      UP: tokens[0] ?? stringValue(firstValue(target, ['clob_token_id0', 'clobTokenId0', 'token_id0'])),
+      DOWN: tokens[1] ?? stringValue(firstValue(target, ['clob_token_id1', 'clobTokenId1', 'token_id1']))
+    }
+  }
+  // Some Gate responses put `markets[0]` beside the IDs while other releases
+  // put the IDs on the event root. Prefer the nested market, then fill gaps
+  // from the root rather than losing a side when the shapes are mixed.
+  const nested = idsFrom(market)
+  const root = idsFrom(source)
+  const up = nested.UP ?? root.UP
+  const down = nested.DOWN ?? root.DOWN
+  return { UP: up, DOWN: down }
 }
 
 function level(value: unknown): OrderBookLevel | undefined {
@@ -183,20 +212,18 @@ export function parseGateMarketObject(source: JsonRecord, receivedAt: number, co
     range = { startTime: range.endTime - parsedDuration * 60_000, endTime: range.endTime }
   }
   const outcomes: Partial<Record<Direction, ReadOnlyOutcomeQuote>> = {}
-  const tokenList = firstValue(source, ['clob_token_ids', 'clobTokenIds', 'tokenIds', 'token_ids'])
-  const tokenIds = Array.isArray(tokenList) ? tokenList.map(stringValue) : []
+  const catalogTokens = catalogOutcomeIds(source)
   const upPrice = decimal(firstValue(source, ['bullish', 'best_ask', 'outcome_price0']))
   const downPrice = decimal(firstValue(source, ['bearish', 'best_ask_token1', 'outcome_price1']))
-  if (upPrice) outcomes.UP = { direction: 'UP', outcomeId: tokenIds[0] ?? 'UP', bestAsk: upPrice, askSize: '0', levels: [], receivedAt }
-  if (downPrice) outcomes.DOWN = { direction: 'DOWN', outcomeId: tokenIds[1] ?? 'DOWN', bestAsk: downPrice, askSize: '0', levels: [], receivedAt }
+  if (upPrice) outcomes.UP = { direction: 'UP', outcomeId: catalogTokens.UP ?? 'UP', bestAsk: upPrice, askSize: '0', levels: [], receivedAt }
+  if (downPrice) outcomes.DOWN = { direction: 'DOWN', outcomeId: catalogTokens.DOWN ?? 'DOWN', bestAsk: downPrice, askSize: '0', levels: [], receivedAt }
   const gateMarket = Array.isArray(source.markets) ? record(source.markets[0]) : undefined
   if (gateMarket) {
-    const gateTokenList = firstValue(gateMarket, ['clob_token_ids', 'clobTokenIds', 'tokenIds', 'token_ids'])
-    const marketTokens = Array.isArray(gateTokenList) ? gateTokenList.map(stringValue) : []
+    const marketTokens = catalogOutcomeIds(source)
     const gateUp = decimal(firstValue(gateMarket, ['best_ask', 'outcome_price0']))
     const gateDown = decimal(firstValue(gateMarket, ['best_ask_token1', 'outcome_price1']))
-    if (gateUp) outcomes.UP = { direction: 'UP', outcomeId: marketTokens[0] ?? stringValue(gateMarket.clob_token_id0) ?? 'UP', bestAsk: gateUp, askSize: '0', levels: [], receivedAt }
-    if (gateDown) outcomes.DOWN = { direction: 'DOWN', outcomeId: marketTokens[1] ?? stringValue(gateMarket.clob_token_id1) ?? 'DOWN', bestAsk: gateDown, askSize: '0', levels: [], receivedAt }
+    if (gateUp) outcomes.UP = { direction: 'UP', outcomeId: marketTokens.UP ?? 'UP', bestAsk: gateUp, askSize: '0', levels: [], receivedAt }
+    if (gateDown) outcomes.DOWN = { direction: 'DOWN', outcomeId: marketTokens.DOWN ?? 'DOWN', bestAsk: gateDown, askSize: '0', levels: [], receivedAt }
   }
   for (const candidate of childOutcomeSources(source)) {
     const quote = outcomeQuote(candidate.value, candidate.fallback, receivedAt)
@@ -208,7 +235,7 @@ export function parseGateMarketObject(source: JsonRecord, receivedAt: number, co
   // price/size rows walked later.
   const direct = outcomeQuote(source, askLevels(source).length ? pageContext.outcomeDirection : undefined, receivedAt)
   if (direct) outcomes[direct.direction] = direct
-  return { marketId: id, asset: parsedAsset, durationMinutes: parsedDuration, ...range, outcomes }
+  return { marketId: id, asset: parsedAsset, durationMinutes: parsedDuration, ...range, outcomes, catalogOutcomeIds: catalogTokens }
 }
 
 function walk(value: unknown, visitor: (value: JsonRecord) => void): void {
@@ -342,9 +369,21 @@ export class GateMarketData implements ReadOnlyVenueSource {
       const market = parseGateMarketObject(item, receivedAt, { pageUrl, sourceUrl })
       if (market) {
         const previous = this.contexts.get(market.marketId)
-        this.contexts.set(market.marketId, previous ? { ...previous, ...market, outcomes: { ...previous.outcomes, ...market.outcomes } } : market)
+        this.contexts.set(market.marketId, previous ? {
+          ...previous,
+          ...market,
+          outcomes: { ...previous.outcomes, ...market.outcomes },
+          catalogOutcomeIds: { ...previous.catalogOutcomeIds, ...market.catalogOutcomeIds }
+        } : market)
         for (const quote of Object.values(market.outcomes)) {
           if (quote) this.outcomeToMarket.set(quote.outcomeId, { marketId: market.marketId, direction: quote.direction })
+        }
+        // The catalogue token IDs are authoritative even when the catalogue
+        // has no valid ask on one side (Gate often reports 1.0 there). This is
+        // what lets compact WebSocket `aid` updates provide the first depth.
+        const catalogTokens = market.catalogOutcomeIds ?? {}
+        for (const [direction, outcomeId] of Object.entries(catalogTokens) as Array<[Direction, string | undefined]>) {
+          if (outcomeId) this.outcomeToMarket.set(outcomeId, { marketId: market.marketId, direction })
         }
         changed = true
       }
@@ -403,6 +442,9 @@ export class GateMarketData implements ReadOnlyVenueSource {
       this.contexts.delete(marketId)
       for (const quote of Object.values(context.outcomes)) {
         if (quote && this.outcomeToMarket.get(quote.outcomeId)?.marketId === marketId) this.outcomeToMarket.delete(quote.outcomeId)
+      }
+      for (const outcomeId of Object.values(context.catalogOutcomeIds ?? {})) {
+        if (outcomeId && this.outcomeToMarket.get(outcomeId)?.marketId === marketId) this.outcomeToMarket.delete(outcomeId)
       }
       changed = true
     }
