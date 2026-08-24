@@ -60,7 +60,31 @@ export function normalizeLegacyWindows(
 }
 
 export function buildReadOnlyComparisons(windows: ReadOnlyWindowQuote[], settings: RiskSettings, now: number): MultiVenueComparison[] {
-  return buildBidirectionalRoutes(windows, settings, now)
+  const uniqueWindows = new Map<string, ReadOnlyWindowQuote>()
+  const quality = (window: ReadOnlyWindowQuote): [number, number, number, number] => {
+    const quotes = Object.values(window.outcomes).filter((quote): quote is NonNullable<typeof quote> => Boolean(quote))
+    const latestQuoteAt = Math.max(0, ...quotes.map((quote) => quote.receivedAt))
+    const complete = quotes.length === 2 ? 1 : 0
+    const depth = quotes.reduce((sum, quote) => sum + Math.max(0, Number(quote.askSize) || 0), 0)
+    return [latestQuoteAt, complete, depth, quotes.length]
+  }
+  const isBetterQuality = (candidate: ReadOnlyWindowQuote, previous: ReadOnlyWindowQuote): boolean => {
+    const candidateQuality = quality(candidate)
+    const previousQuality = quality(previous)
+    for (let index = 0; index < candidateQuality.length; index += 1) {
+      if (candidateQuality[index] === previousQuality[index]) continue
+      return candidateQuality[index] > previousQuality[index]
+    }
+    return false
+  }
+  for (const window of windows) {
+    const key = [window.venueId, window.asset, window.durationMinutes, window.startTime, window.endTime].join(':')
+    const previous = uniqueWindows.get(key)
+    if (!previous || isBetterQuality(window, previous)) {
+      uniqueWindows.set(key, window)
+    }
+  }
+  return buildBidirectionalRoutes([...uniqueWindows.values()], settings, now)
     // The mature MEXC↔Polymarket path already has its own fee/risk model and
     // execution provider. Keep it out of the supplemental board to avoid a
     // duplicate opportunity row while every other pair uses the generic route.

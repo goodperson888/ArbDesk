@@ -4,10 +4,10 @@ import type { CDPSession, Page } from 'playwright-core'
 import type { GatePageCaptureStatus } from '../../shared/types'
 import type { FingerprintBrowserRuntime } from './fingerprint-browser-runtime'
 
-// The duration-specific route only keeps the 15m contract stream active on
-// current Gate builds. The event-contract index page carries both BTC 5m and
-// 15m lists while remaining a single passive page/capture surface.
-const GATE_PAGE_URL = 'https://www.gate.com/zh/trade-events'
+// Gate's event-contract index currently opens the most recently featured
+// asset (often ETH), which leaves BTC rows stale. Start from the BTC route;
+// the page itself rolls the event id and can expose the current 5m/15m data.
+const GATE_PAGE_URL = 'https://www.gate.com/zh/trade-events/btc-updown-5m'
 const PAGE_START_TIMEOUT_MS = 25_000
 const PAGE_ROLL_INTERVAL_MS = 5 * 60_000
 
@@ -109,6 +109,15 @@ export function isGateHost(rawUrl: string): boolean {
       hostname === 'gate.io' || hostname.endsWith('.gate.io') ||
       hostname === 'gateio.ws' || hostname.endsWith('.gateio.ws') ||
       hostname === 'gateio.live' || hostname.endsWith('.gateio.live')
+  } catch {
+    return false
+  }
+}
+
+export function isGateBtcEventUrl(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl)
+    return isGateHost(rawUrl) && /^\/zh\/trade-events\/btc-updown-(?:5|15)m(?:$|\/)/i.test(url.pathname)
   } catch {
     return false
   }
@@ -329,8 +338,13 @@ export class GatePageCapture implements GatePageCaptureSource {
     try {
       page = await this.fingerprintRuntime!.attach('GATE', {
         hosts: ['gate.com', 'gate.io', 'gateio.ws', 'gateio.live'],
-        createIfMissing: false
+        createIfMissing: true,
+        startupUrl: GATE_PAGE_URL
       })
+      if (!isGateBtcEventUrl(page.url())) {
+        this.setStatus('STARTING', 'Gate 已接管；当前标签页不是 BTC 事件页，正在后台切换到 BTC 5m')
+        await page.goto(GATE_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_START_TIMEOUT_MS })
+      }
     } catch (error) {
       this.setStatus('DISCONNECTED', `Gate 指纹浏览器接管失败：${error instanceof Error ? error.message : String(error)}`)
       return

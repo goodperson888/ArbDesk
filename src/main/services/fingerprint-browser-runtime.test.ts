@@ -44,6 +44,25 @@ describe('FingerprintBrowserRuntime', () => {
     expect(context.newPage).not.toHaveBeenCalled()
   })
 
+  it('creates a missing venue page at its passive startup URL', async () => {
+    const startupUrl = 'https://www.gate.com/zh/trade-events/btc-updown-5m'
+    const createdPage = page('about:blank')
+    const context = { pages: () => [], newPage: vi.fn(async () => createdPage) }
+    const browser = { contexts: () => [context], isConnected: () => true, on: vi.fn() }
+    const backend: FingerprintBrowserBackend = {
+      resolveRunningPort: vi.fn(async () => 9333),
+      connect: vi.fn(async () => browser as never),
+      start: vi.fn(async () => ({ debuggingPort: 9333 }))
+    }
+    const runtime = new FingerprintBrowserRuntime(backend)
+    runtime.configure({ containerCode: 'container-1' })
+
+    await runtime.attach('GATE', { hosts: ['gate.com'], createIfMissing: true, startupUrl })
+
+    expect(context.newPage).toHaveBeenCalledTimes(1)
+    expect(createdPage.goto).toHaveBeenCalledWith(startupUrl, { waitUntil: 'domcontentloaded' })
+  })
+
   it('requires a configured fingerprint container', async () => {
     const backend: FingerprintBrowserBackend = {
       resolveRunningPort: vi.fn(),

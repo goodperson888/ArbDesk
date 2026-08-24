@@ -51,4 +51,13 @@ describe('read-only multi-venue board adapter', () => {
       window('POLYMARKET', '0.55', '0.35')
     ], settings, 10_100)).toEqual([])
   })
+
+  it('collapses duplicate venue windows into one comparison per duration and time range', () => {
+    const gate = window('GATE', '0.40', '0.40')
+    const duplicateGate = { ...window('GATE', '0.45', '0.35'), marketId: 'GATE-market-duplicate' }
+    const kalshi = window('KALSHI', '0.45', '0.45')
+    const rows = buildReadOnlyComparisons([gate, duplicateGate, kalshi], settings, 10_100)
+    expect(rows).toHaveLength(2)
+    expect(new Set(rows.map((row) => row.id)).size).toBe(2)
+  })
 })
