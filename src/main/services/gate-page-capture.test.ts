@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { gatePageDuration, gateRollDelayMs, isGateBtcEventUrl, isGateEventResponse, isGateHost, selectGatePageDuration } from './gate-page-capture'
+import { gatePageDuration, gateRollDelayMs, isGateBtcEventUrl, isGateEventResponse, isGateHost, selectGatePageDuration, selectGatePageUrl } from './gate-page-capture'
 
 describe('Gate page routing', () => {
   it('accepts only Gate-owned hosts and event-contract responses', () => {
@@ -35,5 +35,13 @@ describe('Gate page routing', () => {
     const now = new Date('2026-08-25T00:02:30.000Z').getTime()
     expect(gateRollDelayMs(now)).toBe(150_000)
     expect(gateRollDelayMs(new Date('2026-08-25T00:04:59.000Z').getTime())).toBe(1_000)
+  })
+
+  it('prefers the newest same-duration Gate tab when duplicate old event tabs exist', () => {
+    expect(selectGatePageUrl([
+      'https://www.gate.com/zh/trade-events/btc-updown-15m?eventId=889291&outcome=Up',
+      'https://www.gate.com/zh/trade-events/btc-updown-5m?eventId=896245&outcome=Up',
+      'https://www.gate.com/zh/trade-events/btc-updown-15m?eventId=896282&outcome=Up'
+    ], 15)).toContain('eventId=896282')
   })
 })

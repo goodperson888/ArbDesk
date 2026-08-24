@@ -137,6 +137,38 @@ export function gatePageDuration(rawUrl: string): 5 | 15 | undefined {
   }
 }
 
+function gateEventIdRank(rawUrl: string): number | undefined {
+  try {
+    const raw = new URL(rawUrl).searchParams.get('eventId') ?? new URL(rawUrl).searchParams.get('event_id')
+    const value = raw ? Number(raw) : NaN
+    return Number.isFinite(value) ? value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Hubstudio profiles can retain an old Gate tab from a previous run. When
+ * several tabs expose the same duration, attach to the highest eventId (Gate
+ * event IDs increase with each new round) instead of whichever tab happens to
+ * be first in Chromium's page list.
+ */
+export function selectGatePageUrl(urls: readonly string[], duration: 5 | 15): string | undefined {
+  let selected: string | undefined
+  let selectedRank = Number.NEGATIVE_INFINITY
+  let selectedIndex = -1
+  urls.forEach((url, index) => {
+    if (gatePageDuration(url) !== duration) return
+    const rank = gateEventIdRank(url) ?? Number.NEGATIVE_INFINITY
+    if (rank > selectedRank || (rank === selectedRank && index > selectedIndex)) {
+      selected = url
+      selectedRank = rank
+      selectedIndex = index
+    }
+  })
+  return selected
+}
+
 export function selectGatePageDuration(available: readonly (5 | 15)[], requested?: 5 | 15): 5 | 15 | undefined {
   if (requested !== undefined) return available.includes(requested) ? requested : undefined
   return available.includes(5) ? 5 : available[0]
@@ -418,9 +450,12 @@ export class GatePageCapture implements GatePageCaptureSource {
     try {
       const context = seedPage.context()
       const pagesByDuration = new Map<5 | 15, Page>()
-      for (const candidate of context.pages()) {
-        const duration = gatePageDuration(candidate.url())
-        if (duration && !candidate.isClosed() && !pagesByDuration.has(duration)) pagesByDuration.set(duration, candidate)
+      const candidates = context.pages().filter((candidate) => !candidate.isClosed())
+      for (const duration of [5, 15] as const) {
+        const sameDuration = candidates.filter((candidate) => gatePageDuration(candidate.url()) === duration)
+        const selectedUrl = selectGatePageUrl(sameDuration.map((candidate) => candidate.url()), duration)
+        const selected = sameDuration.find((candidate) => candidate.url() === selectedUrl)
+        if (selected) pagesByDuration.set(duration, selected)
       }
       if (!pagesByDuration.has(5) && !gatePageDuration(seedPage.url())) pagesByDuration.set(5, seedPage)
       for (const duration of [5, 15] as const) {
