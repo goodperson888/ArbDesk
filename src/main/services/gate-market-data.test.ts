@@ -316,6 +316,39 @@ describe('GateMarketData', () => {
     })
     expect(source.getStatus().message).toContain('REST hash 2/2·方向2')
     expect(source.getStatus().message).toContain('WS h 2·命中0')
+    expect(source.getStatus().message).toContain('aid 2·命中2')
+  })
+
+  it('uses a unique websocket market key as a safe fallback when aid and hash differ', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-24T15:42:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-15m'
+    const wsUrl = 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web'
+    source.ingest(JSON.stringify({ code: 0, data: {
+      hash: 'rest-hash-up', asset_id: 'rest-up-token', market: 'ge_896005_up', asks: [['0.41', '10']], bids: []
+    } }), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/book?event_id=896005&outcome=Up', pageUrl)
+    source.ingest(JSON.stringify({ code: 0, data: {
+      hash: 'rest-hash-down', asset_id: 'rest-down-token', market: 'ge_896005_down', asks: [['0.59', '11']], bids: []
+    } }), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/book?event_id=896005&outcome=Down', pageUrl)
+    source.ingest(JSON.stringify({ result: {
+      mk: 'ge_896005_up', aid: 'ws-up-token', h: 'ws-hash-up', a: [['0.40', '12']], b: []
+    } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+    source.ingest(JSON.stringify({ result: {
+      mk: 'ge_896005_down', aid: 'ws-down-token', h: 'ws-hash-down', a: [['0.60', '13']], b: []
+    } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+
+    expect(source.getLatestWindows()[0]).toMatchObject({
+      marketId: '896005', durationMinutes: 15,
+      outcomes: {
+        UP: { outcomeId: 'ws-up-token', bestAsk: '0.4', askSize: '12' },
+        DOWN: { outcomeId: 'ws-down-token', bestAsk: '0.6', askSize: '13' }
+      }
+    })
+    expect(source.getStatus().message).toContain('aid 2·命中0')
+    expect(source.getStatus().message).toContain('mk 2·命中2')
   })
 
   it('maps Gate websocket market_id tokens and removes an expired round on refresh', async () => {

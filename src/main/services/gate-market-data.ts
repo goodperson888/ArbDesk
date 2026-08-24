@@ -25,6 +25,11 @@ interface GatePipelineStats {
   restBookDirections: number
   websocketHashes: number
   websocketHashMatches: number
+  restAssetIds: Set<string>
+  websocketAids: number
+  websocketAidMatches: number
+  websocketMarketKeys: number
+  websocketMarketKeyMatches: number
 }
 
 interface GateBookHashBinding {
@@ -330,6 +335,8 @@ export class GateMarketData implements ReadOnlyVenueSource {
   private contexts = new Map<string, GateMarketContext>()
   private outcomeToMarket = new Map<string, { marketId: string; direction: Direction }>()
   private bookHashToMarket = new Map<string, GateBookHashBinding>()
+  /** A market key is usable only when it has been observed for one side. */
+  private marketKeyToMarket = new Map<string, GateBookHashBinding | null>()
   private snapshot: ReadOnlyWindowQuote[] = []
   private startPromise?: Promise<void>
   private capturedAccount: { openOrderCount?: number; positionCount?: number; updatedAt?: number } = {}
@@ -371,6 +378,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
     this.contexts.clear()
     this.outcomeToMarket.clear()
     this.bookHashToMarket.clear()
+    this.marketKeyToMarket.clear()
     this.pipelineStats.clear()
     this.snapshot = []
     this.emit()
@@ -419,16 +427,33 @@ export class GateMarketData implements ReadOnlyVenueSource {
         stats.restBookResponses += 1
         if (restHash) stats.restBookHashes += 1
         if (requestDirection) stats.restBookDirections += 1
+        const restAssetId = stringValue(firstValue(item, ['asset_id', 'assetId']))
+        if (restAssetId) {
+          stats.restAssetIds.add(restAssetId)
+          while (stats.restAssetIds.size > 128) stats.restAssetIds.delete(stats.restAssetIds.values().next().value!)
+        }
         this.pipelineStats.set(restDuration, stats)
       }
       const market = parseGateMarketObject(item, receivedAt, { pageUrl, sourceUrl })
       if (market) {
+        const marketKey = stringValue(firstValue(item, ['market', 'market_id', 'marketId', 'mk']))
         const bookHash = restHash
         if (bookHash && requestDirection) {
           this.bookHashToMarket.set(bookHash, { marketId: market.marketId, direction: requestDirection, endTime: market.endTime })
           while (this.bookHashToMarket.size > 128) {
             const oldest = this.bookHashToMarket.keys().next().value
             if (oldest) this.bookHashToMarket.delete(oldest)
+            else break
+          }
+        }
+        if (marketKey && requestDirection) {
+          const binding = { marketId: market.marketId, direction: requestDirection, endTime: market.endTime }
+          const existing = this.marketKeyToMarket.get(marketKey)
+          if (existing === undefined) this.marketKeyToMarket.set(marketKey, binding)
+          else if (existing && (existing.marketId !== binding.marketId || existing.direction !== binding.direction)) this.marketKeyToMarket.set(marketKey, null)
+          while (this.marketKeyToMarket.size > 128) {
+            const oldest = this.marketKeyToMarket.keys().next().value
+            if (oldest) this.marketKeyToMarket.delete(oldest)
             else break
           }
         }
@@ -464,10 +489,12 @@ export class GateMarketData implements ReadOnlyVenueSource {
       const tokenContext = tokenId ? this.outcomeToMarket.get(tokenId) : undefined
       const bookHash = stringValue(firstValue(item, ['h', 'hash', 'book_hash', 'orderbook_hash']))
       const hashContext = bookHash ? this.bookHashToMarket.get(bookHash) : undefined
+      const marketKey = stringValue(firstValue(item, ['mk', 'market', 'market_id', 'marketId']))
+      const marketKeyContext = marketKey ? this.marketKeyToMarket.get(marketKey) ?? undefined : undefined
       // The hash belongs to this exact book update and is authoritative when
       // present; an aid cache can survive a round rotation or be recycled by
       // Gate, so it is only a fallback when the frame has no hash.
-      const resolvedTokenContext = hashContext ?? tokenContext
+      const resolvedTokenContext = hashContext ?? tokenContext ?? marketKeyContext
       if (explicitTokenId && hashContext) {
         this.outcomeToMarket.set(explicitTokenId, { marketId: hashContext.marketId, direction: hashContext.direction })
       }
@@ -479,6 +506,12 @@ export class GateMarketData implements ReadOnlyVenueSource {
         if (bookHash) {
           stats.websocketHashes += 1
           if (hashContext) stats.websocketHashMatches += 1
+        }
+        stats.websocketAids += 1
+        if (tokenContext || stats.restAssetIds.has(explicitTokenId)) stats.websocketAidMatches += 1
+        if (marketKey) {
+          stats.websocketMarketKeys += 1
+          if (marketKeyContext) stats.websocketMarketKeyMatches += 1
         }
         if (resolvedTokenContext) {
           stats.mappedBookFrames += 1
@@ -570,6 +603,9 @@ export class GateMarketData implements ReadOnlyVenueSource {
       for (const [bookHash, binding] of this.bookHashToMarket) {
         if (binding.marketId === marketId) this.bookHashToMarket.delete(bookHash)
       }
+      for (const [marketKey, binding] of this.marketKeyToMarket) {
+        if (binding?.marketId === marketId) this.marketKeyToMarket.delete(marketKey)
+      }
       changed = true
     }
     if (!changed) return
@@ -593,7 +629,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
       const mappedAge = stats?.lastMappedBookAt === undefined ? '无' : `${((Math.max(0, now - stats.lastMappedBookAt)) / 1_000).toFixed(1)}秒`
       const quoteAge = stats?.lastQuoteUpdateAt === undefined ? '无' : `${((Math.max(0, now - stats.lastQuoteUpdateAt)) / 1_000).toFixed(1)}秒`
       const rest = stats ? `REST hash ${stats.restBookHashes}/${stats.restBookResponses}·方向${stats.restBookDirections}` : 'REST hash 无'
-      const ws = stats ? `WS h ${stats.websocketHashes}·命中${stats.websocketHashMatches}` : 'WS h 无'
+      const ws = stats ? `WS h ${stats.websocketHashes}·命中${stats.websocketHashMatches} / aid ${stats.websocketAids}·命中${stats.websocketAidMatches} / mk ${stats.websocketMarketKeys}·命中${stats.websocketMarketKeyMatches}` : 'WS h 无'
       return `${duration}m 原始WS ${rawAge} / 映射${mappedAge} / 盘口${quoteAge} / 未映射${stats?.unmappedBookFrames ?? 0} / ${rest} / ${ws}`
     }).join('；')
   }
@@ -608,7 +644,9 @@ export class GateMarketData implements ReadOnlyVenueSource {
     return {
       rawBookFrames: 0, mappedBookFrames: 0, unmappedBookFrames: 0,
       restBookResponses: 0, restBookHashes: 0, restBookDirections: 0,
-      websocketHashes: 0, websocketHashMatches: 0
+      websocketHashes: 0, websocketHashMatches: 0,
+      restAssetIds: new Set<string>(), websocketAids: 0, websocketAidMatches: 0,
+      websocketMarketKeys: 0, websocketMarketKeyMatches: 0
     }
   }
 
