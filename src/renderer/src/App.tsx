@@ -259,6 +259,26 @@ function comparisonStatusLabel(status: MultiVenueComparisonStatus): string {
   return '已拦截'
 }
 
+function grossComparisonStatusLabel(status: MultiVenueComparisonStatus): string {
+  if (status === 'MANUAL_EXECUTABLE') return '双腿待确认'
+  if (status === 'STALE') return '行情过期'
+  if (status === 'BLOCKED') return '深度不足 / 暂不可下单'
+  return comparisonStatusLabel(status)
+}
+
+function grossComparisonNotice(status: MultiVenueComparisonStatus): string {
+  if (status === 'MANUAL_EXECUTABLE') return '这条路线已接入受限双腿人工执行；两腿不能原子成交，任一腿失败会进入恢复态。未知深度不参与可执行量或利润计算。'
+  if (status === 'STALE') return 'Gate↔Kalshi 双腿下单已经接入，但当前至少一腿行情超过新鲜度门槛；等待两边盘口恢复后才允许下单。'
+  if (status === 'BLOCKED') return 'Gate↔Kalshi 双腿连接器已经接入，但当前至少一腿没有可执行深度，暂时不能安全确定下单份额。'
+  return '这条路线可用于观察和比价，但当前未通过真实下单门槛。'
+}
+
+function grossComparisonActionLabel(status: MultiVenueComparisonStatus): string {
+  if (status === 'STALE') return '行情过期 · 暂不下单'
+  if (status === 'BLOCKED') return '深度不足 · 暂不下单'
+  return '只读观察 · 暂不支持下单'
+}
+
 function comparisonLegLabel(comparison: MultiVenueComparison, index: number): string {
   const leg = comparison.legs[index]
   return leg ? `${leg.venueLabel} ${leg.direction}` : '—'
@@ -1809,7 +1829,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                           : money(comparison.executableQuantity, 2)}</td>
                         <td><span className={positive ? 'positive-value' : 'negative-value'}>{comparison.edgeKind === 'GROSS_ONLY' ? '—' : `${positive ? '+' : ''}${money(displayedProfit(comparison), 2)}`}</span></td>
                         <td className="mono countdown">{secondsRemaining(comparison.endTime, now)}</td>
-                        <td><span className={`comparison-status ${comparison.status.toLowerCase()}`} title={comparison.blockReasons.join('；') || '当前通过展示层机会检查'}>{comparison.edgeKind === 'GROSS_ONLY' ? comparison.status === 'MANUAL_EXECUTABLE' ? '双腿待确认' : '只读观察' : comparisonStatusLabel(comparison.status)}</span></td>
+                        <td><span className={`comparison-status ${comparison.status.toLowerCase()}`} title={comparison.blockReasons.join('；') || '当前通过展示层机会检查'}>{comparison.edgeKind === 'GROSS_ONLY' ? grossComparisonStatusLabel(comparison.status) : comparisonStatusLabel(comparison.status)}</span></td>
                       </tr>
                     )
                   })}
@@ -1825,7 +1845,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
             <>
               <section className="ticket-market-summary">
                 <div className="ticket-summary-heading">
-                  <span><span className="duration-pill">{selectedComparison.durationMinutes}m</span><span className={`comparison-status ${selectedComparison.status.toLowerCase()}`}>{selectedComparison.edgeKind === 'GROSS_ONLY' ? selectedComparison.status === 'MANUAL_EXECUTABLE' ? '双腿待确认' : '只读观察' : comparisonStatusLabel(selectedComparison.status)}</span></span>
+                  <span><span className="duration-pill">{selectedComparison.durationMinutes}m</span><span className={`comparison-status ${selectedComparison.status.toLowerCase()}`}>{selectedComparison.edgeKind === 'GROSS_ONLY' ? grossComparisonStatusLabel(selectedComparison.status) : comparisonStatusLabel(selectedComparison.status)}</span></span>
                   <small>{matchClassLabel(selectedComparison.matchClass)}</small>
                 </div>
                 <h2>{selectedComparison.asset.replace('/USD', '')} · {marketWindowLabel(selectedComparison.startTime, selectedComparison.endTime)}</h2>
@@ -1917,9 +1937,9 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   <span>参考毛边际<strong className={Number(selectedComparison.netEdgePerShare) > 0 ? 'profit' : ''}>{Number(selectedComparison.netEdgePerShare) >= 0 ? '+' : ''}{money(selectedComparison.netEdgePerShare, 4)}</strong></span>
                   <span>参考收益率<strong>{Number(selectedComparison.conditionalReturnPct) >= 0 ? '+' : ''}{money(selectedComparison.conditionalReturnPct, 2)}%</strong></span>
                 </div>
-                <div className="read-only-notice"><Info aria-hidden="true" /><span>{selectedComparison.status === 'MANUAL_EXECUTABLE' ? '这条路线已接入受限双腿人工执行；两腿不能原子成交，任一腿失败会进入恢复态。未知深度不参与可执行量或利润计算。' : '这条路线可用于观察和比价，但未接入真实下单。未知深度不参与可执行量或利润计算。'}</span></div>
+                <div className="read-only-notice"><Info aria-hidden="true" /><span>{grossComparisonNotice(selectedComparison.status)}</span></div>
                 {selectedComparison.blockReasons.length > 0 && <ul className="read-only-reasons">{selectedComparison.blockReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}
-                {selectedComparison.status !== 'MANUAL_EXECUTABLE' && <button className="execute-button read-only-execute" type="button" disabled><LockKeyhole aria-hidden="true" />只读观察 · 暂不支持下单</button>}
+                {selectedComparison.status !== 'MANUAL_EXECUTABLE' && <button className="execute-button read-only-execute" type="button" disabled><LockKeyhole aria-hidden="true" />{grossComparisonActionLabel(selectedComparison.status)}</button>}
               </section>}
             </>
           ) : <div className="empty-state">没有可用机会</div>}

@@ -85,11 +85,15 @@ export function routeToComparison(route: BidirectionalRoute, settings: RiskSetti
   const includesKalshi = route.left.venueId === 'KALSHI' || route.right.venueId === 'KALSHI'
   const kalshiPairSupported = includesKalshi && [route.left.venueId, route.right.venueId].some((venue) => venue === 'MEXC' || venue === 'POLYMARKET' || venue === 'GATE')
   const maxAge = route.quoteAgeMs
+  const executableDepth = new Decimal(route.executableQuantity)
+  const depthReady = executableDepth.gte(1)
   const blockReasons = [
     includesKalshi ? '跨平台双腿执行需人工确认；按首腿实际成交量对冲第二腿' : '新平台当前只读，尚未开放该路线下单',
     route.matchClass === 'EXACT'
       ? kalshiPairSupported ? '双腿没有跨平台原子事务；第二腿失败会进入恢复态' : '交易连接器尚未接入'
       : '结算源、取价方式或平价规则不完全一致',
+    maxAge > settings.maxQuoteAgeMs ? `行情过期：最慢一腿 ${Math.round(maxAge / 1_000)} 秒未更新（门槛 ${Math.round(settings.maxQuoteAgeMs / 1_000)} 秒）` : '',
+    !depthReady ? '当前至少一腿没有可执行深度，无法确定安全下单份额' : '',
     !route.left.feeVerified || !route.right.feeVerified ? '手续费模型尚未完成实盘校验，当前仅显示毛边际' : ''
   ].filter(Boolean)
   const comparisonLegs = legs(route, now)
@@ -97,7 +101,7 @@ export function routeToComparison(route: BidirectionalRoute, settings: RiskSetti
     id: route.routeId,
     asset: route.left.asset, durationMinutes: route.left.durationMinutes, startTime: route.left.startTime, endTime: route.left.endTime,
     strategy: 'COMPLEMENTARY_OUTCOMES', matchClass: route.matchClass,
-    status: maxAge > settings.maxQuoteAgeMs ? 'STALE' : kalshiPairSupported ? 'MANUAL_EXECUTABLE' : 'BLOCKED',
+    status: maxAge > settings.maxQuoteAgeMs ? 'STALE' : kalshiPairSupported && depthReady ? 'MANUAL_EXECUTABLE' : 'BLOCKED',
     executionProvider: 'MULTI_VENUE', edgeKind: 'GROSS_ONLY', legs: comparisonLegs,
     allInCostPerShare: route.allInCostPerShare, netEdgePerShare: route.netEdgePerShare,
     conditionalReturnPct: new Decimal(route.allInCostPerShare).gt(0) ? new Decimal(route.netEdgePerShare).div(route.allInCostPerShare).mul(100).toFixed(4) : '0',

@@ -53,4 +53,24 @@ describe('bidirectional route builder', () => {
     const route = buildBidirectionalRoutes([market('GATE'), market('KALSHI')], settings, 10_100)[0]
     expect(routeToComparison(route, settings, 10_100).status).toBe('MANUAL_EXECUTABLE')
   })
+
+  it('marks a Gate↔Kalshi route stale when either quote exceeds the freshness gate', () => {
+    const staleGate = { ...market('GATE'), outcomes: {
+      ...market('GATE').outcomes,
+      UP: { ...market('GATE').outcomes.UP!, receivedAt: 1_000 },
+      DOWN: { ...market('GATE').outcomes.DOWN!, receivedAt: 1_000 }
+    } }
+    const route = buildBidirectionalRoutes([staleGate, market('KALSHI')], settings, 10_100)[0]
+    expect(routeToComparison(route, settings, 10_100).status).toBe('STALE')
+  })
+
+  it('does not expose a submit route when one leg has no executable depth', () => {
+    const noDepth = { ...market('GATE'), outcomes: {
+      ...market('GATE').outcomes,
+      UP: { ...market('GATE').outcomes.UP!, askSize: '0' },
+      DOWN: { ...market('GATE').outcomes.DOWN!, askSize: '0' }
+    } }
+    const route = buildBidirectionalRoutes([noDepth, market('KALSHI')], settings, 10_100)[0]
+    expect(routeToComparison(route, settings, 10_100).status).toBe('BLOCKED')
+  })
 })
