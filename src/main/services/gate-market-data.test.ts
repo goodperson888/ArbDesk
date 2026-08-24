@@ -232,6 +232,22 @@ describe('GateMarketData', () => {
     expect(source.getLatestWindows()).toEqual([])
   })
 
+  it('reports raw versus mapped websocket pipeline health without persisting frames', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-24T15:42:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    source.ingest(JSON.stringify({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      aid: 'unmapped-gate-token', a: [['0.42', '12']], b: [['0.41', '9']]
+    } }), Date.now(), 'WebSocket', 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web',
+    'https://www.gate.com/zh/trade-events/btc-updown-15m?eventId=896002&outcome=Up')
+
+    expect(source.getStatus().message).toContain('15m 原始WS 0.0秒')
+    expect(source.getStatus().message).toContain('映射无')
+    expect(source.getStatus().message).toContain('未映射1')
+  })
+
   it('maps Gate websocket market_id tokens and removes an expired round on refresh', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-23T12:32:00.000Z'))

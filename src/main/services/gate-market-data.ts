@@ -13,6 +13,14 @@ interface GateMarketContext {
   catalogOutcomeIds?: Partial<Record<Direction, string>>
 }
 
+interface GatePipelineStats {
+  rawBookFrames: number
+  mappedBookFrames: number
+  unmappedBookFrames: number
+  lastRawBookAt?: number
+  lastMappedBookAt?: number
+}
+
 type JsonRecord = Record<string, unknown>
 
 const MAX_WALK_OBJECTS = 12_000
@@ -311,6 +319,8 @@ export class GateMarketData implements ReadOnlyVenueSource {
   private startPromise?: Promise<void>
   private capturedAccount: { openOrderCount?: number; positionCount?: number; updatedAt?: number } = {}
   private listeners = new Set<() => void>()
+  private pipelineStats = new Map<5 | 15, GatePipelineStats>()
+  private lastPipelineOnlyEmitAt = 0
 
   constructor(
     private readonly pageCapture: GatePageCaptureSource,
@@ -345,6 +355,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
     this.pageCapture.stop()
     this.contexts.clear()
     this.outcomeToMarket.clear()
+    this.pipelineStats.clear()
     this.snapshot = []
     this.emit()
   }
@@ -378,6 +389,8 @@ export class GateMarketData implements ReadOnlyVenueSource {
     }
     this.captureAccountCounts(parsed, sourceUrl, receivedAt)
     let changed = false
+    let observedPipeline = false
+    const frameDuration = transport === 'WebSocket' ? urlContext({ pageUrl, sourceUrl }).duration : undefined
     walk(parsed, (item) => {
       const market = parseGateMarketObject(item, receivedAt, { pageUrl, sourceUrl })
       if (market) {
@@ -411,6 +424,20 @@ export class GateMarketData implements ReadOnlyVenueSource {
       const possibleMarketTokenId = stringValue(firstValue(item, ['marketId', 'market_id', 'id']))
       const tokenId = explicitTokenId ?? (possibleMarketTokenId && this.outcomeToMarket.has(possibleMarketTokenId) ? possibleMarketTokenId : undefined)
       const tokenContext = tokenId ? this.outcomeToMarket.get(tokenId) : undefined
+      const hasBookFields = item.a !== undefined || item.b !== undefined || item.asks !== undefined || item.bids !== undefined
+      if (frameDuration && explicitTokenId && hasBookFields) {
+        const stats = this.pipelineStats.get(frameDuration) ?? { rawBookFrames: 0, mappedBookFrames: 0, unmappedBookFrames: 0 }
+        stats.rawBookFrames += 1
+        stats.lastRawBookAt = receivedAt
+        if (tokenContext) {
+          stats.mappedBookFrames += 1
+          stats.lastMappedBookAt = receivedAt
+        } else {
+          stats.unmappedBookFrames += 1
+        }
+        this.pipelineStats.set(frameDuration, stats)
+        observedPipeline = true
+      }
       if (tokenContext) {
         const context = this.contexts.get(tokenContext.marketId)
         const levels = askLevels(item)
@@ -447,7 +474,19 @@ export class GateMarketData implements ReadOnlyVenueSource {
       context.outcomes[quote.direction] = quote
       changed = true
     })
-    if (!changed) return
+    if (!changed) {
+      if (observedPipeline && receivedAt - this.lastPipelineOnlyEmitAt >= 500) {
+        this.lastPipelineOnlyEmitAt = receivedAt
+        this.status = {
+          ...this.status,
+          connectionState: 'CONNECTED',
+          updatedAt: receivedAt,
+          message: `Gate WebSocket 原始帧在线但尚未形成新盘口；${this.pipelineStatusMessage(Date.now())}`
+        }
+        this.emit()
+      }
+      return
+    }
     const now = Date.now()
     this.pruneExpiredContexts(now)
     this.snapshot = [...this.contexts.values()]
@@ -457,7 +496,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
       .sort((left, right) => left.startTime - right.startTime || left.durationMinutes - right.durationMinutes)
     this.status = {
       connectionState: 'CONNECTED',
-      message: `Gate ${transport}被动行情已解析；${this.snapshot.length} 个 BTC 5m/15m 双向盘口，未额外请求接口`,
+      message: `Gate ${transport}被动行情已解析；${this.snapshot.length} 个 BTC 5m/15m 双向盘口；${this.pipelineStatusMessage(now)}；未额外请求接口`,
       marketCount: this.snapshot.length,
       updatedAt: receivedAt
     }
@@ -490,6 +529,15 @@ export class GateMarketData implements ReadOnlyVenueSource {
   }
 
   private emit(): void { for (const listener of this.listeners) listener() }
+
+  private pipelineStatusMessage(now: number): string {
+    return ([5, 15] as const).map((duration) => {
+      const stats = this.pipelineStats.get(duration)
+      const rawAge = stats?.lastRawBookAt === undefined ? '无' : `${((Math.max(0, now - stats.lastRawBookAt)) / 1_000).toFixed(1)}秒`
+      const mappedAge = stats?.lastMappedBookAt === undefined ? '无' : `${((Math.max(0, now - stats.lastMappedBookAt)) / 1_000).toFixed(1)}秒`
+      return `${duration}m 原始WS ${rawAge} / 映射${mappedAge} / 未映射${stats?.unmappedBookFrames ?? 0}`
+    }).join('；')
+  }
 
   private captureAccountCounts(payload: unknown, sourceUrl: string, receivedAt: number): void {
     const path = (() => { try { return new URL(sourceUrl).pathname.toLowerCase() } catch { return '' } })()
