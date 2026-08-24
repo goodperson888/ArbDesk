@@ -22,6 +22,12 @@ interface GatePipelineStats {
   lastQuoteUpdateAt?: number
 }
 
+interface GateBookHashBinding {
+  marketId: string
+  direction: Direction
+  endTime: number
+}
+
 type JsonRecord = Record<string, unknown>
 
 const MAX_WALK_OBJECTS = 12_000
@@ -316,6 +322,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
   private status: ReadOnlyVenueStatus = { connectionState: 'NOT_CONFIGURED', message: '等待 Gate 单页面被动行情', marketCount: 0 }
   private contexts = new Map<string, GateMarketContext>()
   private outcomeToMarket = new Map<string, { marketId: string; direction: Direction }>()
+  private bookHashToMarket = new Map<string, GateBookHashBinding>()
   private snapshot: ReadOnlyWindowQuote[] = []
   private startPromise?: Promise<void>
   private capturedAccount: { openOrderCount?: number; positionCount?: number; updatedAt?: number } = {}
@@ -356,6 +363,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
     this.pageCapture.stop()
     this.contexts.clear()
     this.outcomeToMarket.clear()
+    this.bookHashToMarket.clear()
     this.pipelineStats.clear()
     this.snapshot = []
     this.emit()
@@ -395,6 +403,18 @@ export class GateMarketData implements ReadOnlyVenueSource {
     walk(parsed, (item) => {
       const market = parseGateMarketObject(item, receivedAt, { pageUrl, sourceUrl })
       if (market) {
+        const requestDirection = urlContext({ pageUrl, sourceUrl }).outcomeDirection
+        const bookHash = transport === 'REST' && /\/event-contract\/book(?:$|\?)/i.test(sourceUrl)
+          ? stringValue(firstValue(item, ['hash', 'book_hash', 'orderbook_hash']))
+          : undefined
+        if (bookHash && requestDirection) {
+          this.bookHashToMarket.set(bookHash, { marketId: market.marketId, direction: requestDirection, endTime: market.endTime })
+          while (this.bookHashToMarket.size > 128) {
+            const oldest = this.bookHashToMarket.keys().next().value
+            if (oldest) this.bookHashToMarket.delete(oldest)
+            else break
+          }
+        }
         const previous = this.contexts.get(market.marketId)
         this.contexts.set(market.marketId, previous ? {
           ...previous,
@@ -425,12 +445,21 @@ export class GateMarketData implements ReadOnlyVenueSource {
       const possibleMarketTokenId = stringValue(firstValue(item, ['marketId', 'market_id', 'id']))
       const tokenId = explicitTokenId ?? (possibleMarketTokenId && this.outcomeToMarket.has(possibleMarketTokenId) ? possibleMarketTokenId : undefined)
       const tokenContext = tokenId ? this.outcomeToMarket.get(tokenId) : undefined
+      const bookHash = stringValue(firstValue(item, ['h', 'hash', 'book_hash', 'orderbook_hash']))
+      const hashContext = bookHash ? this.bookHashToMarket.get(bookHash) : undefined
+      // The hash belongs to this exact book update and is authoritative when
+      // present; an aid cache can survive a round rotation or be recycled by
+      // Gate, so it is only a fallback when the frame has no hash.
+      const resolvedTokenContext = hashContext ?? tokenContext
+      if (explicitTokenId && hashContext) {
+        this.outcomeToMarket.set(explicitTokenId, { marketId: hashContext.marketId, direction: hashContext.direction })
+      }
       const hasBookFields = item.a !== undefined || item.b !== undefined || item.asks !== undefined || item.bids !== undefined
       if (frameDuration && explicitTokenId && hasBookFields) {
         const stats = this.pipelineStats.get(frameDuration) ?? { rawBookFrames: 0, mappedBookFrames: 0, unmappedBookFrames: 0 }
         stats.rawBookFrames += 1
         stats.lastRawBookAt = receivedAt
-        if (tokenContext) {
+        if (resolvedTokenContext) {
           stats.mappedBookFrames += 1
           stats.lastMappedBookAt = receivedAt
         } else {
@@ -439,23 +468,23 @@ export class GateMarketData implements ReadOnlyVenueSource {
         this.pipelineStats.set(frameDuration, stats)
         observedPipeline = true
       }
-      if (tokenContext) {
-        const context = this.contexts.get(tokenContext.marketId)
+      if (resolvedTokenContext) {
+        const context = this.contexts.get(resolvedTokenContext.marketId)
         const levels = askLevels(item)
         if (context && levels.length) {
-          context.outcomes[tokenContext.direction] = {
-            direction: tokenContext.direction, outcomeId: tokenId!, bestAsk: levels[0].price, askSize: levels[0].size,
+          context.outcomes[resolvedTokenContext.direction] = {
+            direction: resolvedTokenContext.direction, outcomeId: tokenId ?? explicitTokenId!, bestAsk: levels[0].price, askSize: levels[0].size,
             levels, receivedAt
           }
           if (frameDuration) this.notePipelineQuoteUpdate(frameDuration, receivedAt)
           changed = true
-        } else if (context && context.outcomes[tokenContext.direction] && isExplicitEmptyBookFrame(item)) {
+        } else if (context && context.outcomes[resolvedTokenContext.direction] && isExplicitEmptyBookFrame(item)) {
           // Gate sends incremental order-book frames with empty `a`/`b`
           // arrays when no ask level changed. They are still live updates;
           // retain the last known ask while advancing freshness so a quiet
           // side is not incorrectly marked stale after the global 8s cutoff.
-          context.outcomes[tokenContext.direction] = {
-            ...context.outcomes[tokenContext.direction]!,
+          context.outcomes[resolvedTokenContext.direction] = {
+            ...context.outcomes[resolvedTokenContext.direction]!,
             receivedAt
           }
           if (frameDuration) this.notePipelineQuoteUpdate(frameDuration, receivedAt)
@@ -464,7 +493,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
           // A zero-size ask is a deletion, not a heartbeat. Be conservative
           // when only a delta is available: remove the cached quote instead
           // of presenting an old price/depth as fresh.
-          delete context.outcomes[tokenContext.direction]
+          delete context.outcomes[resolvedTokenContext.direction]
           changed = true
         }
       }
@@ -516,6 +545,9 @@ export class GateMarketData implements ReadOnlyVenueSource {
       }
       for (const outcomeId of Object.values(context.catalogOutcomeIds ?? {})) {
         if (outcomeId && this.outcomeToMarket.get(outcomeId)?.marketId === marketId) this.outcomeToMarket.delete(outcomeId)
+      }
+      for (const [bookHash, binding] of this.bookHashToMarket) {
+        if (binding.marketId === marketId) this.bookHashToMarket.delete(bookHash)
       }
       changed = true
     }

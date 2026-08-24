@@ -249,6 +249,39 @@ describe('GateMarketData', () => {
     expect(source.getStatus().message).toContain('未映射1')
   })
 
+  it('binds websocket aid to the REST book direction through hash when catalogue IDs are absent', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-24T15:42:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageBase = 'https://www.gate.com/zh/trade-events/btc-updown-5m?eventId=896003'
+    const bookUrl = 'https://www.gate.com/apiw/v2/event-contract/book?event_id=896003&market_id=3809000&outcome='
+    const wsUrl = 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web'
+    source.ingest(JSON.stringify({ code: 0, data: {
+      hash: 'book-hash-up', asset_id: 'shared-market-asset', asks: [['0.41', '10']]
+    } }), Date.now(), 'REST', `${bookUrl}Up`, `${pageBase}&outcome=Up`)
+    source.ingest(JSON.stringify({ code: 0, data: {
+      hash: 'book-hash-down', asset_id: 'shared-market-asset', asks: [['0.59', '11']]
+    } }), Date.now(), 'REST', `${bookUrl}Down`, `${pageBase}&outcome=Down`)
+    source.ingest(JSON.stringify({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      aid: 'ws-up-token', h: 'book-hash-up', a: [['0.40', '12']], b: []
+    } }), Date.now(), 'WebSocket', wsUrl, `${pageBase}&outcome=Up`)
+    source.ingest(JSON.stringify({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      // Reuse the aid to ensure the current book hash wins over an old aid
+      // cache when Gate rotates/recycles compact token IDs.
+      aid: 'ws-up-token', h: 'book-hash-down', a: [['0.60', '13']], b: []
+    } }), Date.now(), 'WebSocket', wsUrl, `${pageBase}&outcome=Up`)
+
+    expect(source.getLatestWindows()[0]).toMatchObject({
+      marketId: '896003', durationMinutes: 5,
+      outcomes: {
+        UP: { outcomeId: 'ws-up-token', bestAsk: '0.4', askSize: '12' },
+        DOWN: { outcomeId: 'ws-up-token', bestAsk: '0.6', askSize: '13' }
+      }
+    })
+  })
+
   it('maps Gate websocket market_id tokens and removes an expired round on refresh', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-23T12:32:00.000Z'))
