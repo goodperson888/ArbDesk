@@ -27,6 +27,7 @@ const MEXC_URL = 'https://prediction.mexc.com/prediction-markets/all'
 const HUBSTUDIO_API = 'http://127.0.0.1:6873'
 const MEXC_USDT_COIN_ID = '128f589271cb4951b03e71e6323eb7be'
 const MEXC_EVENT_CACHE_MS = 10_000
+const MEXC_FRESHNESS_NOTIFY_THROTTLE_MS = 250
 const MEXC_FEE_CACHE_MS = 10 * 60_000
 const MEXC_REST_FALLBACK_MS = 10_000
 const MEXC_PREFLIGHT_QUOTE_MS = 500
@@ -184,6 +185,7 @@ export class MexcBrowserManager {
   private hubstudioApiBase?: string
   private hubstudioConnectedContainerCode?: string
   private hubstudioMonitor?: NodeJS.Timeout
+  private lastPredictionFreshnessNotifyAt = 0
   private hubstudioNetworkSession?: CDPSession
   private hubstudioSocketUrls = new Map<string, string>()
   private hubstudioPredictionConfirmedAt = 0
@@ -212,6 +214,7 @@ export class MexcBrowserManager {
   private latestFillRows?: { receivedAt: number; rows: MexcFillLogRow[] }
   private fillRowListeners = new Set<(rows: MexcFillLogRow[]) => void>()
   private latestWindows: MexcWindowQuote[] = []
+  private monitoringEnabled = true
   private marketDataListeners = new Set<() => void>()
   private instrumentedHubstudioPages = new WeakSet<Page>()
   private trackedHubstudioOrderPages = new WeakSet<Page>()
@@ -250,6 +253,31 @@ export class MexcBrowserManager {
   onMarketData(listener: () => void): () => void {
     this.marketDataListeners.add(listener)
     return () => this.marketDataListeners.delete(listener)
+  }
+
+  setMonitoringEnabled(enabled: boolean): void {
+    if (this.monitoringEnabled === enabled) return
+    this.monitoringEnabled = enabled
+    if (enabled) {
+      if (this.hubstudioPage && !this.hubstudioPage.isClosed()) {
+        this.startHubstudioMonitoring()
+        void this.syncHubstudioPredictionSubscriptions().catch(() => undefined)
+      }
+      return
+    }
+    if (this.hubstudioMonitor) clearInterval(this.hubstudioMonitor)
+    this.hubstudioMonitor = undefined
+    const page = this.hubstudioPage
+    if (page && !page.isClosed()) {
+      void page.evaluate(() => {
+        type FeedState = { stop: () => void }
+        const root = window as typeof window & { __arbDeskPredictionFeed?: FeedState }
+        root.__arbDeskPredictionFeed?.stop()
+        delete root.__arbDeskPredictionFeed
+      }).catch(() => undefined)
+    }
+    this.latestWindows = []
+    for (const listener of this.marketDataListeners) listener()
   }
 
   getLatestWindows(): MexcWindowQuote[] {
@@ -312,6 +340,7 @@ export class MexcBrowserManager {
   }
 
   async fetchActiveBtcWindows(): Promise<MexcWindowQuote[]> {
+    if (!this.monitoringEnabled) return []
     if (!this.getStatus().open) {
       if (this.mode === 'HUBSTUDIO') {
         await this.reconnectIfAvailable()
@@ -1370,6 +1399,24 @@ export class MexcBrowserManager {
 
   private applyMexcIndex(price: string, receivedAt: number): void {
     if (!(Number(price) > 0)) return
+    if (this.latestMexcIndex?.price === price) {
+      const shouldNotify = receivedAt - this.latestMexcIndex.receivedAt >= MEXC_FRESHNESS_NOTIFY_THROTTLE_MS
+      this.latestMexcIndex = { price, receivedAt }
+      if (!shouldNotify) {
+        for (const window of this.latestWindows) {
+          window.indexPrice = price
+          window.indexReceivedAt = receivedAt
+        }
+        return
+      }
+      this.latestWindows = this.latestWindows.map((window) => ({
+        ...window,
+        indexPrice: price,
+        indexReceivedAt: receivedAt
+      }))
+      for (const listener of this.marketDataListeners) listener()
+      return
+    }
     this.latestMexcIndex = { price, receivedAt }
     this.latestWindows = this.latestWindows.map((window) => ({
       ...window,
@@ -1381,6 +1428,8 @@ export class MexcBrowserManager {
 
   private confirmMexcPredictionFreshness(receivedAt: number): void {
     this.hubstudioPredictionConfirmedAt = receivedAt
+    if (receivedAt - this.lastPredictionFreshnessNotifyAt < MEXC_FRESHNESS_NOTIFY_THROTTLE_MS) return
+    this.lastPredictionFreshnessNotifyAt = receivedAt
     let changed = false
     this.latestWindows = this.latestWindows.map((window) => ({
       ...window,
@@ -2324,13 +2373,14 @@ export class MexcBrowserManager {
   }
 
   private startHubstudioMonitoring(): void {
+    if (!this.monitoringEnabled) return
     if (this.hubstudioMonitor) clearInterval(this.hubstudioMonitor)
     this.hubstudioMonitor = setInterval(() => {
       if (!this.hubstudioPage || this.hubstudioPage.isClosed()) return
       void this.followHubstudioLiveMarket().catch(() => undefined)
       void this.prunePredictionTrackerCookies().catch(() => undefined)
       void this.recoverStuckErrorPages().catch(() => undefined)
-      if (Date.now() - this.lastHubstudioAccountRefreshAt < 15_000 || this.hubstudioAccountRefreshing) return
+      if (Date.now() - this.lastHubstudioAccountRefreshAt < 30_000 || this.hubstudioAccountRefreshing) return
       this.hubstudioAccountRefreshing = true
       void this.refreshAccountBalanceState()
         .finally(() => {
@@ -2660,7 +2710,7 @@ export class MexcBrowserManager {
       url,
       authenticated: this.mode === 'HUBSTUDIO' ? this.hubstudioAuthenticated : this.embeddedAuthenticated,
       automationAvailable: open,
-      monitoring: open,
+      monitoring: this.monitoringEnabled && open,
       hubstudioContainerCode: this.mode === 'HUBSTUDIO' ? this.hubstudioContainerCode : undefined,
       debuggingPort: this.mode === 'HUBSTUDIO' ? this.hubstudioDebuggingPort : undefined,
       calibrated: this.getCalibration(),

@@ -20,7 +20,9 @@ import {
   LogOut,
   LockKeyhole,
   Network,
+  Pause,
   Plus,
+  Play,
   RefreshCw,
   RotateCcw,
   ScrollText,
@@ -28,6 +30,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
+  Square,
   Trash2,
   Volume2,
   X,
@@ -42,7 +45,12 @@ import type {
   ExecutionState,
   ExecutionPlan,
   EmergencyAccessSnapshot,
+  GateCredentialSummary,
+  GatePageCaptureStatus,
+  KalshiCredentialSummary,
+  KalshiPageCaptureStatus,
   LicenseSummary,
+  LimitlessCredentialSummary,
   ManualExecutionConditions,
   MexcBrowserMode,
   MexcBrowserStatus,
@@ -52,9 +60,14 @@ import type {
   PolymarketHedgeMode,
   PolymarketIdentityValidation,
   PolymarketSignatureType,
-  SettlementDistanceRule
+  PredictFunCredentialSummary,
+  PredictFunPageCaptureStatus,
+  SettlementDistanceRule,
+  VenuePreparationReport
 } from '../../shared/types'
+import type { MultiVenueComparison, MultiVenueComparisonStatus, MultiVenueExecutionReceipt, MultiVenueExecutionRequest, VenueCycleDataState, VenueDescriptor } from '../../shared/multi-venue'
 import { defaultSettlementDistanceRules } from '../../shared/defaults'
+import { routeDirectionLabel, stableRouteKey } from './route-display'
 
 interface SettlementRuleDraft {
   id: string
@@ -63,6 +76,32 @@ interface SettlementRuleDraft {
 }
 
 type SettingsView = 'MAIN' | 'RISK' | 'LIVE' | 'ACCOUNT'
+type OpportunitySelectionMode = 'FOLLOW_BEST' | 'LOCKED'
+type DurationFilter = 'ALL' | 5 | 15
+
+const PREPARATION_STAGE_LABELS = {
+  PASS: '通过', WARN: '待资金', BLOCKED: '阻塞', SKIPPED: '跳过'
+} as const
+
+function PreparationReportView({ report }: { report: VenuePreparationReport }): JSX.Element {
+  return <details className="credential-help preparation-report" open={!report.readyExceptFunding}>
+    <summary>{report.readyExceptFunding ? '非下单链路已完成' : '查看非下单联调阻塞项'} · 额外身份/账户请求 {report.requestCount} 次</summary>
+    <div className="preparation-report-body">
+      <p>{report.message}</p>
+      <div className="preparation-summary-grid">
+        <span>抵押资产<strong>{report.collateralBalance ?? '—'}</strong></span>
+        <span>Gas 资产<strong>{report.nativeBalance ?? '—'}</strong></span>
+        <span>持仓<strong>{report.positionCount ?? '—'}</strong></span>
+        <span>活动委托<strong>{report.openOrderCount ?? '—'}</strong></span>
+      </div>
+      {report.stages.map((stage) => <div className={`preparation-stage ${stage.status.toLowerCase()}`} key={stage.id}>
+        <span>{PREPARATION_STAGE_LABELS[stage.status]}</span>
+        <p><strong>{stage.label}</strong><small>{stage.detail} · {stage.durationMs}ms</small></p>
+      </div>)}
+      <div className="credential-notice"><ShieldCheck aria-hidden="true" /><span>安全模式已锁定：真实订单提交、撤单和链上授权交易均不可调用。</span></div>
+    </div>
+  </details>
+}
 
 const STATE_LABELS: Record<ExecutionState, string> = {
   IDLE: '已创建',
@@ -92,6 +131,10 @@ const CALIBRATION_LABELS: Record<MexcCalibrationKind, string> = {
 function money(value: string, digits = 2): string {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed.toFixed(digits) : '—'
+}
+
+function shortAddress(value: string): string {
+  return value.length > 12 ? `${value.slice(0, 6)}…${value.slice(-4)}` : value
 }
 
 function directionLabel(direction: Direction): string {
@@ -124,9 +167,63 @@ function secondsRemaining(endTime: number, now: number): string {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
 }
 
+function marketWindowLabel(startTime: number, endTime: number): string {
+  const format = (value: number): string => new Date(value).toLocaleTimeString('zh-CN', {
+    hour: '2-digit', minute: '2-digit', hour12: false
+  })
+  return `${format(startTime)}–${format(endTime)}`
+}
+
+function matchClassLabel(matchClass: MultiVenueComparison['matchClass']): string {
+  if (matchClass === 'EXACT') return '结算规则一致'
+  if (matchClass === 'COVERED') return '结算范围覆盖'
+  if (matchClass === 'CONDITIONAL') return '结算规则有差异'
+  if (matchClass === 'CORRELATED') return '仅相关市场'
+  return '市场不兼容'
+}
+
+function cycleStateLabel(state: VenueCycleDataState): string {
+  if (state === 'DEPTH_READY') return '深度'
+  if (state === 'PRICE_ONLY') return '价格'
+  if (state === 'STALE') return '过期'
+  if (state === 'NO_MARKET') return '无市场'
+  return '离线'
+}
+
 function StatusDot({ status }: { status: string }): JSX.Element {
   const connected = status === 'CONNECTED' || status === 'BROWSER_READY'
   return <span className={`status-dot ${connected ? 'connected' : 'offline'}`} />
+}
+
+function VenueHealthChip({ platform, onToggle, disabled }: { platform: VenueDescriptor; onToggle?: (platform: VenueDescriptor) => void; disabled?: boolean }): JSX.Element {
+  const statusMessage = platform.statusMessage ?? `${platform.label}连接状态`
+  if (platform.integrationState === 'PLANNED') {
+    const plannedMessage = `${platform.label} 当前暂停短周期扫描；不会主动请求市场数据`
+    return <span className="venue-health-chip planned" title={plannedMessage} data-status-message={plannedMessage}>
+      <span className="status-dot planned-dot" />
+      <strong>{platform.label}</strong>
+      <small className="venue-planned">暂停扫描</small>
+      <span className="venue-status-tooltip" role="tooltip">{plannedMessage}</span>
+    </span>
+  }
+  const monitoringEnabled = platform.monitoringEnabled !== false
+  return <span className={`venue-health-chip ${monitoringEnabled ? '' : 'monitoring-paused'}`} title={statusMessage} data-status-message={statusMessage}>
+    <StatusDot status={platform.connectionState} />
+    <strong>{platform.label}</strong>
+    {(platform.cycles ?? []).map((cycle) => <small className={`cycle-health ${cycle.state.toLowerCase()}`} key={cycle.durationMinutes}>
+      {cycle.durationMinutes}m {cycleStateLabel(cycle.state)}
+    </small>)}
+    {platform.integrationState === 'READ_ONLY' && <small className="venue-read-only">只读</small>}
+    <span className="venue-status-tooltip" role="tooltip">{statusMessage}</span>
+    {onToggle && <button
+      className="venue-monitor-toggle"
+      type="button"
+      onClick={(event) => { event.stopPropagation(); onToggle(platform) }}
+      disabled={disabled}
+      aria-label={`${monitoringEnabled ? '关闭' : '开启'}${platform.label}监控`}
+      title={`${monitoringEnabled ? '关闭' : '开启'}${platform.label}监控`}
+    >{monitoringEnabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}</button>}
+  </span>
 }
 
 function opportunityReady(opportunity: Opportunity, snapshot: AppSnapshot, now: number): boolean {
@@ -152,12 +249,17 @@ function minimumQuantityForOpportunity(opportunity: Opportunity, maxHedgeSlippag
     : Number.POSITIVE_INFINITY
 }
 
-function opportunityPotentialProfit(opportunity: Opportunity, snapshot: AppSnapshot): number {
-  const cost = Number(opportunity.allInCostPerShare)
-  if (!(cost > 0)) return Number.NEGATIVE_INFINITY
-  const capitalQuantity = Math.floor(Number(snapshot.settings.maxCapitalPerTrade) / cost * 100) / 100
-  const executableQuantity = Math.max(0, Math.min(Number(opportunity.maxQuantity), capitalQuantity))
-  return Number(opportunity.netEdgePerShare) * executableQuantity
+function comparisonStatusLabel(status: MultiVenueComparisonStatus): string {
+  if (status === 'EXECUTABLE') return '可执行'
+  if (status === 'MANUAL_EXECUTABLE') return '双腿待确认'
+  if (status === 'NO_EDGE') return '暂无利润'
+  if (status === 'STALE') return '行情过期'
+  return '已拦截'
+}
+
+function comparisonLegLabel(comparison: MultiVenueComparison, index: number): string {
+  const leg = comparison.legs[index]
+  return leg ? `${leg.venueLabel} ${leg.direction}` : '—'
 }
 
 function quoteAgeLabel(milliseconds: number): string {
@@ -496,6 +598,9 @@ function App(): JSX.Element {
 function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [snapshot, setSnapshot] = useState<AppSnapshot>()
   const [selectedId, setSelectedId] = useState<string>()
+  const [selectedComparisonId, setSelectedComparisonId] = useState<string>()
+  const [selectionMode, setSelectionMode] = useState<OpportunitySelectionMode>('FOLLOW_BEST')
+  const [durationFilter, setDurationFilter] = useState<DurationFilter>('ALL')
   const [quantity, setQuantity] = useState('50')
   const [now, setNow] = useState(Date.now())
   const [busy, setBusy] = useState(false)
@@ -514,6 +619,30 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [polyFunderAddress, setPolyFunderAddress] = useState('')
   const [polyPrivateKey, setPolyPrivateKey] = useState('')
   const [polyValidation, setPolyValidation] = useState<PolymarketIdentityValidation>()
+  const [predictFunCredentials, setPredictFunCredentials] = useState<PredictFunCredentialSummary>()
+  const [predictFunPageStatus, setPredictFunPageStatus] = useState<PredictFunPageCaptureStatus>()
+  const [predictFunApiKey, setPredictFunApiKey] = useState('')
+  const [predictFunAccountType, setPredictFunAccountType] = useState<'PREDICT_ACCOUNT' | 'EOA'>('PREDICT_ACCOUNT')
+  const [predictFunAccountAddress, setPredictFunAccountAddress] = useState('')
+  const [predictFunPrivateKey, setPredictFunPrivateKey] = useState('')
+  const [limitlessCredentials, setLimitlessCredentials] = useState<LimitlessCredentialSummary>()
+  const [limitlessTokenId, setLimitlessTokenId] = useState('')
+  const [limitlessTokenSecret, setLimitlessTokenSecret] = useState('')
+  const [limitlessPrivateKey, setLimitlessPrivateKey] = useState('')
+  const [limitlessPreparation, setLimitlessPreparation] = useState<VenuePreparationReport>()
+  const [predictFunPreparation, setPredictFunPreparation] = useState<VenuePreparationReport>()
+  const [gateCredentials, setGateCredentials] = useState<GateCredentialSummary>()
+  const [gatePageStatus, setGatePageStatus] = useState<GatePageCaptureStatus>()
+  const [gateApiKey, setGateApiKey] = useState('')
+  const [gateApiSecret, setGateApiSecret] = useState('')
+  const [gatePreparation, setGatePreparation] = useState<VenuePreparationReport>()
+  const [kalshiCredentials, setKalshiCredentials] = useState<KalshiCredentialSummary>()
+  const [kalshiPageStatus, setKalshiPageStatus] = useState<KalshiPageCaptureStatus>()
+  const [kalshiApiKeyId, setKalshiApiKeyId] = useState('')
+  const [kalshiPrivateKeyPem, setKalshiPrivateKeyPem] = useState('')
+  const [kalshiPreparation, setKalshiPreparation] = useState<VenuePreparationReport>()
+  const [multiVenueReceipt, setMultiVenueReceipt] = useState<MultiVenueExecutionReceipt>()
+  const [revealPlatformSecrets, setRevealPlatformSecrets] = useState(false)
   const [settlementRuleDrafts, setSettlementRuleDrafts] = useState<SettlementRuleDraft[]>([])
   const [settlementRuleError, setSettlementRuleError] = useState<string>()
   const [historyOpen, setHistoryOpen] = useState(false)
@@ -538,20 +667,19 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [hedgeModeDraft, setHedgeModeDraft] = useState<PolymarketHedgeMode>('PROTECTED_MARKET')
   const previousCanExecuteRef = useRef(false)
   const soundCooldownRef = useRef(new Map<string, number>())
-  const manualSelectionUntilRef = useRef(0)
 
   useEffect(() => {
     void window.arbApp.getSnapshot().then((value) => {
       setSnapshot(value)
-      setSelectedId(value.opportunities[0]?.id)
       void window.arbApp.testPolymarketConnection().catch(() => undefined)
       void window.arbApp.refreshOpportunities().catch(() => undefined)
     })
     const unsubscribe = window.arbApp.onSnapshot(setSnapshot)
-    const clock = window.setInterval(() => setNow(Date.now()), 500)
-    // Market depth arrives through backend streams; the five-second refresh is
-    // a full-book audit for quiet markets and a fallback for broken streams.
-    const refresh = window.setInterval(() => void window.arbApp.refreshOpportunities().catch(() => undefined), 5_000)
+    const clock = window.setInterval(() => setNow(Date.now()), 1_000)
+    // MEXC/Polymarket/Gate/Predict streams update the snapshot directly.
+    // A 15-second REST audit is enough for quiet markets and avoids keeping all
+    // platform pages and Electron IPC calls hot every five seconds.
+    const refresh = window.setInterval(() => void window.arbApp.refreshOpportunities().catch(() => undefined), 15_000)
     return () => {
       unsubscribe()
       window.clearInterval(clock)
@@ -583,39 +711,83 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       minimumBps: rule.minimumBps
     })))
     setSettlementRuleError(undefined)
-    const refreshStatus = (): void => void window.arbApp.getMexcStatus().then(setMexcStatus)
+    const refreshStatus = (): void => {
+      void window.arbApp.getMexcStatus().then(setMexcStatus)
+      void window.arbApp.getPredictFunPageCaptureStatus().then(setPredictFunPageStatus)
+      void window.arbApp.getGatePageCaptureStatus().then(setGatePageStatus)
+      void window.arbApp.getKalshiPageCaptureStatus().then(setKalshiPageStatus)
+    }
     refreshStatus()
     void window.arbApp.getPolymarketCredentialSummary().then((summary) => {
       setPolymarketCredentials(summary)
       setPolySignatureType(summary.signatureType ?? 0)
       setPolyFunderAddress(summary.funderAddress ?? '')
     })
-    const statusTimer = window.setInterval(refreshStatus, 2_000)
+    void window.arbApp.getPredictFunCredentialSummary().then((summary) => {
+      setPredictFunCredentials(summary)
+      setPredictFunAccountType(summary.accountType ?? 'PREDICT_ACCOUNT')
+      setPredictFunAccountAddress(summary.accountAddress ?? '')
+    })
+    void window.arbApp.getLimitlessCredentialSummary().then((summary) => {
+      setLimitlessCredentials(summary)
+    })
+    void window.arbApp.getGateCredentialSummary().then(setGateCredentials)
+    void window.arbApp.getKalshiCredentialSummary().then(setKalshiCredentials)
+    const statusTimer = window.setInterval(refreshStatus, 5_000)
     return () => window.clearInterval(statusTimer)
   }, [settingsOpen, snapshot?.settings.hubstudioContainerCode])
 
   const selected = useMemo(
-    () => snapshot?.opportunities.find((opportunity) => opportunity.id === selectedId) ?? snapshot?.opportunities[0],
+    () => snapshot?.opportunities.find((opportunity) => opportunity.id === selectedId),
     [selectedId, snapshot]
   )
-  const readyOpportunities = useMemo(() => snapshot
-    ? snapshot.opportunities.filter((opportunity) => opportunityReady(opportunity, snapshot, now))
-    : [], [now, snapshot])
-  const bestOpportunity = useMemo(() => snapshot
-    ? [...readyOpportunities].sort((left, right) =>
-      opportunityPotentialProfit(right, snapshot) - opportunityPotentialProfit(left, snapshot) ||
-      Number(right.netEdgePerShare) - Number(left.netEdgePerShare)
-    )[0]
-    : undefined, [readyOpportunities, snapshot])
-  const readyOpportunityCount = readyOpportunities.length
-  const orderedOpportunities = useMemo(() => snapshot
-    ? [...snapshot.opportunities].sort((left, right) =>
-      left.durationMinutes - right.durationMinutes ||
-      Number(left.mexcDirection === 'DOWN') - Number(right.mexcDirection === 'DOWN') ||
-      left.startTime - right.startTime ||
-      String(left.id).localeCompare(String(right.id))
+  const selectedComparison = useMemo(
+    () => snapshot?.multiVenueBoard.comparisons.find((comparison) => comparison.id === selectedComparisonId),
+    [selectedComparisonId, snapshot?.multiVenueBoard.comparisons]
+  )
+  const selectedKalshiLeg = useMemo(
+    () => selectedComparison?.legs.find((leg) => leg.venueId === 'KALSHI'),
+    [selectedComparison]
+  )
+  const opportunityById = useMemo(() => new Map(
+    snapshot?.opportunities.map((opportunity) => [opportunity.id, opportunity]) ?? []
+  ), [snapshot?.opportunities])
+  const visibleComparisons = useMemo(() => snapshot
+    ? snapshot.multiVenueBoard.comparisons.filter((comparison) =>
+      durationFilter === 'ALL'
+        ? comparison.durationMinutes === 5 || comparison.durationMinutes === 15
+        : comparison.durationMinutes === durationFilter
     )
-    : [], [snapshot])
+    : [], [durationFilter, snapshot])
+  const readyComparisons = useMemo(() => snapshot
+    ? visibleComparisons.filter((comparison) => {
+      const legacy = comparison.legacyOpportunityId
+        ? opportunityById.get(comparison.legacyOpportunityId)
+        : undefined
+      return comparison.status === 'EXECUTABLE' && Boolean(legacy && opportunityReady(legacy, snapshot, now))
+    })
+    : [], [now, opportunityById, snapshot, visibleComparisons])
+  const bestComparison = useMemo(() => [...readyComparisons].sort((left, right) =>
+    Number(snapshot?.settings.autoOpenEnabled ? right.autoOrderPotentialProfit : right.potentialProfit) -
+      Number(snapshot?.settings.autoOpenEnabled ? left.autoOrderPotentialProfit : left.potentialProfit) ||
+    Number(right.netEdgePerShare) - Number(left.netEdgePerShare) ||
+    left.fixedSortKey.localeCompare(right.fixedSortKey)
+  )[0], [readyComparisons, snapshot?.settings.autoOpenEnabled])
+  const bestOpportunity = bestComparison?.legacyOpportunityId
+    ? opportunityById.get(bestComparison.legacyOpportunityId)
+    : undefined
+  const readyOpportunityCount = readyComparisons.length
+  const orderedComparisonRows = useMemo(() => visibleComparisons
+    .map((comparison) => ({
+      comparison,
+      opportunity: comparison.legacyOpportunityId
+        ? opportunityById.get(comparison.legacyOpportunityId)
+        : undefined
+    })), [opportunityById, visibleComparisons])
+  const integratedPlatformCount = snapshot?.multiVenueBoard.platforms.filter((platform) => platform.integrationState !== 'PLANNED').length ?? 0
+  const displayedProfit = (comparison: MultiVenueComparison): string => snapshot?.settings.autoOpenEnabled
+    ? comparison.autoOrderPotentialProfit
+    : comparison.potentialProfit
 
   useEffect(() => {
     if (!selected?.id || !(Number(quantity) > 0)) {
@@ -754,19 +926,20 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
 
   useEffect(() => {
     const bestId = bestOpportunity?.id
-    if (!bestId || bestId === selected?.id || busy || !executionSessionIdle) return
-    const delay = Math.max(1_000, manualSelectionUntilRef.current - Date.now() + 1_000)
-    let timer = 0
-    const selectWhenIdle = (): void => {
-      if ((document.activeElement as HTMLElement | null)?.id === 'quantity') {
-        timer = window.setTimeout(selectWhenIdle, 1_000)
-        return
-      }
-      setSelectedId(bestId)
-    }
-    timer = window.setTimeout(selectWhenIdle, delay)
-    return () => window.clearTimeout(timer)
-  }, [bestOpportunity?.id, busy, executionSessionIdle, selected?.id])
+    if (selectionMode !== 'FOLLOW_BEST' || !bestId || bestId === selected?.id || busy || !executionSessionIdle) return
+    setSelectedId(bestId)
+    if (bestComparison) setSelectedComparisonId(bestComparison.id)
+  }, [bestComparison, bestOpportunity?.id, busy, executionSessionIdle, selected?.id, selectionMode])
+
+  useEffect(() => {
+    if (!snapshot) return
+    const selectedVisible = orderedComparisonRows.some((row) => row.comparison.id === selectedComparisonId)
+    if (selectedComparisonId && selectedVisible) return
+    const fallback = bestComparison ?? orderedComparisonRows[0]?.comparison
+    setSelectedComparisonId(fallback?.id)
+    setSelectedId(fallback?.legacyOpportunityId)
+    if (selectionMode === 'LOCKED') setSelectionMode('FOLLOW_BEST')
+  }, [bestComparison, orderedComparisonRows, selectedComparisonId, selectionMode, snapshot])
 
   useEffect(() => {
     const becameExecutable = canExecute && !previousCanExecuteRef.current
@@ -805,6 +978,17 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     }
   }
 
+  async function toggleVenueMonitoring(platform: VenueDescriptor): Promise<void> {
+    const nextEnabled = platform.monitoringEnabled === false
+    await run(
+      () => window.arbApp.setVenueMonitoring(platform.id, nextEnabled).then((nextSnapshot) => {
+        setSnapshot(nextSnapshot)
+        return nextSnapshot
+      }),
+      `${platform.label}监控已${nextEnabled ? '开启' : '关闭'}`
+    )
+  }
+
   async function copyLicenseMachineCode(): Promise<void> {
     try {
       await navigator.clipboard.writeText(license.machineCode)
@@ -814,9 +998,23 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     }
   }
 
-  function selectOpportunity(id: string): void {
-    manualSelectionUntilRef.current = Date.now() + 15_000
-    setSelectedId(id)
+  function selectComparison(comparison: MultiVenueComparison): void {
+    setSelectionMode('LOCKED')
+    setSelectedComparisonId(comparison.id)
+    setSelectedId(comparison.legacyOpportunityId)
+  }
+
+  function followBestOpportunity(): void {
+    setSelectionMode('FOLLOW_BEST')
+    if (bestComparison) {
+      setSelectedComparisonId(bestComparison.id)
+      setSelectedId(bestComparison.legacyOpportunityId)
+    }
+  }
+
+  function changeDurationFilter(duration: DurationFilter): void {
+    setDurationFilter(duration)
+    setSelectionMode('FOLLOW_BEST')
   }
 
   async function execute(): Promise<void> {
@@ -928,6 +1126,171 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     setPolyValidation(undefined)
   }
 
+  async function savePredictFunCredentials(): Promise<void> {
+    const result = await run(
+      () => window.arbApp.updatePredictFunCredentials({
+        apiKey: predictFunApiKey || undefined,
+        accountType: predictFunAccountType,
+        accountAddress: predictFunAccountAddress || undefined,
+        signerPrivateKey: predictFunPrivateKey || undefined
+      }),
+      'Predict.fun 凭据已加密保存，行情正在刷新'
+    )
+    if (!result) return
+    setPredictFunCredentials(result)
+    setPredictFunApiKey('')
+    setPredictFunPrivateKey('')
+    setPredictFunPreparation(undefined)
+  }
+
+  async function openPredictFunPage(): Promise<void> {
+    await run(
+      () => window.arbApp.openPredictFunPage(),
+      'Predict.fun 单页面已打开；需要释放资源时点击“停止监听”'
+    )
+    setPredictFunPageStatus(await window.arbApp.getPredictFunPageCaptureStatus())
+  }
+
+  async function stopPredictFunPage(): Promise<void> {
+    await run(() => window.arbApp.stopPredictFunPage(), 'Predict.fun 监听已停止，页面资源已释放')
+    setPredictFunPageStatus(await window.arbApp.getPredictFunPageCaptureStatus())
+  }
+
+  async function saveLimitlessCredentials(): Promise<void> {
+    const result = await run(
+      () => window.arbApp.updateLimitlessCredentials({
+        tokenId: limitlessTokenId || undefined,
+        tokenSecret: limitlessTokenSecret || undefined,
+        walletPrivateKey: limitlessPrivateKey || undefined
+      }),
+      'Limitless 交易凭据已加密保存'
+    )
+    if (!result) return
+    setLimitlessCredentials(result)
+    setLimitlessTokenId('')
+    setLimitlessTokenSecret('')
+    setLimitlessPrivateKey('')
+    setLimitlessPreparation(undefined)
+  }
+
+  async function prepareLimitlessWithoutSubmitting(): Promise<void> {
+    const result = await run(
+      () => window.arbApp.prepareLimitlessWithoutSubmitting(),
+      'Limitless 非下单联调完成；没有发送真实订单'
+    )
+    if (result) setLimitlessPreparation(result)
+  }
+
+  async function preparePredictFunWithoutSubmitting(): Promise<void> {
+    const result = await run(
+      () => window.arbApp.preparePredictFunWithoutSubmitting(),
+      'Predict.fun 非下单联调完成；没有发送真实订单'
+    )
+    if (result) setPredictFunPreparation(result)
+  }
+
+  async function saveGateCredentials(): Promise<void> {
+    const result = await run(
+      () => window.arbApp.updateGateCredentials({ apiKey: gateApiKey || undefined, apiSecret: gateApiSecret || undefined }),
+      'Gate APIv4 只读凭据已加密保存'
+    )
+    if (!result) return
+    setGateCredentials(result)
+    setGateApiKey('')
+    setGateApiSecret('')
+    setGatePreparation(undefined)
+  }
+
+  async function openGatePage(): Promise<void> {
+    await run(() => window.arbApp.openGatePage(), 'Gate 事件合约单页面已打开；需要释放资源时点击“停止监听”')
+    setGatePageStatus(await window.arbApp.getGatePageCaptureStatus())
+  }
+
+  async function stopGatePage(): Promise<void> {
+    await run(() => window.arbApp.stopGatePage(), 'Gate 监听已停止，页面资源已释放')
+    setGatePageStatus(await window.arbApp.getGatePageCaptureStatus())
+  }
+
+  async function prepareGateWithoutSubmitting(): Promise<void> {
+    const result = await run(() => window.arbApp.prepareGateWithoutSubmitting(), 'Gate 非下单联调完成；没有发送真实订单')
+    if (result) setGatePreparation(result)
+  }
+
+  async function saveKalshiCredentials(): Promise<void> {
+    const result = await run(
+      () => window.arbApp.updateKalshiCredentials({ apiKeyId: kalshiApiKeyId || undefined, privateKeyPem: kalshiPrivateKeyPem || undefined }),
+      'Kalshi API 身份已加密保存；只读联调可用'
+    )
+    if (!result) return
+    setKalshiCredentials(result)
+    setKalshiApiKeyId('')
+    setKalshiPrivateKeyPem('')
+    setKalshiPreparation(undefined)
+  }
+
+  async function openKalshiPage(): Promise<void> {
+    await run(() => window.arbApp.openKalshiPage(), 'Kalshi 单页面已打开；后台继续被动监听网页行情')
+    setKalshiPageStatus(await window.arbApp.getKalshiPageCaptureStatus())
+  }
+
+  async function stopKalshiPage(): Promise<void> {
+    await run(() => window.arbApp.stopKalshiPage(), 'Kalshi 监听已停止，页面资源已释放')
+    setKalshiPageStatus(await window.arbApp.getKalshiPageCaptureStatus())
+  }
+
+  async function prepareKalshiWithoutSubmitting(): Promise<void> {
+    const result = await run(() => window.arbApp.prepareKalshiWithoutSubmitting(), 'Kalshi 非下单联调完成；没有发送真实订单')
+    if (result) setKalshiPreparation(result)
+  }
+
+  async function executeSelectedMultiVenue(): Promise<void> {
+    if (!snapshot || !selectedComparison || !selectedKalshiLeg?.marketId) return
+    const otherLeg = selectedComparison.legs.find((leg) => leg.venueId !== 'KALSHI')
+    if (!otherLeg || (otherLeg.venueId !== 'MEXC' && otherLeg.venueId !== 'POLYMARKET')) {
+      setMessage('当前机会没有可真实执行的第二平台；仍是观察机会')
+      return
+    }
+    if (!kalshiCredentials?.configured) {
+      setMessage('请先在设置中保存 Kalshi API Key ID 与 RSA 私钥')
+      return
+    }
+    if (!snapshot.settings.kalshiLiveEnabled || snapshot.settings.mode !== 'ASSISTED') {
+      setMessage('请先切换到人工监督模式，并开启 Kalshi 实盘开关')
+      return
+    }
+    if (otherLeg.venueId === 'MEXC' && !snapshot.settings.mexcAutomationEnabled) {
+      setMessage('MEXC↔Kalshi 双腿执行需要开启 MEXC 自动提交')
+      return
+    }
+    if (otherLeg.venueId === 'POLYMARKET' && !snapshot.settings.polymarketLiveEnabled) {
+      setMessage('Polymarket↔Kalshi 双腿执行需要开启 Polymarket 实盘对冲')
+      return
+    }
+    const quantity = Math.floor(Math.min(
+      Number(selectedComparison.executableQuantity),
+      Number(selectedKalshiLeg.availableQuantity),
+      Number(otherLeg.availableQuantity)
+    ) * 100) / 100
+    if (!Number.isFinite(quantity) || quantity < 1) {
+      setMessage('两边盘口不足 1 份，未发送双腿订单')
+      return
+    }
+    const confirmation = window.confirm(
+      `即将执行双腿真实订单（不是原子交易）：\n\n${otherLeg.venueLabel} ${otherLeg.direction} ${quantity.toFixed(2)}份 @ ${Number(otherLeg.price).toFixed(4)}\n→ 成交回读后再发送\nKalshi ${selectedKalshiLeg.direction} ${quantity.toFixed(2)}份 @ ${Number(selectedKalshiLeg.price).toFixed(4)}\n\n如果第一腿成交、第二腿失败，会进入恢复态，不会自动重复下单。确认继续？`
+    )
+    if (!confirmation) return
+    const request: MultiVenueExecutionRequest = {
+      comparisonId: selectedComparison.id,
+      quantity: quantity.toFixed(2),
+      startTime: selectedComparison.startTime,
+      endTime: selectedComparison.endTime,
+      confirmed: true,
+      legs: selectedComparison.legs as unknown as MultiVenueExecutionRequest['legs']
+    }
+    const result = await run(() => window.arbApp.executeMultiVenue(request), '双腿执行已完成或进入恢复态；请查看两边订单号')
+    if (result) setMultiVenueReceipt(result)
+  }
+
   async function validatePolymarketIdentity(): Promise<void> {
     const result = await run(() => window.arbApp.validatePolymarketIdentity(selected?.polymarketTokenId))
     if (!result) return
@@ -948,6 +1311,21 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       if (!confirmed) return
     }
     const result = await run(() => window.arbApp.updateSettings({ polymarketLiveEnabled: enabling }))
+    if (result) setSnapshot({ ...snapshot, settings: result })
+  }
+
+  async function toggleKalshiLive(): Promise<void> {
+    if (!snapshot) return
+    const enabling = !snapshot.settings.kalshiLiveEnabled
+    if (enabling) {
+      if (!kalshiCredentials?.configured) {
+      setMessage('请先保存 Kalshi API Key ID 与 RSA 私钥')
+        return
+      }
+      const confirmed = window.confirm('启用后，机会面板中的“双腿执行”按钮才会生效。系统会先成交 MEXC 或 Polymarket，再向 Kalshi 发送实际成交数量；不会自动下单。确认开启？')
+      if (!confirmed) return
+    }
+    const result = await run(() => window.arbApp.updateSettings({ kalshiLiveEnabled: enabling }))
     if (result) setSnapshot({ ...snapshot, settings: result })
   }
 
@@ -1276,10 +1654,14 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
           <strong>ArbDesk</strong>
         </div>
         <div className="connection-strip" aria-label="连接状态">
-          <span title={snapshot.connectionDetails.mexc}><StatusDot status={snapshot.connection.mexc} />MEXC {snapshot.connection.mexc === 'BROWSER_READY' ? (snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? 'Hubstudio' : '内嵌') : '未连接'}</span>
-          <span title={snapshot.connectionDetails.polymarket}><StatusDot status={snapshot.connection.polymarket} />Polymarket {snapshot.connection.polymarket === 'CONNECTED' ? '在线' : '断开'}</span>
+          {snapshot.multiVenueBoard.platforms
+            .map((platform) => <VenueHealthChip key={platform.id} platform={platform} onToggle={(venue) => void toggleVenueMonitoring(venue)} disabled={busy} />)}
         </div>
         <div className="top-actions">
+          {snapshot.settings.autoOpenEnabled && <button className="auto-armed-badge" type="button" onClick={() => void toggleAutoOpen()} disabled={busy} title="自动开单已布防，点击立即停止">
+            <Bot aria-hidden="true" />
+            <span><strong>自动已布防</strong><small>{snapshot.settings.autoOpenQuantityMode === 'FIXED' ? `${snapshot.settings.autoOpenFixedQuantity}份` : `最大量${snapshot.settings.autoOpenMaxQuantityPct}%`} · 点击停止</small></span>
+          </button>}
           <div className={`mode-badge ${snapshot.settings.mode.toLowerCase()}`}>
             {snapshot.settings.mode === 'SIMULATION' ? '模拟模式' : snapshot.settings.mode === 'ASSISTED' ? '人工监督' : '实盘'}
           </div>
@@ -1302,41 +1684,84 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       </button>
 
       <main className="workspace">
+        {snapshot.multiVenueExecutionSessions.length > 0 && <section className="recovery-sessions-banner" role="alert">
+          <ShieldAlert aria-hidden="true" />
+          <span><strong>{snapshot.multiVenueExecutionSessions.length} 条跨平台执行会话需要恢复核对</strong><small>软件不会自动重发未知订单；请打开执行日志核对两边实际成交后再标记已恢复。</small></span>
+        </section>}
         <section className="main-column">
           <section className="panel opportunities-panel">
-            <div className="panel-header">
-              <div className="scanner-title"><h1>BTC 跨平台机会</h1><span>{snapshot.opportunities.length}条 · {readyOpportunityCount}条可执行</span></div>
-              <button className="icon-button scanner-refresh" onClick={() => void run(() => window.arbApp.refreshOpportunities())} disabled={busy} aria-label="刷新套利机会" title="刷新套利机会">
-                <RefreshCw className={busy ? 'spin' : ''} aria-hidden="true" />
-              </button>
+            <div className="panel-header opportunities-header">
+              <div className="scanner-title"><h1>多平台套利机会</h1><span>{integratedPlatformCount}个平台 · {visibleComparisons.length}组对比 · {readyOpportunityCount}条可执行</span></div>
+              <div className="opportunity-toolbar">
+                <div className="compact-segments" role="group" aria-label="机会周期筛选">
+                  {(['ALL', 5, 15] as const).map((duration) => (
+                    <button key={duration} type="button" aria-pressed={durationFilter === duration} onClick={() => changeDurationFilter(duration)}>
+                      {duration === 'ALL' ? '全部' : `${duration}m`}
+                    </button>
+                  ))}
+                </div>
+                <div className="compact-segments selection-mode-control" role="group" aria-label="机会选择方式">
+                  <button type="button" aria-pressed={selectionMode === 'FOLLOW_BEST'} onClick={followBestOpportunity} title="自动选中当前可执行净利润最大的机会">
+                    <Zap aria-hidden="true" />跟随最优
+                  </button>
+                  <button type="button" aria-pressed={selectionMode === 'LOCKED'} onClick={() => setSelectionMode('LOCKED')} title="保持当前选择，不随最优机会变化">
+                    <LockKeyhole aria-hidden="true" />锁定当前
+                  </button>
+                </div>
+                <button className="icon-button scanner-refresh" onClick={() => void run(() => window.arbApp.refreshOpportunities())} disabled={busy} aria-label="刷新套利机会" title="刷新套利机会">
+                  <RefreshCw className={busy ? 'spin' : ''} aria-hidden="true" />
+                </button>
+              </div>
+            </div>
+            <div className="best-opportunity-strip" role="status" aria-live="polite">
+              {bestComparison ? (
+                <>
+                  <span className="best-opportunity-label">系统推荐</span>
+                  <strong>{comparisonLegLabel(bestComparison, 0)} + {comparisonLegLabel(bestComparison, 1)}</strong>
+                  <span>{bestComparison.durationMinutes}m</span>
+                  <span>可执行 {money(bestComparison.executableQuantity, 2)}份</span>
+                  <span className="positive-value">预计 +{money(displayedProfit(bestComparison), 2)} USDT</span>
+                  <small>{selectionMode === 'FOLLOW_BEST' ? '下单面板正在跟随最优' : '当前已手动锁定，推荐仅作提示'}</small>
+                </>
+              ) : <span className="best-opportunity-empty">当前没有通过全部风控的可执行机会</span>}
             </div>
             <div className="table-wrap">
               <table>
                 <thead>
-                  <tr><th>周期</th><th>MEXC</th><th>Polymarket</th><th>净边际</th><th title="两边盘口深度允许的对齐数量，不含账户余额和收益门槛">盘口量</th><th>剩余</th><th title="每份包含两边价格、手续费和风险缓冲后的总成本">全部成本</th></tr>
+                  <tr><th>标的/窗口</th><th>路线/方向</th><th>第一腿</th><th>第二腿</th><th>净边际/份</th><th title="实盘路线显示可执行量；只读路线仅显示已确认的参考深度">数量/深度</th><th>预计净利润</th><th>剩余</th><th>状态</th></tr>
                 </thead>
                 <tbody>
-                  {snapshot.opportunities.length === 0 && (
-                    <tr><td colSpan={7}><div className="empty-state">暂无真实跨平台报价。{snapshot.connectionDetails.polymarket}</div></td></tr>
+                  {orderedComparisonRows.length === 0 && (
+                    <tr><td colSpan={9}><div className="empty-state">当前筛选下暂无真实跨平台报价。{snapshot.connectionDetails.polymarket}</div></td></tr>
                   )}
-                  {orderedOpportunities.map((opportunity) => {
-                    const positive = opportunityReady(opportunity, snapshot, now)
-                    const isSelected = opportunity.id === selected?.id
-                    const isBest = opportunity.id === bestOpportunity?.id
+                  {orderedComparisonRows.map(({ comparison, opportunity }) => {
+                    const positive = Boolean(opportunity && opportunityReady(opportunity, snapshot, now))
+                    const isSelected = comparison.id === selectedComparison?.id
+                    const isBest = comparison.id === bestComparison?.id
+                    const firstLeg = comparison.legs[0]
+                    const secondLeg = comparison.legs[1]
                     return (
-                      <tr key={opportunity.id} className={['opportunity-row', positive ? 'ready' : '', isBest ? 'best' : '', isSelected ? 'selected' : ''].filter(Boolean).join(' ')} onClick={() => selectOpportunity(opportunity.id)} tabIndex={0} onKeyDown={(event) => event.key === 'Enter' && selectOpportunity(opportunity.id)}>
-                        <td><span className="duration-pill">{opportunity.durationMinutes}m</span>{isBest && <span className="best-badge">最佳</span>}</td>
-                        <td><span className="quote-inline"><Direction direction={opportunity.mexcDirection} /><span className="mono">{Number(opportunity.mexcAvailableQuantity) > 0 ? money(opportunity.mexcPrice, 4) : '--'}</span></span></td>
-                        <td><span className="quote-inline"><Direction direction={opportunity.polymarketDirection} /><span className="mono">{Number(opportunity.polymarketAvailableQuantity) > 0 ? money(opportunity.polymarketPrice, 4) : '--'}</span></span></td>
-                        <td><span className="edge-cell" title={opportunity.feeVerificationBlocked ? '费用待校验' : opportunity.settlementRiskBlocked ? '风控拦截' : positive ? '当前可执行' : '未通过全部执行门槛'}>
+                      <tr key={stableRouteKey(comparison)} className={['opportunity-row', positive ? 'ready' : '', isBest ? 'best' : '', isSelected ? 'selected' : '', opportunity ? '' : comparison.status === 'MANUAL_EXECUTABLE' ? 'manual-executable' : 'read-only'].filter(Boolean).join(' ')} onClick={() => selectComparison(comparison)} tabIndex={0} aria-selected={isSelected} onKeyDown={(event) => {
+                        if (event.key !== 'Enter' && event.key !== ' ') return
+                        event.preventDefault()
+                        selectComparison(comparison)
+                      }}>
+                        <td><span className="market-window-cell"><span><span className="duration-pill">{comparison.durationMinutes}m</span>{isBest && <span className="best-badge">最佳</span>}{comparison.edgeKind === 'GROSS_ONLY' && <span className="best-badge">只读</span>}</span><small>{comparison.asset.replace('/USD', '')} · {marketWindowLabel(comparison.startTime, comparison.endTime)}</small></span></td>
+                        <td><span className="route-direction-cell"><strong>{routeDirectionLabel(comparison)}</strong><small>{comparison.executionProvider === 'LEGACY_MEXC_POLY' ? '成熟兼容路线' : comparison.status === 'MANUAL_EXECUTABLE' ? '双腿待确认' : '观察路线'}</small></span></td>
+                        <td><span className="venue-leg"><strong>{firstLeg?.venueLabel ?? '—'}</strong><span className="quote-inline">{firstLeg && <Direction direction={firstLeg.direction} />}<span className="mono">{firstLeg && Number(firstLeg.price) > 0 ? money(firstLeg.price, 4) : '--'}</span>{firstLeg && Number(firstLeg.price) > 0 && !(Number(firstLeg.availableQuantity) > 0) && <span className="price-only-badge" title="已拿到最优价格，真实盘口深度尚未捕获">仅价</span>}</span></span></td>
+                        <td><span className="venue-leg"><strong>{secondLeg?.venueLabel ?? '—'}</strong><span className="quote-inline">{secondLeg && <Direction direction={secondLeg.direction} />}<span className="mono">{secondLeg && Number(secondLeg.price) > 0 ? money(secondLeg.price, 4) : '--'}</span>{secondLeg && Number(secondLeg.price) > 0 && !(Number(secondLeg.availableQuantity) > 0) && <span className="price-only-badge" title="已拿到最优价格，真实盘口深度尚未捕获">仅价</span>}</span></span></td>
+                        <td><span className="edge-cell" title={comparison.edgeKind === 'GROSS_ONLY' ? comparison.blockReasons.join('；') : opportunity?.feeVerificationBlocked ? '费用待校验' : opportunity?.settlementRiskBlocked ? '风控拦截' : positive ? '当前可执行' : '未通过全部执行门槛'}>
                           <span className={positive ? 'positive-value' : 'negative-value'}>
-                            {opportunity.feeVerificationBlocked ? '—' : `${positive ? '+' : ''}${money(opportunity.netEdgePerShare, 4)}`}
+                            {comparison.edgeKind === 'GROSS_ONLY' ? `参考 ${Number(comparison.netEdgePerShare) >= 0 ? '+' : ''}${money(comparison.netEdgePerShare, 4)}` : opportunity?.feeVerificationBlocked ? '—' : `${positive ? '+' : ''}${money(comparison.netEdgePerShare, 4)}`}
                           </span>
                           {!positive && <AlertTriangle aria-hidden="true" />}
                         </span></td>
-                        <td className="mono">{money(opportunity.maxQuantity, 0)}</td>
-                        <td className="mono countdown">{secondsRemaining(opportunity.endTime, now)}</td>
-                        <td className="mono all-in-cost-cell">{opportunity.feeVerificationBlocked ? '—' : money(opportunity.allInCostPerShare, 2)}</td>
+                        <td className="mono">{comparison.edgeKind === 'GROSS_ONLY'
+                          ? Number(comparison.executableQuantity) > 0 ? `参考 ${money(comparison.executableQuantity, 2)}` : '—'
+                          : money(comparison.executableQuantity, 2)}</td>
+                        <td><span className={positive ? 'positive-value' : 'negative-value'}>{comparison.edgeKind === 'GROSS_ONLY' ? '—' : `${positive ? '+' : ''}${money(displayedProfit(comparison), 2)}`}</span></td>
+                        <td className="mono countdown">{secondsRemaining(comparison.endTime, now)}</td>
+                        <td><span className={`comparison-status ${comparison.status.toLowerCase()}`} title={comparison.blockReasons.join('；') || '当前通过展示层机会检查'}>{comparison.edgeKind === 'GROSS_ONLY' ? comparison.status === 'MANUAL_EXECUTABLE' ? '双腿待确认' : '只读观察' : comparisonStatusLabel(comparison.status)}</span></td>
                       </tr>
                     )
                   })}
@@ -1348,73 +1773,106 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
         </section>
 
         <aside className="order-ticket panel" aria-label="执行面板">
-          {selected ? (
+          {selectedComparison ? (
             <>
-              <label className="field-label" htmlFor="quantity">对齐份额</label>
-              <div className="quantity-control">
-                <input id="quantity" value={quantity} inputMode="decimal" onChange={(event) => setQuantity(event.target.value)} />
-                <button onClick={() => snapshot.settings.allowUnprofitableTestTrade
-                  ? setQuantity(minimumAlignedQuantity.toFixed(2))
-                  : void setMaximumQuantity()} disabled={busy}>
-                  {snapshot.settings.allowUnprofitableTestTrade ? '最小' : busy ? '计算中' : '最大'}
-                </button>
-              </div>
+              <section className="ticket-market-summary">
+                <div className="ticket-summary-heading">
+                  <span><span className="duration-pill">{selectedComparison.durationMinutes}m</span><span className={`comparison-status ${selectedComparison.status.toLowerCase()}`}>{selectedComparison.edgeKind === 'GROSS_ONLY' ? selectedComparison.status === 'MANUAL_EXECUTABLE' ? '双腿待确认' : '只读观察' : comparisonStatusLabel(selectedComparison.status)}</span></span>
+                  <small>{matchClassLabel(selectedComparison.matchClass)}</small>
+                </div>
+                <h2>{selectedComparison.asset.replace('/USD', '')} · {marketWindowLabel(selectedComparison.startTime, selectedComparison.endTime)}</h2>
+                <div className="ticket-leg-grid">
+                  {selectedComparison.legs.map((leg, index) => <div className="ticket-leg-card" key={`${leg.venueId}:${leg.direction}:${index}`}>
+                    <span><strong>{index + 1}. {leg.venueLabel}</strong><Direction direction={leg.direction} /></span>
+                    <b className="mono">{Number(leg.price) > 0 ? money(leg.price, 4) : '—'}</b>
+                    <small>{Number(leg.availableQuantity) > 0 ? `深度 ${money(leg.availableQuantity, 2)}份` : '仅有价格 · 深度待捕获'} · {quoteAgeLabel(leg.quoteAgeMs)}</small>
+                  </div>)}
+                </div>
+                {selectedKalshiLeg && <div className="kalshi-live-ticket">
+                  <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>这是双腿执行入口：先提交 {selectedComparison.legs.find((leg) => leg.venueId !== 'KALSHI')?.venueLabel ?? '第一平台'}，读取实际成交后再提交 Kalshi FOK。两边没有原子交易，第二腿失败会进入恢复态，不会自动重复下单。</span></div>
+                  <button className="wide-secondary" onClick={() => void executeSelectedMultiVenue()} disabled={busy || selectedComparison.status !== 'MANUAL_EXECUTABLE' || !snapshot.settings.kalshiLiveEnabled || snapshot.settings.mode !== 'ASSISTED' || !selectedKalshiLeg.marketId}>
+                    <Zap aria-hidden="true" />执行双腿（{selectedKalshiLeg.direction} → Kalshi）
+                  </button>
+                  {multiVenueReceipt && multiVenueReceipt.comparisonId === selectedComparison.id && <div className="browser-status-detail"><span>双腿</span><p>{multiVenueReceipt.message} · 状态 {multiVenueReceipt.status}</p></div>}
+                </div>}
+              </section>
 
-              <div className="execute-action-row">
-                <button className={`execute-button ${unprotectedMode || manualRiskOverrideActive ? 'risk-override' : ''}`} onClick={() => void execute()} disabled={!canExecute} title={unprotectedMode ? '无保护模式：MEXC点击后立即并行全量提交Polymarket FAK(最高0.99)，不等成交回报、不校验滑点与收益门槛' : '点击后先复核所选两边盘口；确认MEXC实际成交后才会提交Polymarket对冲'}>
-                  {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <ArrowRight aria-hidden="true" />}
-                  {unprotectedMode ? '极速无保护 · ' : manualRiskOverrideActive ? '风险执行 · ' : ''}
-                  {snapshot.settings.mode === 'SIMULATION'
-                    ? '模拟执行两腿'
-                    : snapshot.settings.mexcAutomationEnabled
-                      ? '执行MEXC第一腿'
-                      : '准备MEXC第一腿'}
-                </button>
-                <ExecutionConditionsHelp checks={executionChecks} busy={busy} onToggle={(condition) => void toggleManualExecutionCondition(condition)} />
-              </div>
-              {snapshot.settings.autoOpenEnabled && <div className={`browser-status-detail auto-open-status ${snapshot.autoOpenState.status.toLowerCase()}`} role="status" aria-live="polite"><span>AUTO</span><p>{snapshot.autoOpenState.message}</p></div>}
-              {currentPlan && <div className="capacity-summary" title={`账户余额计算已预留${currentPlan.accountBalanceReservePct}%安全垫`}>
-                <span title={`限制：${currentPlan.affordableLimitingFactors.join('、') || '盘口深度'}`}>{snapshot.settings.mode === 'ASSISTED' ? '账户可付' : '本金可用'} <strong>{currentPlan.maxAffordableQuantity}</strong>份</span>
-                <span title={`Polymarket最多接受当前最优价加${snapshot.settings.maxHedgeSlippage}`}>保护价内盘口 <strong>{currentPlan.marketDepthQuantity}</strong>份</span>
-              </div>}
-              {!canExecute && executeBlockReason && <p className="execution-note"><AlertTriangle aria-hidden="true" />禁用原因：{executeBlockReason}</p>}
+              {selected ? <>
+                <div className="ticket-key-metrics">
+                  <span>预计本金<strong>{selected.feeVerificationBlocked ? '—' : `$${requestedCapital.toFixed(2)}`}</strong></span>
+                  <span>预计利润<strong className={!selected.feeVerificationBlocked && requestedProfit > 0 ? 'profit' : ''}>{selected.feeVerificationBlocked ? '—' : `${requestedProfit >= 0 ? '+' : ''}$${requestedProfit.toFixed(2)}`}</strong></span>
+                  <span>安全距离<strong>{money(selected.settlementDistanceBps, 1)} / {money(selected.requiredSettlementDistanceBps, 1)} bps</strong></span>
+                </div>
 
-              {(selected.feeVerificationBlocked || selected.settlementRiskBlocked || selected.stale || Number(selected.conditionalReturnPct) < Number(snapshot.settings.minConditionalReturnPct)) && selected.riskFlags.length > 0 && (
-                <div className="inline-warning"><AlertTriangle aria-hidden="true" /><span>{selected.riskFlags[0]}</span></div>
-              )}
+                {(selected.feeVerificationBlocked || selected.settlementRiskBlocked || selected.stale || Number(selected.conditionalReturnPct) < Number(snapshot.settings.minConditionalReturnPct)) && selected.riskFlags.length > 0 && (
+                  <div className="inline-warning"><AlertTriangle aria-hidden="true" /><span>{selected.riskFlags[0]}</span></div>
+                )}
 
-              <div className="cost-breakdown">
-                <Row label="预计占用本金" value={selected.feeVerificationBlocked ? '—' : `$${requestedCapital.toFixed(2)}`} emphasized />
-                <Row label="预计利润" value={selected.feeVerificationBlocked ? '—' : `${requestedProfit >= 0 ? '+' : ''}$${requestedProfit.toFixed(2)}`} positive={!selected.feeVerificationBlocked && requestedProfit > 0} />
-                <Row label="动态安全距离" value={`${money(selected.settlementDistanceBps, 2)} / ${money(selected.requiredSettlementDistanceBps, 2)} bps`} positive={Number(selected.settlementDistanceBps) >= Number(selected.requiredSettlementDistanceBps)} />
-                <details className="ticket-calculation-details">
-                  <summary>风险与费用明细</summary>
-                  <div>
-                    <FormulaHelp inline />
-                    <Row
-                      label="条件收益率"
-                      value={selected.feeVerificationBlocked ? '—' : `${Number(effectiveConditionalReturn) >= 0 ? '+' : ''}${money(effectiveConditionalReturn, 2)}%`}
-                      positive={!selected.feeVerificationBlocked && Number(effectiveConditionalReturn) > 0}
-                    />
-                    <Row label="最坏亏损率" value={selected.feeVerificationBlocked ? '—' : `${money(selected.worstCaseReturnPct, 2)}%`} />
-                    <Row label="MEXC结算信号" value={selected.mexcSignal
-                      ? <SignalValue direction={selected.mexcSignal} distanceBps={selected.mexcDistanceBps} />
-                      : '未知'} />
-                    <Row label="Polymarket结算信号" value={selected.polymarketSignal
-                      ? <SignalValue direction={selected.polymarketSignal} distanceBps={selected.polymarketDistanceBps} />
-                      : '未知'} />
-                    <div className="breakdown-divider" />
-                    <Row label="MEXC本金" value={`$${currentPlan?.mexcSpend ?? money(Number(selected.mexcPrice) * Number(quantity || 0) + '', 2)}`} />
-                    <Row label="Polymarket本金" value={`$${currentPlan?.polymarketSpend ?? money(Number(selected.polymarketPrice) * Number(quantity || 0) + '', 2)}`} />
-                    <Row label="MEXC手续费" value={selected.mexcFeeRateSource === 'HISTORY' ? `$${currentPlan ? money(currentPlan.mexcFee, 2) : money(Number(selected.mexcFeePerShare) * Number(quantity || 0) + '', 2)}` : '—'} />
-                    <Row label="Polymarket手续费" value={`$${currentPlan ? money(currentPlan.polymarketFee, 2) : money(Number(selected.polymarketFeePerShare) * Number(quantity || 0) + '', 2)}`} />
-                    {currentPlan && <Row label="盘口档位" value={`MEXC ${currentPlan.mexcLevelsUsed}档 / Poly ${currentPlan.polymarketLevelsUsed}档`} />}
-                    <Row label="风险缓冲" value={`$${money(Number(selected.riskBufferPerShare) * Number(quantity || 0) + '', 2)}`} />
-                    <Row label="两边同时输" value={selected.feeVerificationBlocked ? '—' : `-$${Math.abs(requestedBothLose).toFixed(2)}`} />
-                    <Row label="两边同时赢" value={selected.feeVerificationBlocked ? '—' : `+$${requestedBothWin.toFixed(2)}`} positive={!selected.feeVerificationBlocked} />
-                  </div>
-                </details>
-              </div>
+                <label className="field-label ticket-quantity-label" htmlFor="quantity">对齐份额</label>
+                <div className="quantity-control">
+                  <input id="quantity" value={quantity} inputMode="decimal" onFocus={() => setSelectionMode('LOCKED')} onChange={(event) => {
+                    setSelectionMode('LOCKED')
+                    setQuantity(event.target.value)
+                  }} />
+                  <button onClick={() => {
+                    setSelectionMode('LOCKED')
+                    if (snapshot.settings.allowUnprofitableTestTrade) setQuantity(minimumAlignedQuantity.toFixed(2))
+                    else void setMaximumQuantity()
+                  }} disabled={busy}>
+                    {snapshot.settings.allowUnprofitableTestTrade ? '最小' : busy ? '计算中' : '最大'}
+                  </button>
+                </div>
+                {currentPlan && <div className="capacity-summary" title={`账户余额计算已预留${currentPlan.accountBalanceReservePct}%安全垫`}>
+                  <span title={`限制：${currentPlan.affordableLimitingFactors.join('、') || '盘口深度'}`}>{snapshot.settings.mode === 'ASSISTED' ? '账户可付' : '本金可用'} <strong>{currentPlan.maxAffordableQuantity}</strong>份</span>
+                  <span title={`Polymarket最多接受当前最优价加${snapshot.settings.maxHedgeSlippage}`}>保护价内盘口 <strong>{currentPlan.marketDepthQuantity}</strong>份</span>
+                </div>}
+
+                <div className="execute-action-row">
+                  <button className={`execute-button ${unprotectedMode || manualRiskOverrideActive ? 'risk-override' : ''}`} onClick={() => void execute()} disabled={!canExecute} title={unprotectedMode ? '无保护模式：MEXC点击后立即并行全量提交Polymarket FAK(最高0.99)，不等成交回报、不校验滑点与收益门槛' : '点击后先复核所选两边盘口；确认MEXC实际成交后才会提交Polymarket对冲'}>
+                    {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <ArrowRight aria-hidden="true" />}
+                    {unprotectedMode ? '极速无保护 · ' : manualRiskOverrideActive ? '风险执行 · ' : ''}
+                    {snapshot.settings.mode === 'SIMULATION'
+                      ? '模拟执行两腿'
+                      : snapshot.settings.mexcAutomationEnabled
+                        ? '执行MEXC第一腿'
+                        : '准备MEXC第一腿'}
+                  </button>
+                  <ExecutionConditionsHelp checks={executionChecks} busy={busy} onToggle={(condition) => void toggleManualExecutionCondition(condition)} />
+                </div>
+                {snapshot.settings.autoOpenEnabled && <div className={`browser-status-detail auto-open-status ${snapshot.autoOpenState.status.toLowerCase()}`} role="status" aria-live="polite"><span>AUTO</span><p>{snapshot.autoOpenState.message}</p></div>}
+                {!canExecute && executeBlockReason && <p className="execution-note"><AlertTriangle aria-hidden="true" />禁用原因：{executeBlockReason}</p>}
+
+                <div className="cost-breakdown">
+                  <details className="ticket-calculation-details">
+                    <summary>风险与费用明细</summary>
+                    <div>
+                      <FormulaHelp inline />
+                      <Row label="条件收益率" value={selected.feeVerificationBlocked ? '—' : `${Number(effectiveConditionalReturn) >= 0 ? '+' : ''}${money(effectiveConditionalReturn, 2)}%`} positive={!selected.feeVerificationBlocked && Number(effectiveConditionalReturn) > 0} />
+                      <Row label="最坏亏损率" value={selected.feeVerificationBlocked ? '—' : `${money(selected.worstCaseReturnPct, 2)}%`} />
+                      <Row label="MEXC结算信号" value={selected.mexcSignal ? <SignalValue direction={selected.mexcSignal} distanceBps={selected.mexcDistanceBps} /> : '未知'} />
+                      <Row label="Polymarket结算信号" value={selected.polymarketSignal ? <SignalValue direction={selected.polymarketSignal} distanceBps={selected.polymarketDistanceBps} /> : '未知'} />
+                      <div className="breakdown-divider" />
+                      <Row label="MEXC本金" value={`$${currentPlan?.mexcSpend ?? money(Number(selected.mexcPrice) * Number(quantity || 0) + '', 2)}`} />
+                      <Row label="Polymarket本金" value={`$${currentPlan?.polymarketSpend ?? money(Number(selected.polymarketPrice) * Number(quantity || 0) + '', 2)}`} />
+                      <Row label="MEXC手续费" value={selected.mexcFeeRateSource === 'HISTORY' ? `$${currentPlan ? money(currentPlan.mexcFee, 2) : money(Number(selected.mexcFeePerShare) * Number(quantity || 0) + '', 2)}` : '—'} />
+                      <Row label="Polymarket手续费" value={`$${currentPlan ? money(currentPlan.polymarketFee, 2) : money(Number(selected.polymarketFeePerShare) * Number(quantity || 0) + '', 2)}`} />
+                      {currentPlan && <Row label="盘口档位" value={`MEXC ${currentPlan.mexcLevelsUsed}档 / Poly ${currentPlan.polymarketLevelsUsed}档`} />}
+                      <Row label="风险缓冲" value={`$${money(Number(selected.riskBufferPerShare) * Number(quantity || 0) + '', 2)}`} />
+                      <Row label="两边同时输" value={selected.feeVerificationBlocked ? '—' : `-$${Math.abs(requestedBothLose).toFixed(2)}`} />
+                      <Row label="两边同时赢" value={selected.feeVerificationBlocked ? '—' : `+$${requestedBothWin.toFixed(2)}`} positive={!selected.feeVerificationBlocked} />
+                    </div>
+                  </details>
+                </div>
+              </> : <section className="read-only-ticket">
+                <div className="ticket-key-metrics">
+                  <span>两腿成本<strong>{money(selectedComparison.allInCostPerShare, 4)}</strong></span>
+                  <span>参考毛边际<strong className={Number(selectedComparison.netEdgePerShare) > 0 ? 'profit' : ''}>{Number(selectedComparison.netEdgePerShare) >= 0 ? '+' : ''}{money(selectedComparison.netEdgePerShare, 4)}</strong></span>
+                  <span>参考收益率<strong>{Number(selectedComparison.conditionalReturnPct) >= 0 ? '+' : ''}{money(selectedComparison.conditionalReturnPct, 2)}%</strong></span>
+                </div>
+                <div className="read-only-notice"><Info aria-hidden="true" /><span>{selectedComparison.status === 'MANUAL_EXECUTABLE' ? '这条路线已接入受限双腿人工执行；两腿不能原子成交，任一腿失败会进入恢复态。未知深度不参与可执行量或利润计算。' : '这条路线可用于观察和比价，但未接入真实下单。未知深度不参与可执行量或利润计算。'}</span></div>
+                {selectedComparison.blockReasons.length > 0 && <ul className="read-only-reasons">{selectedComparison.blockReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}
+                {selectedComparison.status !== 'MANUAL_EXECUTABLE' && <button className="execute-button read-only-execute" type="button" disabled><LockKeyhole aria-hidden="true" />只读观察 · 暂不支持下单</button>}
+              </section>}
             </>
           ) : <div className="empty-state">没有可用机会</div>}
         </aside>
@@ -1564,7 +2022,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <div><strong>实盘控制</strong><span>{snapshot.settings.autoOpenEnabled ? '自动开单已布防' : snapshot.settings.mexcAutomationEnabled ? 'MEXC自动点击已开' : '自动执行已关'} · {snapshot.settings.polymarketLiveEnabled ? '真实对冲已开' : '真实对冲已关'}</span><small>管理自动点击、真实FAK、自动开单与一次性小额联调</small></div><ChevronRight />
               </button>
               <button className="settings-menu-card" onClick={() => setSettingsView('ACCOUNT')}>
-                <div><strong>账户与环境</strong><span>{snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? 'Hubstudio' : '内嵌MEXC'} · {polymarketCredentials?.configured ? 'Polymarket已配置' : 'Polymarket未配置'}</span><small>低频配置：浏览器环境、网络、校准和交易身份</small></div><ChevronRight />
+                <div><strong>账户与环境</strong><span>{snapshot.settings.mexcBrowserMode === 'HUBSTUDIO' ? 'Hubstudio' : '内嵌MEXC'} · {polymarketCredentials?.configured ? 'Polymarket已配置' : 'Polymarket未配置'} · Limitless {limitlessCredentials?.configured ? '已配置' : '待配置'} · Predict {predictFunCredentials?.tradingConfigured ? '已配置' : '待配置'} · Gate {gateCredentials?.configured ? '已配置' : '仅行情'} · Kalshi {kalshiCredentials?.configured ? '已配置' : '仅行情'}</span><small>低频配置：浏览器环境、网络、校准和交易身份</small></div><ChevronRight />
               </button>
             </nav>
             </>}
@@ -1689,7 +2147,105 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
               </label>
               <button className="wide-secondary" onClick={() => void saveAndTestPolymarketProxy()} disabled={busy}><Network />保存并测试公开行情</button>
               <div className="browser-status-detail"><span>NET</span><p>{snapshot.connectionDetails.polymarket}</p></div>
-              <div className="browser-status-detail"><span>价格源</span><p>当前套利判断直接比较MEXC与Polymarket官方盘口，不需要Chainlink密钥。Chainlink只适合以后作为结算参考价和偏差预警，不作为下单前置条件。</p></div>
+              <div className="browser-status-detail"><span>价格源</span><p>已通过Polymarket官方RTDS的一条公共WebSocket接收Chainlink BTC/USD 60秒TWAP，5m/15m共用，无需密钥；用于结算方向和偏差风控，不替代两平台真实盘口。仅保留内存最新值，不写入逐笔磁盘日志；断线时REST按15秒限频兜底。</p></div>
+              </div>
+            </details>
+            <details className="settings-module credential-section">
+              <summary><div><strong>Limitless / Predict.fun / Gate / Kalshi</strong><span className={limitlessCredentials?.configured && predictFunCredentials?.tradingConfigured && gateCredentials?.configured ? 'ready-text' : ''}>Limitless {limitlessCredentials?.configured ? '已配置' : '待配置'} · Predict {predictFunCredentials?.tradingConfigured ? '已配置' : '仅行情'} · Gate {gateCredentials?.configured ? '已配置' : '仅行情'} · Kalshi {kalshiCredentials?.configured ? (snapshot.settings.kalshiLiveEnabled ? '实盘开关已开' : '已配置') : '仅行情'}</span><small>行情连接；交易身份由系统安全存储加密</small></div><ChevronRight /></summary>
+              <div className="settings-module-body">
+                <p>公开行情与交易身份分离。秘密值只在主进程按需解密，页面、普通设置、日志和状态快照都不会收到私钥原文；留空保存不会覆盖已存秘密。</p>
+                <div className="credential-route-card">
+                  <strong>Limitless 交易身份</strong>
+                  <span>在 Limitless 的 API Tokens 页面派生带 trading scope 的 Token ID 和 Token Secret，再填写 Base 钱包私钥。钱包地址和 Profile ID 由软件自动验证读取。</span>
+                </div>
+                <label className="settings-field" htmlFor="limitless-token-id">Limitless Token ID（首次必填）
+                  <input id="limitless-token-id" type={revealPlatformSecrets ? 'text' : 'password'} value={limitlessTokenId} onChange={(event) => setLimitlessTokenId(event.target.value)} placeholder={limitlessCredentials?.tokenIdMasked ? `已保存 ${limitlessCredentials.tokenIdMasked}；留空不修改` : 'API Token 弹窗 → API Tokens → Derive'} spellCheck={false} autoComplete="new-password" />
+                </label>
+                <label className="settings-field" htmlFor="limitless-token-secret">Limitless Token Secret（首次必填）
+                  <input id="limitless-token-secret" type={revealPlatformSecrets ? 'text' : 'password'} value={limitlessTokenSecret} onChange={(event) => setLimitlessTokenSecret(event.target.value)} placeholder={limitlessCredentials?.hasTokenSecret ? '已保存；留空不修改' : 'Derive 后只显示一次的 Secret'} spellCheck={false} autoComplete="new-password" />
+                </label>
+                <label className="settings-field" htmlFor="limitless-private-key">Limitless Base 钱包私钥（首次必填）
+                  <input id="limitless-private-key" type={revealPlatformSecrets ? 'text' : 'password'} value={limitlessPrivateKey} onChange={(event) => setLimitlessPrivateKey(event.target.value)} placeholder={limitlessCredentials?.hasWalletPrivateKey ? '已保存；留空不修改' : '0x 开头的 32 字节私钥'} spellCheck={false} autoComplete="new-password" />
+                </label>
+                <button className="wide-secondary" onClick={() => void saveLimitlessCredentials()} disabled={busy || !limitlessCredentials?.encryptionAvailable || (!limitlessCredentials?.configured && (!limitlessTokenId || !limitlessTokenSecret || !limitlessPrivateKey))}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <LockKeyhole aria-hidden="true" />}加密保存并验证 Limitless 身份</button>
+                {limitlessCredentials?.message && <div className="browser-status-detail"><span>LIMIT</span><p>{limitlessCredentials.message}{limitlessCredentials.profileId ? ` · Profile ${limitlessCredentials.profileId}` : ''}{limitlessCredentials.walletAddress ? ` · 钱包 ${shortAddress(limitlessCredentials.walletAddress)}` : ''}</p></div>}
+                <button className="wide-secondary safe-preparation-button" onClick={() => void prepareLimitlessWithoutSubmitting()} disabled={busy || !limitlessCredentials?.configured}><ShieldCheck aria-hidden="true" />完整联调 Limitless（绝不下单）</button>
+                {limitlessPreparation && <PreparationReportView report={limitlessPreparation} />}
+
+                <div className="credential-route-card">
+                  <strong>Predict.fun 交易身份</strong>
+                  <span>网页账户通常选择 Predict Account；Deposit Address 是账户地址，Privy 私钥对应的 signer 地址会由软件本地派生。</span>
+                </div>
+                <label className="settings-field" htmlFor="predict-fun-api-key">Predict.fun 主网 API Key（官方API模式必填；网页扫描可留空）
+                  <input id="predict-fun-api-key" type={revealPlatformSecrets ? 'text' : 'password'} value={predictFunApiKey} onChange={(event) => setPredictFunApiKey(event.target.value)} placeholder={predictFunCredentials?.configured ? '已保存；填写新值可替换' : '从 Predict.fun 官方申请后粘贴'} spellCheck={false} autoComplete="new-password" />
+                </label>
+                <label className="settings-field" htmlFor="predict-fun-account-type">Predict.fun 账户类型
+                  <select id="predict-fun-account-type" value={predictFunAccountType} onChange={(event) => setPredictFunAccountType(event.target.value as 'PREDICT_ACCOUNT' | 'EOA')}>
+                    <option value="PREDICT_ACCOUNT">Predict Account（网页智能钱包）</option>
+                    <option value="EOA">普通 EOA 钱包</option>
+                  </select>
+                </label>
+                <label className="settings-field" htmlFor="predict-fun-account-address">{predictFunAccountType === 'PREDICT_ACCOUNT' ? 'Predict Deposit Address' : 'EOA 钱包地址'}
+                  <input id="predict-fun-account-address" value={predictFunAccountAddress} onChange={(event) => setPredictFunAccountAddress(event.target.value)} placeholder="0x 开头的 BNB Chain 地址" spellCheck={false} autoComplete="off" />
+                </label>
+                <label className="settings-field" htmlFor="predict-fun-private-key">{predictFunAccountType === 'PREDICT_ACCOUNT' ? 'Privy Wallet 私钥' : 'EOA 钱包私钥'}
+                  <input id="predict-fun-private-key" type={revealPlatformSecrets ? 'text' : 'password'} value={predictFunPrivateKey} onChange={(event) => setPredictFunPrivateKey(event.target.value)} placeholder={predictFunCredentials?.hasSignerPrivateKey ? '已保存；留空不修改' : '0x 开头的 32 字节私钥'} spellCheck={false} autoComplete="new-password" />
+                </label>
+                <label className="credential-reveal"><input type="checkbox" checked={revealPlatformSecrets} onChange={(event) => setRevealPlatformSecrets(event.target.checked)} /><span>临时显示本次尚未保存的密钥输入</span></label>
+                <div className="credential-notice"><KeyRound aria-hidden="true" /><span>API Key 使用系统钥匙串加密，不写入普通设置文件。盘口通过 WebSocket 实时更新；REST 每15秒发现轮次、每30秒校准，断线时才临时回退。</span></div>
+                <button className="wide-secondary" onClick={() => void savePredictFunCredentials()} disabled={busy || !predictFunCredentials?.encryptionAvailable || (!predictFunCredentials?.configured && predictFunApiKey.trim().length < 8)}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <LockKeyhole aria-hidden="true" />}加密保存 Predict.fun 身份</button>
+                <button className="wide-secondary" onClick={() => void openPredictFunPage()} disabled={busy}><ExternalLink aria-hidden="true" />打开 Predict.fun 单页面行情</button>
+                <button className="wide-secondary" onClick={() => void stopPredictFunPage()} disabled={busy}><Square aria-hidden="true" />停止 Predict.fun 监听并释放页面</button>
+                <div className="credential-notice"><Network aria-hidden="true" /><span>未配置 API Key 时，软件只被动监听这一个网页自身的 REST 响应和 WebSocket 帧，不复制网页 Key、不额外调用内部接口，也不会通过页面下单。</span></div>
+                {predictFunPageStatus && <div className="browser-status-detail"><span>页面</span><p>{predictFunPageStatus.message}</p></div>}
+                {snapshot.multiVenueBoard.platforms.filter((platform) => platform.id === 'LIMITLESS' || platform.id === 'PREDICT_FUN' || platform.id === 'GATE' || platform.id === 'KALSHI').map((platform) => (
+                  <div className="browser-status-detail" key={platform.id}><span>{platform.id === 'LIMITLESS' ? 'LIMIT' : platform.id === 'PREDICT_FUN' ? 'PRED' : platform.id === 'GATE' ? 'GATE' : 'KALSHI'}</span><p>{platform.integrationState === 'PLANNED' ? '暂不纳入短周期扫描' : platform.connectionState === 'CONNECTED' ? '只读行情在线' : platform.connectionState === 'NOT_CONFIGURED' ? '等待网页行情或官方Key' : '连接异常'} · {platform.integrationState === 'READ_ONLY' ? '禁止下单' : platform.integrationState}</p></div>
+                ))}
+                {predictFunCredentials?.message && <div className="browser-status-detail"><span>PRED</span><p>{predictFunCredentials.message}{predictFunCredentials.apiKeyMasked ? ` · ${predictFunCredentials.apiKeyMasked}` : ''}{predictFunCredentials.signerAddress ? ` · signer ${shortAddress(predictFunCredentials.signerAddress)}` : ''}</p></div>}
+                <button className="wide-secondary safe-preparation-button" onClick={() => void preparePredictFunWithoutSubmitting()} disabled={busy || !predictFunCredentials?.tradingConfigured}><ShieldCheck aria-hidden="true" />完整联调 Predict.fun（绝不下单）</button>
+                {predictFunPreparation && <PreparationReportView report={predictFunPreparation} />}
+
+                <div className="credential-route-card">
+                  <strong>Gate 事件合约</strong>
+                  <span>BTC/ETH 5分钟、15分钟盘口通过 Gate 网页单页被动捕获；APIv4 Key 只用于验证账户身份和读取共享现货账户的 USDT 余额。</span>
+                </div>
+                <label className="settings-field" htmlFor="gate-api-key">Gate APIv4 Key（账户只读联调；公开扫描可留空）
+                  <input id="gate-api-key" type={revealPlatformSecrets ? 'text' : 'password'} value={gateApiKey} onChange={(event) => setGateApiKey(event.target.value)} placeholder={gateCredentials?.apiKeyMasked ? `已保存 ${gateCredentials.apiKeyMasked}；留空不修改` : 'Gate → API管理 → APIv4 Keys'} spellCheck={false} autoComplete="new-password" />
+                </label>
+                <label className="settings-field" htmlFor="gate-api-secret">Gate APIv4 Secret
+                  <input id="gate-api-secret" type={revealPlatformSecrets ? 'text' : 'password'} value={gateApiSecret} onChange={(event) => setGateApiSecret(event.target.value)} placeholder={gateCredentials?.hasApiSecret ? '已保存；留空不修改' : '创建 Key 时显示的 Secret'} spellCheck={false} autoComplete="new-password" />
+                </label>
+                <div className="credential-notice"><KeyRound aria-hidden="true" /><span>建议在 Gate 创建仅“现货/保证金只读”的 APIv4 Key，并设置 IP 白名单；不要开启交易或提现权限。软件的 Gate 联调守卫仅放行一个 GET 余额接口。</span></div>
+                <button className="wide-secondary" onClick={() => void saveGateCredentials()} disabled={busy || !gateCredentials?.encryptionAvailable || (!gateCredentials?.configured && (!gateApiKey || !gateApiSecret))}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <LockKeyhole aria-hidden="true" />}加密保存 Gate 只读身份</button>
+                <button className="wide-secondary" onClick={() => void openGatePage()} disabled={busy}><ExternalLink aria-hidden="true" />打开 Gate 事件合约单页面</button>
+                <button className="wide-secondary" onClick={() => void stopGatePage()} disabled={busy}><Square aria-hidden="true" />停止 Gate 监听并释放页面</button>
+                <div className="credential-notice"><Network aria-hidden="true" /><span>软件只监听这一页自身的事件合约 REST/WebSocket 流量，不复制网页会话、不额外调用内部行情接口，也不会点击或调用下单、撤单、划转。</span></div>
+                {gatePageStatus && <div className="browser-status-detail"><span>GATE页</span><p>{gatePageStatus.message}</p></div>}
+                {gateCredentials?.message && <div className="browser-status-detail"><span>GATE</span><p>{gateCredentials.message}{gateCredentials.apiKeyMasked ? ` · ${gateCredentials.apiKeyMasked}` : ''}</p></div>}
+                <button className="wide-secondary safe-preparation-button" onClick={() => void prepareGateWithoutSubmitting()} disabled={busy || !gateCredentials?.configured}><ShieldCheck aria-hidden="true" />完整联调 Gate（绝不下单）</button>
+                {gatePreparation && <PreparationReportView report={gatePreparation} />}
+
+                <div className="credential-route-card">
+                  <strong>Kalshi 行情、账户与人工实盘入口</strong>
+                  <span>Kalshi 当前只接入 KXBTC15M 15分钟市场；5分钟市场不纳入扫描。真实执行仅支持 MEXC↔Kalshi 或 Polymarket↔Kalshi 双腿流程，默认关闭，不会自动下单。</span>
+                </div>
+                <label className="settings-field" htmlFor="kalshi-api-key-id">Kalshi API Key ID（首次必填）
+                  <input id="kalshi-api-key-id" type={revealPlatformSecrets ? 'text' : 'password'} value={kalshiApiKeyId} onChange={(event) => setKalshiApiKeyId(event.target.value)} placeholder={kalshiCredentials?.apiKeyIdMasked ? `已保存 ${kalshiCredentials.apiKeyIdMasked}；留空不修改` : 'Kalshi API Keys → Key ID'} spellCheck={false} autoComplete="new-password" />
+                </label>
+                <label className="settings-field" htmlFor="kalshi-private-key">Kalshi RSA 私钥 PEM（首次必填）
+                  <textarea id="kalshi-private-key" rows={5} value={kalshiPrivateKeyPem} onChange={(event) => setKalshiPrivateKeyPem(event.target.value)} placeholder={kalshiCredentials?.hasPrivateKey ? '已保存；留空不修改' : '-----BEGIN RSA PRIVATE KEY-----\\n...\\n-----END RSA PRIVATE KEY-----'} spellCheck={false} autoComplete="new-password" />
+                </label>
+                <div className="credential-notice"><KeyRound aria-hidden="true" /><span>{kalshiCredentials?.message ?? 'Kalshi 公开市场和盘口无需 Key；配置 Key 后可读取账户并进入人工确认下单。'}</span></div>
+                <button className="wide-secondary" onClick={() => void saveKalshiCredentials()} disabled={busy || !kalshiCredentials?.encryptionAvailable || (!kalshiCredentials?.configured && (!kalshiApiKeyId || !kalshiPrivateKeyPem))}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <LockKeyhole aria-hidden="true" />}加密保存 Kalshi 身份</button>
+                <button className={`wide-secondary ${snapshot.settings.kalshiLiveEnabled ? 'live-toggle enabled' : ''}`} onClick={() => void toggleKalshiLive()} disabled={busy || !kalshiCredentials?.configured}>
+                  {snapshot.settings.kalshiLiveEnabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}Kalshi 双腿实盘执行：{snapshot.settings.kalshiLiveEnabled ? '已开启（点击关闭）' : '默认关闭'}
+                </button>
+                <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>开启开关不会立即发单；每次发送仍需在机会面板确认 ticker、方向、数量和最高价格。网络超时不会自动重试。</span></div>
+                <button className="wide-secondary" onClick={() => void openKalshiPage()} disabled={busy}><ExternalLink aria-hidden="true" />打开 Kalshi 页面检查行情</button>
+                <button className="wide-secondary" onClick={() => void stopKalshiPage()} disabled={busy}><Square aria-hidden="true" />停止 Kalshi 监听并释放页面</button>
+                {kalshiPageStatus && <div className="browser-status-detail"><span>K页</span><p>{kalshiPageStatus.message}</p></div>}
+                <button className="wide-secondary safe-preparation-button" onClick={() => void prepareKalshiWithoutSubmitting()} disabled={busy || !kalshiCredentials?.configured}><ShieldCheck aria-hidden="true" />完整联调 Kalshi（绝不下单）</button>
+                {kalshiPreparation && <PreparationReportView report={kalshiPreparation} />}
               </div>
             </details>
             <details className="settings-module credential-section">

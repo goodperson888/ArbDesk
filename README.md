@@ -1,13 +1,18 @@
 # ArbDesk — MEXC × Polymarket
 
-一个本地优先、有人监督的 BTC 预测市场跨平台执行桌面应用。界面使用 React，桌面运行时使用 Electron，核心逻辑使用 TypeScript 与十进制定点数。
+一个本地优先、有人监督的多平台预测市场跨平台执行桌面应用。当前内置 BTC 5m/15m，事件模型和路线引擎已为 ETH 及其他事件预留扩展点。界面使用 React，桌面运行时使用 Electron，核心逻辑使用 TypeScript 与十进制定点数。
 
 > 当前版本是可运行的安全 MVP。扫描器只显示 MEXC 与 Polymarket 官方接口返回的真实盘口，不再生成模拟行情；任一数据源断开时显示空列表和错误原因。模拟模式只模拟成交过程。真实资金模式必须在完成账户、页面、盘口和失败恢复测试后手动启用。
+
+Limitless、Predict.fun、Gate 与 Kalshi 的 Token/API Key、钱包和资金准备步骤见：[平台凭据配置指南](docs/platform-credential-setup.zh-CN.md)。
+
+Kalshi 的 KXBTC15M 已接入默认市场扫描（当前不纳入 5 分钟周期）；设置页可单独开启 MEXC↔Kalshi 或 Polymarket↔Kalshi 双腿人工执行，默认关闭，不支持自动下单、撤单或账户变更。两平台没有原子交易：系统先确认首腿真实成交，再按实际数量发送 Kalshi FOK；第二腿失败会进入恢复态，网络超时不会自动重试。Gate/Predict.fun 各自自动启动一个后台被动页面（Predict.fun 没有 API Key 时仍可正常工作），设置页提供“停止监听并释放页面”；后台页面会节流并过滤无关资源，避免长期占用过多 CPU/内存。
 
 ## 已实现
 
 - macOS / Windows 桌面应用结构，无需用户安装 Node 或数据库；
 - BTC 5 分钟、15 分钟机会看板；
+- 所有已接入平台按统一事件 ID 生成 N×N 双向比较路线，新增资产只需要事件配置和市场映射；
 - Polymarket 当前滚动市场发现、真实 CLOB 卖盘和按市场查询的费率；
 - 精确金额、份额与预计利润计算；
 - 页面内可悬浮/点击查看手续费、条件收益率、最坏亏损率与结算距离公式；
@@ -28,6 +33,9 @@
 - 模拟交易、人工成交确认、审计日志和风险限制；
 - 同一开始/结束时间窗的 MEXC 与 Polymarket 报价才会配对；
 - Polymarket 签名类型、funder、签名私钥和 L2 API 凭据配置页；秘密凭据由 Electron `safeStorage` 使用系统钥匙串加密，渲染进程只看到状态和掩码；
+- Predict.fun 无 API Key 时使用单个网页的被动网络监听，不复制网页凭据、不额外调用内部接口；默认保持一个后台页面，设置页可停止并释放；配置 Key 后优先使用官方 REST/WebSocket；
+- Limitless 与 Predict.fun 均提供“完整联调（绝不下单）”：手动触发身份、账户、持仓、委托、链上余额/授权读取，并用官方 SDK 在本地构建和签名测试订单；真实提交、撤单和授权交易由请求白名单硬性禁止；
+- Gate 事件合约通过一个网页被动读取 BTC 5m/15m 双向盘口；默认保持一个后台页面，设置页可停止并释放。APIv4 Key 仅用于一个官方只读余额接口。Gate 事件合约订单 API 尚未公开，因此不会猜测下单/委托接口，也不会把现货接口当作事件合约接口；
 - 默认关闭真实资金与 MEXC 实验自动点击。
 - 启动前限时授权门禁：未授权或到期时不挂载交易主界面；若到期时仍有未处理敞口，只保留最小化的恢复与平仓页面。
 
@@ -96,8 +104,8 @@ npm run package:win
 ## 真实数据来源
 
 - MEXC：事件轮次先从页面已有响应读取，UP/DOWN 深度和 5m/15m BTC 指数通过 Prediction WebSocket 持续订阅；仅在首次快照、跨盘、推送静默或开仓前所选盘口超过 500 毫秒未更新时使用 REST 补充校验。首档卖价和首档数量用于机会计算。
-- Polymarket：Gamma API 按 `btc-updown-5m-{startUnix}` / `btc-updown-15m-{startUnix}` 发现市场，CLOB API 获取每个 outcome token 的卖盘和费率。
-- Chainlink：目前只作为 Polymarket 结算规则来源，应用未单独接入 Chainlink 实时报价，因此状态会明确显示“未接入”。
+- Polymarket：Gamma API 按 `btc-updown-5m-{startUnix}` / `btc-updown-15m-{startUnix}` 发现市场，CLOB API 获取每个 outcome token 的卖盘和费率，CLOB WebSocket 持续更新实时深度。
+- Chainlink：通过 Polymarket 官方 RTDS 的一条公共 WebSocket 订阅 BTC/USD 60 秒 TWAP，5m/15m 共用，用于结算方向、偏差距离和临近结算风控；无需 Chainlink 密钥。内存只保留最新 TWAP 和当前窗口基准，不逐条落盘。启动时每个新窗口读取一次官方基准，RTDS 断线时参考价 REST 最多每15秒兜底一次。
 - Binance：可以以后增加为参考现货价，但不能替代 MEXC Prediction 盘口，因为二者不是同一可成交合约。
 
 ## Polymarket 网络代理

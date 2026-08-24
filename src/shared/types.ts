@@ -1,3 +1,5 @@
+import type { MultiVenueBoardSnapshot, MultiVenueExecutionReceipt, MultiVenueExecutionRequest, MultiVenueExecutionSession } from './multi-venue'
+
 export type Venue = 'MEXC' | 'POLYMARKET'
 export type Direction = 'UP' | 'DOWN'
 export type MarketDuration = 5 | 15 | 30
@@ -250,6 +252,8 @@ export interface RiskSettings {
   polymarketProxyUrl: string
   mexcAutomationEnabled: boolean
   polymarketLiveEnabled: boolean
+  /** Kalshi 单腿实盘下单总开关；默认关闭，且不受自动开单开关影响。 */
+  kalshiLiveEnabled?: boolean
   allowUnprofitableTestTrade: boolean
   autoOpenEnabled: boolean
   autoOpenQuantityMode: 'FIXED' | 'MAX_PERCENT'
@@ -323,6 +327,9 @@ export interface AppSnapshot {
   }
   settings: RiskSettings
   opportunities: Opportunity[]
+  multiVenueBoard: MultiVenueBoardSnapshot
+  multiVenueReceipt?: MultiVenueExecutionReceipt
+  multiVenueExecutionSessions: MultiVenueExecutionSession[]
   orderHistory: ArbitrageOrderRecord[]
   activeSession?: ExecutionSession
   recoverySessions: ExecutionSession[]
@@ -352,6 +359,33 @@ export interface RetryPolymarketHedgeRequest {
 
 export interface UpdateSettingsRequest extends Omit<Partial<RiskSettings>, 'manualExecutionConditions'> {
   manualExecutionConditions?: Partial<ManualExecutionConditions>
+}
+
+export interface PlaceKalshiOrderRequest {
+  ticker: string
+  direction: Direction
+  quantity: string
+  /** 用户看到的该 outcome 的卖一价（美元）；服务端会重新校验最新缓存。 */
+  outcomePrice: string
+  quoteReceivedAt: number
+  marketEndTime: number
+  /** UI 二次确认后才允许进入真实 POST 路径。 */
+  confirmed: boolean
+}
+
+export interface KalshiOrderReceipt {
+  orderId: string
+  clientOrderId: string
+  ticker: string
+  direction: Direction
+  side: 'bid' | 'ask'
+  quantity: string
+  outcomePrice: string
+  fillCount: string
+  remainingCount: string
+  status: 'EXECUTED' | 'PARTIAL' | 'CANCELED' | 'RESTING' | 'UNKNOWN'
+  submittedAt: number
+  message: string
 }
 
 export interface MexcBrowserStatus {
@@ -447,6 +481,131 @@ export interface UpdatePolymarketCredentialsRequest {
   apiPassphrase?: string
 }
 
+export interface PredictFunCredentialSummary {
+  configured: boolean
+  tradingConfigured: boolean
+  encryptionAvailable: boolean
+  apiKeyMasked?: string
+  source?: 'KEYCHAIN' | 'ENVIRONMENT'
+  accountType?: 'PREDICT_ACCOUNT' | 'EOA'
+  accountAddress?: string
+  signerAddress?: string
+  hasSignerPrivateKey: boolean
+  message: string
+}
+
+export interface UpdatePredictFunCredentialsRequest {
+  apiKey?: string
+  accountType?: 'PREDICT_ACCOUNT' | 'EOA'
+  accountAddress?: string
+  signerPrivateKey?: string
+}
+
+export interface PredictFunPageCaptureStatus {
+  state: 'IDLE' | 'STARTING' | 'CONNECTED' | 'DISCONNECTED'
+  message: string
+  updatedAt?: number
+  responseCount?: number
+  webSocketFrameCount?: number
+  lastCaptureAt?: number
+}
+
+export interface GatePageCaptureStatus {
+  state: 'IDLE' | 'STARTING' | 'CONNECTED' | 'DISCONNECTED'
+  message: string
+  updatedAt?: number
+  responseCount?: number
+  webSocketFrameCount?: number
+  lastCaptureAt?: number
+}
+
+export interface GateCredentialSummary {
+  configured: boolean
+  encryptionAvailable: boolean
+  apiKeyMasked?: string
+  hasApiSecret: boolean
+  message: string
+}
+
+export interface UpdateGateCredentialsRequest {
+  apiKey?: string
+  apiSecret?: string
+}
+
+export interface KalshiCredentialSummary {
+  configured: boolean
+  encryptionAvailable: boolean
+  apiKeyIdMasked?: string
+  hasPrivateKey: boolean
+  message: string
+}
+
+export interface UpdateKalshiCredentialsRequest {
+  apiKeyId?: string
+  privateKeyPem?: string
+}
+
+export interface KalshiPageCaptureStatus {
+  state: 'IDLE' | 'STARTING' | 'CONNECTED' | 'DISCONNECTED'
+  message: string
+  updatedAt?: number
+  responseCount?: number
+  webSocketFrameCount?: number
+  lastCaptureAt?: number
+}
+
+export interface LimitlessCredentialSummary {
+  configured: boolean
+  encryptionAvailable: boolean
+  tokenIdMasked?: string
+  hasTokenSecret: boolean
+  profileId?: string
+  walletAddress?: string
+  hasWalletPrivateKey: boolean
+  message: string
+}
+
+export interface UpdateLimitlessCredentialsRequest {
+  tokenId?: string
+  tokenSecret?: string
+  walletPrivateKey?: string
+}
+
+export type VenuePreparationStageStatus = 'PASS' | 'WARN' | 'BLOCKED' | 'SKIPPED'
+
+export interface VenuePreparationStage {
+  id: string
+  label: string
+  status: VenuePreparationStageStatus
+  durationMs: number
+  detail: string
+}
+
+export interface VenuePreparationReport {
+  venueId: 'LIMITLESS' | 'PREDICT_FUN' | 'GATE' | 'KALSHI'
+  checkedAt: number
+  safeMode: true
+  orderSubmissionBlocked: true
+  identityVerified: boolean
+  marketDataReady: boolean
+  accountReadsReady: boolean
+  localOrderBuilt: boolean
+  localOrderSigned: boolean
+  fundingReady: boolean
+  approvalsReady: boolean
+  collateralBalance?: string
+  nativeBalance?: string
+  openOrderCount?: number
+  positionCount?: number
+  marketId?: string
+  outcomeId?: string
+  orderHash?: string
+  requestCount: number
+  readyExceptFunding: boolean
+  message: string
+  stages: VenuePreparationStage[]
+}
+
 export interface LicenseSummary {
   status: LicenseStatus
   machineCode: string
@@ -472,6 +631,7 @@ export interface ArbAppApi {
   getEmergencyAccessSnapshot(): Promise<EmergencyAccessSnapshot>
   getSnapshot(): Promise<AppSnapshot>
   refreshOpportunities(): Promise<AppSnapshot>
+  setVenueMonitoring(venueId: string, enabled: boolean): Promise<AppSnapshot>
   testPolymarketConnection(): Promise<AppSnapshot>
   execute(request: ExecuteRequest): Promise<ExecutionSession>
   calculateExecutionPlan(request: CalculateExecutionPlanRequest): Promise<ExecutionPlan>
@@ -487,6 +647,30 @@ export interface ArbAppApi {
   getPolymarketCredentialSummary(): Promise<PolymarketCredentialSummary>
   updatePolymarketCredentials(request: UpdatePolymarketCredentialsRequest): Promise<PolymarketCredentialSummary>
   validatePolymarketIdentity(tokenId?: string): Promise<PolymarketIdentityValidation>
+  getPredictFunCredentialSummary(): Promise<PredictFunCredentialSummary>
+  updatePredictFunCredentials(request: UpdatePredictFunCredentialsRequest): Promise<PredictFunCredentialSummary>
+  openPredictFunPage(): Promise<void>
+  stopPredictFunPage(): Promise<void>
+  getPredictFunPageCaptureStatus(): Promise<PredictFunPageCaptureStatus>
+  getLimitlessCredentialSummary(): Promise<LimitlessCredentialSummary>
+  updateLimitlessCredentials(request: UpdateLimitlessCredentialsRequest): Promise<LimitlessCredentialSummary>
+  prepareLimitlessWithoutSubmitting(): Promise<VenuePreparationReport>
+  preparePredictFunWithoutSubmitting(): Promise<VenuePreparationReport>
+  getGateCredentialSummary(): Promise<GateCredentialSummary>
+  updateGateCredentials(request: UpdateGateCredentialsRequest): Promise<GateCredentialSummary>
+  openGatePage(): Promise<void>
+  stopGatePage(): Promise<void>
+  getGatePageCaptureStatus(): Promise<GatePageCaptureStatus>
+  prepareGateWithoutSubmitting(): Promise<VenuePreparationReport>
+  getKalshiCredentialSummary(): Promise<KalshiCredentialSummary>
+  updateKalshiCredentials(request: UpdateKalshiCredentialsRequest): Promise<KalshiCredentialSummary>
+  openKalshiPage(): Promise<void>
+  stopKalshiPage(): Promise<void>
+  getKalshiPageCaptureStatus(): Promise<KalshiPageCaptureStatus>
+  prepareKalshiWithoutSubmitting(): Promise<VenuePreparationReport>
+  executeMultiVenue(request: MultiVenueExecutionRequest): Promise<MultiVenueExecutionReceipt>
+  listMultiVenueExecutionSessions(): Promise<MultiVenueExecutionSession[]>
+  markMultiVenueExecutionSessionRecovered(sessionId: string, note?: string): Promise<MultiVenueExecutionSession[]>
   onSnapshot(listener: (snapshot: AppSnapshot) => void): () => void
   onLicenseState(listener: (summary: LicenseSummary) => void): () => void
 }

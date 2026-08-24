@@ -51,19 +51,25 @@
     }
   },
   "dependencies": {
+    "@limitless-exchange/sdk": "^1.1.0",
     "@polymarket/clob-client-v2": "^1.1.0",
+    "@predictdotfun/sdk": "^1.3.8",
     "axios": "^1.19.0",
     "decimal.js": "^10.6.0",
+    "ethers": "^6.16.0",
     "https-proxy-agent": "^7.0.6",
     "playwright-core": "^1.62.1",
+    "socket.io-client": "^4.8.3",
     "undici": "^7.16.0",
     "viem": "^2.55.16",
+    "ws": "^8.21.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^5.2.0",
     "electron": "^43.4.0",
     "electron-builder": "^26.15.3",

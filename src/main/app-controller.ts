@@ -22,16 +22,22 @@ import type {
   RiskSettings,
   UpdateSettingsRequest
 } from '../shared/types'
+import type { MultiVenueExecutionReceipt, MultiVenueExecutionSession } from '../shared/multi-venue'
 import { defaultManualExecutionConditions, defaultSettlementDistanceRules } from '../shared/defaults'
 import { assertTransition } from './domain/execution-machine'
 import { calculateOpportunity, polymarketCryptoFeePerShare } from './domain/opportunity'
 import { calculateDepthExecutionPlan } from './domain/execution-plan'
+import { calculateExecutableOpportunityProfit } from './domain/opportunity-ranking'
 import { normalizeSettlementDistanceRules } from './domain/settlement-distance'
+import { buildLegacyMultiVenueBoard } from './platforms/legacy-board-adapter'
+import { buildReadOnlyComparisons, normalizeLegacyWindows } from './platforms/read-only-board-adapter'
 import { EventStore } from './services/event-store'
 import type { MexcBrowserManager } from './services/mexc-browser'
 import { SimulatedPolymarketBroker, type PolymarketBroker } from './services/polymarket'
 import type { PolymarketLiveBroker, PolymarketTradingCapacity } from './services/polymarket-live'
 import { PolymarketMarketData, type PolymarketWindowQuote } from './services/polymarket-market-data'
+import type { MultiVenueMarketData } from './services/multi-venue-market-data'
+import type { ExecutionSessionStore } from './services/execution-session-store'
 import type { MexcWindowQuote } from './services/mexc-browser'
 
 const DEFAULT_SETTINGS: RiskSettings = {
@@ -51,6 +57,7 @@ const DEFAULT_SETTINGS: RiskSettings = {
   polymarketProxyUrl: process.env.POLYMARKET_PROXY_URL ?? 'http://127.0.0.1:7890',
   mexcAutomationEnabled: false,
   polymarketLiveEnabled: false,
+  kalshiLiveEnabled: false,
   allowUnprofitableTestTrade: false,
   autoOpenEnabled: false,
   autoOpenQuantityMode: 'FIXED',
@@ -70,6 +77,22 @@ const TEST_TRADE_CAPITAL_HARD_LIMIT = new Decimal(12)
 const MEXC_MIN_NOTIONAL = new Decimal(1)
 const POLYMARKET_MIN_BUY_AMOUNT = new Decimal(1)
 const POLYMARKET_MAX_ORDER_PRICE = new Decimal('0.99')
+
+function currentPolymarketDiscoveryWindows(now = Date.now()): Array<{
+  durationMinutes: 5 | 15
+  startTime: number
+  endTime: number
+}> {
+  return ([5, 15] as const).map((durationMinutes) => {
+    const durationMs = durationMinutes * 60_000
+    const startTime = Math.floor(now / durationMs) * durationMs
+    return {
+      durationMinutes,
+      startTime,
+      endTime: startTime + durationMs
+    }
+  })
+}
 
 function isNonRetryablePolymarketError(message: string): boolean {
   return /余额不足|授权不足|最小下单量|最低.*单量|至少需要1抵押资产|低于1 USDC最小值|价格保护已触发|已超过最高可接受价|请求保护已触发|HTTP (?:403|429)/i.test(message)
@@ -111,6 +134,8 @@ export class AppController {
   private latestMexcWindows: MexcWindowQuote[] = []
   private latestPolymarketWindows: PolymarketWindowQuote[] = []
   private streamRefreshTimer?: NodeJS.Timeout
+  private streamBroadcastTimer?: NodeJS.Timeout
+  private lastStreamBroadcastAt = 0
   private closingOrderId?: string
   private activeExecutionPlan?: ExecutionPlan
   private autoOpenState: AutoOpenState = { status: 'OFF', message: '自动开单未启用', since: Date.now() }
@@ -122,20 +147,28 @@ export class AppController {
   private autoOpenLastFingerprint?: string
   private capacityRefreshTimer?: NodeJS.Timeout
   private licenseActive = false
+  private venueMonitoring = new Map<string, boolean>()
+  private multiVenueReceipt?: MultiVenueExecutionReceipt
+  private multiVenueExecutionSessions: MultiVenueExecutionSession[] = []
 
   constructor(
     private readonly store: EventStore,
     private readonly mexcBrowser: MexcBrowserManager,
     private readonly polymarketData = new PolymarketMarketData(),
     private readonly liveBroker?: PolymarketLiveBroker,
-    private readonly liveExecutionEnabled = process.env.ARB_ENABLE_LIVE_EXECUTION === 'true'
+    private readonly liveExecutionEnabled = process.env.ARB_ENABLE_LIVE_EXECUTION === 'true',
+    private readonly multiVenueData?: MultiVenueMarketData,
+    private readonly executionSessionStore?: ExecutionSessionStore
   ) {
     this.mexcBrowser.onMarketData?.(() => this.scheduleStreamingSnapshot())
     this.polymarketData.onMarketData?.(() => this.scheduleStreamingSnapshot())
+    this.multiVenueData?.onMarketData(() => this.scheduleStreamingSnapshot())
   }
 
   async initialize(): Promise<void> {
     await this.store.initialize()
+    await this.executionSessionStore?.initialize()
+    this.multiVenueExecutionSessions = await this.executionSessionStore?.listUnfinished() ?? []
     this.settings = await this.store.loadSettings(DEFAULT_SETTINGS)
     this.settings.manualExecutionConditions = defaultManualExecutionConditions(this.settings.manualExecutionConditions)
     this.settings.autoOpenEnabled = false
@@ -218,10 +251,57 @@ export class AppController {
     this.broadcast = broadcast
   }
 
+  async recordMultiVenueReceipt(receipt: MultiVenueExecutionReceipt): Promise<void> {
+    this.multiVenueReceipt = receipt
+    if (this.executionSessionStore) {
+      await this.executionSessionStore.recordReceipt(receipt)
+      this.multiVenueExecutionSessions = await this.executionSessionStore.listUnfinished()
+    }
+    const state: ExecutionState = receipt.status === 'HEDGED' ? 'HEDGED' : receipt.status === 'CANCELED' ? 'CANCELLED' : 'RECOVERY_REQUIRED'
+    const event: ExecutionEvent = {
+      id: randomUUID(), sessionId: receipt.sessionId, state, timestamp: Date.now(), message: receipt.message,
+      details: { comparisonId: receipt.comparisonId, firstVenue: receipt.firstLeg.venueId, secondVenue: receipt.secondLeg?.venueId ?? 'KALSHI' }
+    }
+    this.recentEvents = [event, ...this.recentEvents].slice(0, 80)
+    await this.store.appendEvent(event)
+    this.broadcast(this.getSnapshot())
+  }
+
+  async listMultiVenueExecutionSessions(): Promise<MultiVenueExecutionSession[]> {
+    this.multiVenueExecutionSessions = await this.executionSessionStore?.listUnfinished() ?? []
+    return [...this.multiVenueExecutionSessions]
+  }
+
+  async markMultiVenueExecutionSessionRecovered(sessionId: string, note?: string): Promise<MultiVenueExecutionSession[]> {
+    if (!this.executionSessionStore) throw new Error('执行会话持久化尚未启用')
+    await this.executionSessionStore.markRecovered(sessionId, note)
+    this.multiVenueExecutionSessions = await this.executionSessionStore.listUnfinished()
+    this.broadcast(this.getSnapshot())
+    return [...this.multiVenueExecutionSessions]
+  }
+
   setLicenseActive(active: boolean): void {
     if (this.licenseActive === active) return
     this.licenseActive = active
     this.syncCapacityRefreshTimer()
+  }
+
+  async setVenueMonitoring(venueId: string, enabled: boolean): Promise<AppSnapshot> {
+    const known = new Set(['MEXC', 'POLYMARKET', 'LIMITLESS', 'PREDICT_FUN', 'GATE', 'KALSHI'])
+    if (!known.has(venueId)) throw new Error(`不支持的平台监控开关：${venueId}`)
+    this.venueMonitoring.set(venueId, enabled)
+    if (venueId === 'MEXC') this.mexcBrowser.setMonitoringEnabled?.(enabled)
+    else if (venueId === 'POLYMARKET') this.polymarketData.setMonitoringEnabled?.(enabled)
+    else this.multiVenueData?.setVenueMonitoring(venueId, enabled)
+    if (!enabled) {
+      if (venueId === 'MEXC') this.latestMexcWindows = []
+      if (venueId === 'POLYMARKET') this.latestPolymarketWindows = []
+      if (venueId === 'MEXC' || venueId === 'POLYMARKET') this.opportunities = []
+      this.broadcast(this.getSnapshot())
+      return this.getSnapshot()
+    }
+    await this.refreshOpportunities().catch(() => undefined)
+    return this.getSnapshot()
   }
 
   getSnapshot(): AppSnapshot {
@@ -229,6 +309,18 @@ export class AppController {
     this.normalizeExpiredOrders(now)
     const mexcStatus = this.mexcBrowser.getStatus()
     const settlementFeedConnected = this.opportunities.some((opportunity) => Boolean(opportunity.polymarketSignal))
+    const mexcMonitoring = this.venueMonitoring.get('MEXC') !== false
+    const polymarketMonitoring = this.venueMonitoring.get('POLYMARKET') !== false
+    const mexcConnection = mexcMonitoring && mexcStatus.open ? 'CONNECTED' : 'DISCONNECTED'
+    const polymarketConnection = polymarketMonitoring && this.polymarketData.getStatus().connected ? 'CONNECTED' : 'DISCONNECTED'
+    const supplementalStatuses = this.multiVenueData?.getStatuses() ?? {}
+    const supplementalWindows = this.multiVenueData?.getWindows() ?? []
+    const allVenueWindows = [...normalizeLegacyWindows(this.latestMexcWindows, this.latestPolymarketWindows), ...supplementalWindows]
+    const readOnlyComparisons = buildReadOnlyComparisons(
+      allVenueWindows,
+      this.settings,
+      now
+    )
     return {
       generatedAt: now,
       connection: {
@@ -245,6 +337,28 @@ export class AppController {
       },
       settings: this.settings,
       opportunities: this.opportunities,
+      multiVenueReceipt: this.multiVenueReceipt,
+      multiVenueExecutionSessions: this.multiVenueExecutionSessions,
+      multiVenueBoard: buildLegacyMultiVenueBoard({
+        generatedAt: now,
+        opportunities: this.opportunities,
+        settings: this.settings,
+        connections: { MEXC: mexcConnection, POLYMARKET: polymarketConnection },
+        additionalConnections: Object.fromEntries(Object.entries(supplementalStatuses).map(([venueId, status]) => [venueId, status.connectionState])),
+        statusMessages: {
+          MEXC: mexcMonitoring ? this.mexcDataMessage : 'MEXC 监控已暂停，不会主动请求市场数据',
+          POLYMARKET: polymarketMonitoring ? this.polymarketDataMessage : 'Polymarket 监控已暂停，不会主动请求市场数据',
+          ...Object.fromEntries(Object.entries(supplementalStatuses).map(([venueId, status]) => [venueId, status.message]))
+        },
+        windows: allVenueWindows,
+        additionalComparisons: readOnlyComparisons,
+        monitoringEnabled: Object.fromEntries(['MEXC', 'POLYMARKET', 'LIMITLESS', 'PREDICT_FUN', 'GATE', 'KALSHI'].map((venueId) => [
+          venueId,
+          this.venueMonitoring.get(venueId) !== false && (venueId === 'LIMITLESS' || venueId === 'PREDICT_FUN' || venueId === 'GATE' || venueId === 'KALSHI'
+            ? this.multiVenueData?.isVenueMonitoringEnabled(venueId) !== false
+            : true)
+        ]))
+      }),
       orderHistory: this.orderHistory,
       activeSession: this.activeSessionForSnapshot(now),
       // 已到期的挂起恢复组不再展示，也从挂起区清掉。
@@ -438,6 +552,10 @@ export class AppController {
       if (!this.liveBroker || !await this.liveBroker.isConfigured()) {
         throw new Error('请先派生并加密保存Polymarket交易身份')
       }
+    }
+    if (next.kalshiLiveEnabled) {
+      if (next.mode !== 'ASSISTED') throw new Error('Kalshi双腿实盘目前只允许在人工监督模式启用')
+      if (!this.liveExecutionEnabled) throw new Error('实盘总开关未启用；开发环境请用 npm run dev:live 启动ArbDesk')
     }
     if (next.allowUnprofitableTestTrade && next.mode !== 'ASSISTED') {
       throw new Error('小额亏损联调只允许在人工监督模式启用')
@@ -1618,8 +1736,13 @@ export class AppController {
   }
 
   private async loadLiveOpportunities(): Promise<AppSnapshot> {
+    const supplementalRefresh = this.multiVenueData?.refresh()
     let mexcWindows: MexcWindowQuote[]
-    try {
+    if (this.venueMonitoring.get('MEXC') === false) {
+      mexcWindows = []
+      this.latestMexcWindows = []
+      this.mexcDataMessage = 'MEXC 监控已暂停，不会主动请求市场数据'
+    } else try {
       mexcWindows = await this.mexcBrowser.fetchActiveBtcWindows()
       this.latestMexcWindows = mexcWindows
       const monitoredDurations = [...new Set(mexcWindows.map((window) => window.durationMinutes))]
@@ -1633,19 +1756,30 @@ export class AppController {
       this.mexcDataMessage = `MEXC 读取失败：${error instanceof Error ? error.message : String(error)}`
       // 瞬时读取失败不清空列表：清空会导致左侧列表闪烁消失，
       // 保留上一次结果并让stale标记自然生效即可。
+      await supplementalRefresh?.catch(() => undefined)
+      const snapshot = this.getSnapshot()
+      this.broadcast(snapshot)
+      return snapshot
+    }
+    if (this.venueMonitoring.get('POLYMARKET') === false) {
+      this.latestPolymarketWindows = []
+      this.opportunities = []
+      this.polymarketDataMessage = 'Polymarket 监控已暂停，不会主动请求市场数据'
+      await supplementalRefresh?.catch(() => undefined)
       const snapshot = this.getSnapshot()
       this.broadcast(snapshot)
       return snapshot
     }
     try {
-      const polymarketWindows = await this.polymarketData.fetchWindows(mexcWindows.map((window) => ({
-        durationMinutes: window.durationMinutes as 5 | 15,
-        startTime: window.startTime,
-        endTime: window.endTime
-      })))
+      // Polymarket has its own rolling 5m/15m markets. Discovery must not be
+      // driven by whichever durations MEXC currently exposes, otherwise a
+      // missing MEXC 15m market incorrectly hides Polymarket's live 15m book.
+      const polymarketWindows = await this.polymarketData.fetchWindows(currentPolymarketDiscoveryWindows())
       this.latestPolymarketWindows = polymarketWindows
       this.polymarketDataMessage = this.polymarketData.getStatus().message
-      this.opportunities = this.combineLiveQuotes(mexcWindows, polymarketWindows)
+      this.opportunities = mexcWindows.length > 0
+        ? this.combineLiveQuotes(mexcWindows, polymarketWindows)
+        : []
       if (this.licenseActive && this.settings.polymarketLiveEnabled) {
         void this.prefetchPolymarketMarketsFor(
           this.opportunities.map((opportunity) => opportunity.polymarketTokenId ?? '')
@@ -1656,6 +1790,7 @@ export class AppController {
       this.polymarketDataMessage = this.polymarketData.getStatus().message
       // 同上：Polymarket瞬时失败保留上一次列表，避免整列闪烁。
     }
+    await supplementalRefresh?.catch(() => undefined)
     const snapshot = this.getSnapshot()
     this.broadcast(snapshot)
     return snapshot
@@ -1689,20 +1824,43 @@ export class AppController {
 
   private scheduleStreamingSnapshot(): void {
     if (this.streamRefreshTimer) return
+    // Coalesce noisy page/WS ticks before broadcasting to React. Execution
+    // reads fresh backend quotes separately; the board does not need a render
+    // for every websocket frame.
     this.streamRefreshTimer = setTimeout(() => {
       this.streamRefreshTimer = undefined
       const mexcWindows = this.mexcBrowser.getLatestWindows?.() ?? this.latestMexcWindows
       const polymarketWindows = this.polymarketData.getLatestWindows?.() ?? this.latestPolymarketWindows
-      if (mexcWindows.length === 0 || polymarketWindows.length === 0) return
-      this.latestMexcWindows = mexcWindows
-      this.latestPolymarketWindows = polymarketWindows
-      this.mexcDataMessage = `Hubstudio实时深度已接收，最近推送 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`
-      this.polymarketDataMessage = this.polymarketData.getStatus().message
-      this.opportunities = this.combineLiveQuotes(mexcWindows, polymarketWindows)
-      this.evaluateAutoOpen()
-      this.broadcast(this.getSnapshot())
-    }, 50)
+      const coreQuotesChanged = mexcWindows !== this.latestMexcWindows || polymarketWindows !== this.latestPolymarketWindows
+      if (coreQuotesChanged && mexcWindows.length > 0 && polymarketWindows.length > 0) {
+        this.latestMexcWindows = mexcWindows
+        this.latestPolymarketWindows = polymarketWindows
+        this.mexcDataMessage = `Hubstudio实时深度已接收，最近推送 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`
+        this.polymarketDataMessage = this.polymarketData.getStatus().message
+        this.opportunities = this.combineLiveQuotes(mexcWindows, polymarketWindows)
+        this.evaluateAutoOpen()
+      }
+      this.queueStreamingBroadcast()
+    }, 150)
     this.streamRefreshTimer.unref()
+  }
+
+  private queueStreamingBroadcast(): void {
+    const now = Date.now()
+    const elapsed = now - this.lastStreamBroadcastAt
+    if (elapsed >= 300 && !this.streamBroadcastTimer) {
+      this.lastStreamBroadcastAt = now
+      this.broadcast(this.getSnapshot())
+      return
+    }
+    if (this.streamBroadcastTimer) return
+    const delay = Math.max(1, 300 - Math.max(0, elapsed))
+    this.streamBroadcastTimer = setTimeout(() => {
+      this.streamBroadcastTimer = undefined
+      this.lastStreamBroadcastAt = Date.now()
+      this.broadcast(this.getSnapshot())
+    }, delay)
+    this.streamBroadcastTimer.unref()
   }
 
   private combineLiveQuotes(mexcWindows: MexcWindowQuote[], polymarketWindows: PolymarketWindowQuote[]): Opportunity[] {
@@ -1859,8 +2017,17 @@ export class AppController {
     const candidate = [...this.opportunities]
       .filter((opportunity) => this.autoOpportunityReady(opportunity))
       .sort((left, right) => {
-        const leftProfit = new Decimal(left.netEdgePerShare).mul(left.maxQuantity)
-        const rightProfit = new Decimal(right.netEdgePerShare).mul(right.maxQuantity)
+        const score = (opportunity: Opportunity): Decimal => calculateExecutableOpportunityProfit({
+          netEdgePerShare: opportunity.netEdgePerShare,
+          allInCostPerShare: opportunity.allInCostPerShare,
+          availableQuantity: opportunity.maxQuantity,
+          maxCapital: this.settings.maxCapitalPerTrade,
+          quantityMode: this.settings.autoOpenQuantityMode,
+          fixedQuantity: this.settings.autoOpenFixedQuantity,
+          maximumQuantityPct: this.settings.autoOpenMaxQuantityPct
+        })
+        const leftProfit = score(left)
+        const rightProfit = score(right)
         return rightProfit.comparedTo(leftProfit) || new Decimal(right.netEdgePerShare).comparedTo(left.netEdgePerShare)
       })[0]
     if (!candidate) {

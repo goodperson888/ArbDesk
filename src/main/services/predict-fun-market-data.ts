@@ -1,0 +1,768 @@
+import type { Direction, OrderBookLevel, PredictFunPageCaptureStatus } from '../../shared/types'
+import type { ReadOnlyOutcomeQuote, ReadOnlyVenueSource, ReadOnlyVenueStatus, ReadOnlyWindowQuote } from '../platforms/read-only-types'
+import WebSocket, { type ClientOptions, type RawData } from 'ws'
+import type { PredictFunPageCaptureSource } from './predict-fun-page-capture'
+
+const MAINNET_API = 'https://api.predict.fun'
+const DISCOVERY_CACHE_MS = 15_000
+const SNAPSHOT_CACHE_MS = 4_000
+const REST_BOOK_AUDIT_MS = 30_000
+const REQUEST_TIMEOUT_MS = 6_000
+
+interface PredictOutcome {
+  id?: string
+  name?: string
+  index?: number
+  onChainId?: string
+  bestAsk?: { price?: number; size?: number } | null
+}
+
+interface PredictMarket {
+  id?: number
+  feeRateBps?: number
+  tradingStatus?: string
+  decimalPrecision?: number
+  isNegRisk?: boolean
+  isYieldBearing?: boolean
+  outcomes?: PredictOutcome[]
+}
+
+export interface PredictFunPreparationCandidate {
+  marketId: string
+  outcomeId: string
+  direction: Direction
+  bestAsk: string
+  availableQuantity: string
+  feeRateBps: number
+  isNegRisk: boolean
+  isYieldBearing: boolean
+}
+
+interface PredictVariant {
+  type?: string
+  priceFeedProvider?: string
+  priceFeedId?: string
+  priceFeedSymbol?: string
+}
+
+interface PredictCategory {
+  slug?: string
+  startsAt?: string
+  endsAt?: string
+  status?: string
+  marketVariant?: string
+  resolutionProvider?: string
+  description?: string
+  variantData?: PredictVariant
+  markets?: PredictMarket[]
+}
+
+interface PredictCategoriesResponse {
+  success?: boolean
+  data?: PredictCategory[]
+}
+
+interface PredictBookResponse {
+  success?: boolean
+  data?: {
+    marketId?: number
+    updateTimestampMs?: number
+    asks?: Array<[number, number]>
+    bids?: Array<[number, number]>
+  }
+}
+
+interface PredictStreamMessage {
+  type?: string
+  requestId?: number
+  topic?: string
+  data?: unknown
+  success?: boolean
+  error?: { code?: string; message?: string }
+}
+
+interface PredictGraphqlCategory {
+  id?: string
+  slug?: string
+  startsAt?: string
+  endsAt?: string
+  status?: string
+  marketVariant?: string
+  resolutionProvider?: string
+  description?: string
+  marketData?: Array<{
+    marketId?: string
+    priceFeedProvider?: string
+    priceFeedId?: string
+    priceFeedSymbol?: string
+  }>
+  markets?: { edges?: Array<{ node?: PredictGraphqlMarket }> } | PredictGraphqlMarket[]
+}
+
+interface PredictGraphqlMarket {
+  id?: string
+  decimalPrecision?: number
+  takerFeeBps?: number
+  isNegRisk?: boolean
+  isYieldBearing?: boolean
+  isTradingEnabled?: boolean
+  status?: string
+  outcomes?: { edges?: Array<{ node?: PredictOutcome }> } | PredictOutcome[]
+  category?: PredictGraphqlCategory
+}
+
+function isCryptoCategory(category: PredictGraphqlCategory): boolean {
+  const variant = String(category.marketVariant ?? '').toUpperCase()
+  if (/CRYPTO.?UP.?DOWN/.test(variant)) return true
+  const text = `${category.slug ?? ''} ${category.description ?? ''}`.toUpperCase()
+  return text.includes('BTC') && /UP.?DOWN|HIGHER.?LOWER|RISE.?FALL/.test(text)
+}
+
+function categoriesFromGraphql(body: unknown): PredictCategory[] {
+  const markets = new Map<string, { market: PredictGraphqlMarket; category: PredictGraphqlCategory }>()
+  const visited = new Set<object>()
+  const walk = (value: unknown, depth: number): void => {
+    if (!value || typeof value !== 'object' || depth > 10 || visited.has(value)) return
+    visited.add(value)
+    if (Array.isArray(value)) {
+      for (const entry of value) walk(entry, depth + 1)
+      return
+    }
+    const candidate = value as PredictGraphqlMarket & PredictGraphqlCategory & Record<string, unknown>
+    if (isCryptoCategory(candidate)) {
+      const marketNodes = Array.isArray(candidate.markets)
+        ? candidate.markets
+        : candidate.markets?.edges?.flatMap((edge) => edge.node ? [edge.node] : []) ?? []
+      for (const node of marketNodes) {
+        if (node.id) markets.set(String(node.id), { market: node, category: candidate })
+      }
+    }
+    if (candidate.id && candidate.category && isCryptoCategory(candidate.category) &&
+      !Array.isArray(candidate.outcomes) && Array.isArray(candidate.outcomes?.edges)) {
+      markets.set(String(candidate.id), { market: candidate, category: candidate.category })
+      return
+    }
+    for (const [key, entry] of Object.entries(candidate)) {
+      if (key === 'timeseries' || key === 'assetOhlc' || key === 'statistics' || key === 'description') continue
+      walk(entry, depth + 1)
+    }
+  }
+  walk(body, 0)
+  return [...markets.values()].flatMap(({ market, category }) => {
+    const marketId = Number(market.id)
+    if (!category || !Number.isFinite(marketId)) return []
+    const marketData = category.marketData?.find((entry) => String(entry.marketId) === String(market.id)) ?? category.marketData?.[0]
+    return [{
+      slug: category.slug ?? category.id,
+      startsAt: category.startsAt,
+      endsAt: category.endsAt,
+      status: category.status,
+      marketVariant: category.marketVariant ?? 'CRYPTO_UP_DOWN',
+      resolutionProvider: category.resolutionProvider,
+      description: category.description,
+      variantData: {
+        type: category.marketVariant,
+        priceFeedProvider: marketData?.priceFeedProvider,
+        priceFeedId: marketData?.priceFeedId,
+        priceFeedSymbol: marketData?.priceFeedSymbol
+      },
+      markets: [{
+        id: marketId,
+        feeRateBps: market.takerFeeBps,
+        isNegRisk: market.isNegRisk,
+        isYieldBearing: market.isYieldBearing,
+        tradingStatus: market.isTradingEnabled !== false && market.status === 'REGISTERED' ? 'OPEN' : market.status,
+        decimalPrecision: market.decimalPrecision,
+        outcomes: Array.isArray(market.outcomes)
+          ? market.outcomes
+          : market.outcomes?.edges?.flatMap((edge) => edge.node ? [edge.node] : []) ?? [
+          { name: 'Up', onChainId: `predict-page:${marketId}:up` },
+          { name: 'Down', onChainId: `predict-page:${marketId}:down` }
+          ]
+      }]
+    }]
+  })
+}
+
+function levelsFromBook(book: PredictBookResponse, fallback: PredictOutcome | undefined): OrderBookLevel[] {
+  const asks = (book.data?.asks ?? [])
+    .filter(([price, quantity]) => price > 0 && price < 1 && quantity > 0)
+    .map(([price, quantity]) => ({ price: String(price), size: String(quantity) }))
+    .sort((left, right) => Number(left.price) - Number(right.price))
+  if (asks.length > 0) return asks
+  const best = fallback?.bestAsk
+  return best && Number(best.price) > 0 && Number(best.size) > 0
+    ? [{ price: String(best.price), size: String(best.size) }]
+    : []
+}
+
+function noLevelsFromYesBook(book: PredictBookResponse, fallback: PredictOutcome | undefined, precision: number): OrderBookLevel[] {
+  const factor = 10 ** precision
+  const levels = (book.data?.bids ?? [])
+    .filter(([price, quantity]) => price > 0 && price < 1 && quantity > 0)
+    .map(([price, quantity]) => ({ price: String(Math.round((1 - price) * factor) / factor), size: String(quantity) }))
+    .sort((left, right) => Number(left.price) - Number(right.price))
+  if (levels.length > 0) return levels
+  const best = fallback?.bestAsk
+  return best && Number(best.price) > 0 && Number(best.size) > 0
+    ? [{ price: String(best.price), size: String(best.size) }]
+    : []
+}
+
+function outcome(direction: Direction, source: PredictOutcome | undefined, levels: OrderBookLevel[], receivedAt: number): ReadOnlyOutcomeQuote | undefined {
+  const best = levels[0]
+  if (!source?.onChainId || !best) return undefined
+  return { direction, outcomeId: source.onChainId, bestAsk: best.price, askSize: best.size, levels, receivedAt }
+}
+
+function assetSymbol(category: PredictCategory): string {
+  return (category.variantData?.priceFeedSymbol ?? `${category.slug ?? ''} ${category.description ?? ''}`)
+    .toUpperCase().replace(/[/_-]/g, '')
+}
+
+function receivedAtFromBook(value: unknown, fallback: number): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback
+  // A few page/API versions label a Unix-seconds timestamp as
+  // updateTimestampMs. Normalize it before the board's freshness check.
+  return parsed < 100_000_000_000 ? parsed * 1_000 : parsed
+}
+
+function categoryTimestamp(value: unknown): number {
+  if (typeof value === 'number' || (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim()))) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed) && parsed > 0) return parsed < 100_000_000_000 ? parsed * 1_000 : parsed
+  }
+  return Date.parse(String(value ?? ''))
+}
+
+function isOpenStatus(value: string | undefined): boolean {
+  return !value || ['OPEN', 'ACTIVE', 'LIVE', 'TRADING', 'REGISTERED'].includes(value.toUpperCase())
+}
+
+function predictOutcomeDirection(outcome: PredictOutcome): Direction | undefined {
+  if (outcome.index === 1) return 'UP'
+  if (outcome.index === 2) return 'DOWN'
+  const name = String(outcome.name ?? '').trim().toUpperCase()
+  if (/^(?:UP|YES|RISE|HIGHER|涨|上漲|上涨|升)$/.test(name)) return 'UP'
+  if (/^(?:DOWN|NO|FALL|LOWER|跌|下跌|下降|降)$/.test(name)) return 'DOWN'
+  return undefined
+}
+
+function selectCandidates(categories: PredictCategory[], now: number): Array<{ category: PredictCategory; market: PredictMarket }> {
+  return categories
+    // Older page/API responses omit marketVariant. The rolling BTC slug is a
+    // safe second signal and keeps those markets from being discarded before
+    // their actual order book is inspected.
+    .filter((category) => {
+      const variantText = `${category.marketVariant ?? ''} ${category.slug ?? ''} ${category.description ?? ''}`
+      return isOpenStatus(category.status) && /CRYPTO.?UP.?DOWN|BTC.?UP.?DOWN/i.test(variantText)
+    })
+    .filter((category) => /BTC(?:USD|USDT|UPDOWN)?/.test(assetSymbol(category)))
+    .filter((category) => categoryTimestamp(category.endsAt) > now && categoryTimestamp(category.startsAt) < now + 16 * 60_000)
+    .flatMap((category) => (category.markets ?? [])
+      .filter((market) => isOpenStatus(market.tradingStatus))
+      .map((market) => ({ category, market })))
+    .sort((left, right) => categoryTimestamp(left.category.startsAt) - categoryTimestamp(right.category.startsAt))
+    .slice(0, 4)
+}
+
+function parseCategory(category: PredictCategory, market: PredictMarket, book: PredictBookResponse, receivedAt: number): ReadOnlyWindowQuote | undefined {
+  const startTime = categoryTimestamp(category.startsAt)
+  const endTime = categoryTimestamp(category.endsAt)
+  const duration = Math.round((endTime - startTime) / 60_000)
+  if (!Number.isFinite(startTime) || !Number.isFinite(endTime) || (duration !== 5 && duration !== 15) || !market.id) return undefined
+  // The public page localizes outcome names (for example 涨/跌 on zh-CN),
+  // while the stable GraphQL outcome index remains 1=UP and 2=DOWN.
+  // Prefer that index and retain multilingual names for older responses.
+  const upSource = market.outcomes?.find((candidate) => predictOutcomeDirection(candidate) === 'UP')
+  const downSource = market.outcomes?.find((candidate) => predictOutcomeDirection(candidate) === 'DOWN')
+  const precision = Number.isInteger(market.decimalPrecision) ? Number(market.decimalPrecision) : 2
+  const up = outcome('UP', upSource, levelsFromBook(book, upSource), receivedAt)
+  const down = outcome('DOWN', downSource, noLevelsFromYesBook(book, downSource, precision), receivedAt)
+  if (!up && !down) return undefined
+  const feedId = category.variantData?.priceFeedId ?? 'unknown'
+  const feedSymbol = category.variantData?.priceFeedSymbol ?? 'BTCUSDT'
+  return {
+    venueId: 'PREDICT_FUN', marketId: String(market.id), asset: 'BTC/USD', durationMinutes: duration,
+    startTime, endTime, feeRateBps: Number(market.feeRateBps ?? 0), feeVerified: false,
+    resolution: {
+      asset: 'BTC/USD', startTime, endTime, baselineSource: `CHAINLINK:${feedId}`,
+      settlementSource: `CHAINLINK:${feedId}`, observationMethod: `${feedSymbol} 5m candle close immediately before end`,
+      comparisonOperator: 'GT', tieOutcome: 'SPLIT', voidRule: 'Unavailable Chainlink data: consensus of reliable sources',
+      staleDataRule: 'Fallback to consensus of reliable sources', timezone: 'UTC',
+      ruleVersion: 'predict-crypto-up-down-chainlink-v1', evidenceUrl: `https://predict.fun/market/${market.id}`
+    },
+    outcomes: { ...(up ? { UP: up } : {}), ...(down ? { DOWN: down } : {}) }
+  }
+}
+
+export class PredictFunMarketData implements ReadOnlyVenueSource {
+  readonly venueId = 'PREDICT_FUN'
+  private monitoringEnabled = true
+  private status: ReadOnlyVenueStatus = { connectionState: 'NOT_CONFIGURED', message: '等待官方 API Key 或 Predict.fun 单页面被动行情', marketCount: 0 }
+  private discovery?: { fetchedAt: number; categories: PredictCategory[] }
+  private snapshot?: { fetchedAt: number; windows: ReadOnlyWindowQuote[] }
+  private inFlight?: Promise<ReadOnlyWindowQuote[]>
+  private lastRestBookAt = 0
+  private socket?: WebSocket
+  private socketApiKey = ''
+  private desiredTopics = new Set<string>()
+  private activeTopics = new Set<string>()
+  private marketContexts = new Map<string, { category: PredictCategory; market: PredictMarket }>()
+  private reconnectTimer?: NodeJS.Timeout
+  private reconnectAttempt = 0
+  private requestId = 0
+  private pendingSubscriptions = new Map<number, { method: 'subscribe' | 'unsubscribe'; topic: string }>()
+  private listeners = new Set<() => void>()
+
+  constructor(
+    private readonly apiKeyProvider: () => Promise<string | undefined>,
+    private readonly apiBase = MAINNET_API,
+    private readonly options: {
+      enableStreaming?: boolean
+      autoStartPageCapture?: boolean
+      webSocketUrl?: string
+      webSocketFactory?: (url: string, options: ClientOptions) => WebSocket
+      pageCapture?: PredictFunPageCaptureSource
+    } = {}
+  ) {
+    options.pageCapture?.onResponse((event) => this.ingestCapturedResponse(event.url, event.body, event.receivedAt))
+    options.pageCapture?.onWebSocketFrame((event) => this.ingestCapturedWebSocketFrame(event.payload))
+    options.pageCapture?.onStatus((captureStatus) => {
+      if (this.socketApiKey) return
+      const parsedSuffix = (this.snapshot?.windows.length ?? 0) > 0
+        ? `；已形成 ${this.snapshot?.windows.length ?? 0} 个可比较盘口`
+        : this.marketContexts.size > 0
+          ? `；已识别 ${this.marketContexts.size} 个 BTC 5m/15m 市场，等待页面盘口推送`
+          : ''
+      this.status = {
+        connectionState: captureStatus.state === 'CONNECTED' ? 'CONNECTED' : captureStatus.state === 'IDLE' ? 'NOT_CONFIGURED' : 'DISCONNECTED',
+        message: `${captureStatus.message}${parsedSuffix}`,
+        marketCount: this.snapshot?.windows.length ?? 0,
+        updatedAt: captureStatus.updatedAt
+      }
+      this.emitMarketData()
+    })
+  }
+
+  getStatus(): ReadOnlyVenueStatus {
+    return { ...this.status }
+  }
+
+  getLatestWindows(): ReadOnlyWindowQuote[] {
+    return this.snapshot?.windows ?? []
+  }
+
+  getPreparationCandidate(): PredictFunPreparationCandidate | undefined {
+    const windows = this.snapshot?.windows ?? []
+    for (const window of windows) {
+      const context = this.marketContexts.get(window.marketId)
+      const quote = window.outcomes.UP ?? window.outcomes.DOWN
+      if (!context || !quote) continue
+      return {
+        marketId: window.marketId,
+        outcomeId: quote.outcomeId,
+        direction: quote.direction,
+        bestAsk: quote.bestAsk,
+        availableQuantity: quote.askSize,
+        feeRateBps: Number(context.market.feeRateBps ?? window.feeRateBps ?? 0),
+        isNegRisk: Boolean(context.market.isNegRisk),
+        isYieldBearing: Boolean(context.market.isYieldBearing)
+      }
+    }
+    return undefined
+  }
+
+  onMarketData(listener: () => void): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  setMonitoringEnabled(enabled: boolean): void {
+    if (this.monitoringEnabled === enabled) return
+    this.monitoringEnabled = enabled
+    if (!enabled) {
+      this.stopPageCapture()
+      this.status = { connectionState: 'DISCONNECTED', message: 'Predict.fun 监控已暂停，不会主动请求市场数据', marketCount: 0 }
+      this.emitMarketData()
+    }
+  }
+
+  credentialsChanged(): void {
+    this.closeMarketStream()
+    this.socketApiKey = ''
+    this.discovery = undefined
+    this.snapshot = undefined
+    this.lastRestBookAt = 0
+  }
+
+  async openPageCapture(): Promise<void> {
+    await this.options.pageCapture?.start(true)
+  }
+
+  stopPageCapture(): void {
+    this.options.pageCapture?.stop()
+    // Keep official API mode untouched. In no-key mode the page is the only
+    // source, so remove its old snapshot immediately instead of showing stale
+    // opportunities after the user releases the Chromium page.
+    if (!this.socketApiKey) {
+      this.discovery = undefined
+      this.snapshot = undefined
+      this.marketContexts.clear()
+      this.emitMarketData()
+    }
+  }
+
+  getPageCaptureStatus(): PredictFunPageCaptureStatus {
+    const captureStatus = this.options.pageCapture?.getStatus()
+    if (captureStatus) return { ...captureStatus, message: this.status.message }
+    return {
+      state: 'IDLE',
+      message: '当前版本未启用 Predict.fun 网页被动行情'
+    }
+  }
+
+  async fetchWindows(signal?: AbortSignal): Promise<ReadOnlyWindowQuote[]> {
+    if (!this.monitoringEnabled) return []
+    const now = Date.now()
+    const discoveryFresh = Boolean(this.discovery && now - this.discovery.fetchedAt < DISCOVERY_CACHE_MS)
+    if (this.snapshot && (this.socket?.readyState === WebSocket.OPEN ? discoveryFresh : now - this.snapshot.fetchedAt < SNAPSHOT_CACHE_MS)) return this.snapshot.windows
+    if (this.inFlight) return await this.inFlight
+    this.inFlight = this.load(signal)
+    try {
+      return await this.inFlight
+    } finally {
+      this.inFlight = undefined
+    }
+  }
+
+  private async load(signal?: AbortSignal): Promise<ReadOnlyWindowQuote[]> {
+    const apiKey = (await this.apiKeyProvider())?.trim()
+    if (!apiKey) {
+      this.closeMarketStream()
+      const captureStatusBeforeStart = this.options.pageCapture?.getStatus()
+      if (this.options.autoStartPageCapture !== false || (captureStatusBeforeStart && (captureStatusBeforeStart.state === 'CONNECTED' || captureStatusBeforeStart.state === 'STARTING'))) {
+        await this.options.pageCapture?.start(false)
+      }
+      const captureStatus = this.options.pageCapture?.getStatus()
+      const windows = this.snapshot?.windows ?? []
+      this.status = {
+        connectionState: captureStatus?.state === 'CONNECTED' ? 'CONNECTED' : captureStatus?.state === 'STARTING' ? 'DISCONNECTED' : 'NOT_CONFIGURED',
+        message: this.options.autoStartPageCapture === false && (!captureStatus || captureStatus.state === 'IDLE')
+          ? '未配置主网 API Key；点击“打开 Predict.fun 页面”后开始监听'
+          : captureStatus?.message ?? '未配置主网 API Key；点击“打开 Predict.fun 页面”后开始监听',
+        marketCount: windows.length,
+        updatedAt: captureStatus?.updatedAt
+      }
+      return windows
+    }
+    try {
+      const now = Date.now()
+      let categories = this.discovery?.categories
+      if (!categories || now - (this.discovery?.fetchedAt ?? 0) >= DISCOVERY_CACHE_MS) {
+        const response = await this.fetchJson<PredictCategoriesResponse>(
+          `${this.apiBase}/v1/categories?first=50&status=OPEN&marketVariant=CRYPTO_UP_DOWN`, apiKey, signal
+        )
+        categories = response.data ?? []
+        this.discovery = { fetchedAt: now, categories }
+      }
+      const candidates = selectCandidates(categories, now)
+      this.ensureMarketStream(candidates, apiKey)
+      const current = new Map((this.snapshot?.windows ?? []).map((window) => [window.marketId, window]))
+      const shouldAuditAllBooks = this.socket?.readyState !== WebSocket.OPEN || now - this.lastRestBookAt >= REST_BOOK_AUDIT_MS
+      const booksToFetch = candidates.filter(({ market }) => Boolean(market.id) && (shouldAuditAllBooks || !current.has(String(market.id))))
+      const results = await Promise.allSettled(booksToFetch.map(async ({ category, market }) => {
+        if (!market.id) return undefined
+        const book = await this.fetchJson<PredictBookResponse>(`${this.apiBase}/v1/markets/${market.id}/orderbook`, apiKey, signal)
+        return parseCategory(category, market, book, receivedAtFromBook(book.data?.updateTimestampMs, Date.now()))
+      }))
+      for (const result of results) {
+        if (result.status === 'fulfilled' && result.value) current.set(result.value.marketId, result.value)
+      }
+      if (shouldAuditAllBooks) this.lastRestBookAt = Date.now()
+      const windows = candidates.flatMap(({ market }) => market.id && current.has(String(market.id)) ? [current.get(String(market.id))!] : [])
+      this.snapshot = { fetchedAt: Date.now(), windows }
+      this.status = {
+        connectionState: 'CONNECTED', marketCount: windows.length, updatedAt: Date.now(),
+        message: this.socket?.readyState === WebSocket.OPEN
+          ? `WebSocket实时盘口已连接（${windows.length}个 BTC 5m/15m 市场）；REST每15秒发现轮次、每30秒校准盘口`
+          : `REST行情已连接（${windows.length}个市场），WebSocket正在连接；断线期间最多每5秒刷新盘口`
+      }
+      return windows
+    } catch (error) {
+      this.status = { ...this.status, connectionState: 'DISCONNECTED', message: `Predict.fun读取失败：${error instanceof Error ? error.message : String(error)}` }
+      throw error
+    }
+  }
+
+  private ensureMarketStream(candidates: Array<{ category: PredictCategory; market: PredictMarket }>, apiKey: string): void {
+    if (this.options.enableStreaming === false || !this.monitoringEnabled) return
+    this.marketContexts = new Map(candidates.flatMap((context) => context.market.id ? [[String(context.market.id), context]] : []))
+    this.desiredTopics = new Set([...this.marketContexts.keys()].flatMap((marketId) => [
+      `predictOrderbook/${marketId}`,
+      `predictTradingStatus/${marketId}`,
+      `predictMarketStatus/${marketId}`
+    ]))
+    if (this.socket && this.socketApiKey === apiKey) {
+      if (this.socket.readyState === WebSocket.OPEN) this.syncSubscriptions()
+      return
+    }
+    this.closeMarketStream()
+    this.socketApiKey = apiKey
+    this.openMarketStream()
+  }
+
+  private openMarketStream(): void {
+    if (!this.socketApiKey || this.options.enableStreaming === false || !this.monitoringEnabled || this.reconnectTimer) return
+    const createSocket = this.options.webSocketFactory ?? ((url, options) => new WebSocket(url, options))
+    const socket = createSocket(this.options.webSocketUrl ?? 'wss://ws.predict.fun/ws', {
+      headers: { 'x-api-key': this.socketApiKey, 'user-agent': 'ArbDesk/0.1' }
+    })
+    this.socket = socket
+    socket.on('open', () => {
+      if (this.socket !== socket) return
+      this.reconnectAttempt = 0
+      this.activeTopics.clear()
+      this.syncSubscriptions()
+      this.status = {
+        connectionState: 'CONNECTED', marketCount: this.snapshot?.windows.length ?? 0, updatedAt: Date.now(),
+        message: `WebSocket实时盘口已连接（${this.marketContexts.size}个市场）；REST只做轮次发现和30秒校准`
+      }
+      this.emitMarketData()
+    })
+    socket.on('message', (data: RawData) => this.handleStreamMessage(socket, data))
+    socket.on('close', () => {
+      if (this.socket !== socket) return
+      this.socket = undefined
+      this.activeTopics.clear()
+      this.status = {
+        ...this.status, connectionState: this.snapshot ? 'CONNECTED' : 'DISCONNECTED',
+        message: 'WebSocket已断开，按退避策略重连；REST低频兜底仍启用'
+      }
+      this.emitMarketData()
+      this.scheduleReconnect()
+    })
+    socket.on('error', (error: Error) => {
+      if (this.socket !== socket) return
+      this.status = { ...this.status, message: `WebSocket连接异常，使用REST兜底：${error.message}` }
+    })
+  }
+
+  private handleStreamMessage(socket: WebSocket, raw: RawData): void {
+    if (this.socket !== socket) return
+    let message: PredictStreamMessage
+    try {
+      message = JSON.parse(raw.toString()) as PredictStreamMessage
+    } catch {
+      return
+    }
+    this.handleStreamPayload(message, true)
+  }
+
+  private handleStreamPayload(message: PredictStreamMessage, officialSocket: boolean): void {
+    if (message.type === 'R' && officialSocket) {
+      const pending = typeof message.requestId === 'number' ? this.pendingSubscriptions.get(message.requestId) : undefined
+      if (typeof message.requestId === 'number') this.pendingSubscriptions.delete(message.requestId)
+      if (message.success === false) {
+        if (pending?.method === 'subscribe') this.activeTopics.delete(pending.topic)
+        this.status = { ...this.status, message: `WebSocket订阅失败：${message.error?.code ?? 'unknown'} ${message.error?.message ?? ''}`.trim() }
+      }
+      return
+    }
+    if (message.type !== 'M' || !message.topic) return
+    if (message.topic === 'heartbeat') {
+      if (officialSocket) this.sendStreamRequest({ method: 'heartbeat', data: message.data })
+      return
+    }
+    const orderbookMatch = /(?:predict)?order[._:/-]?book[/:](\d+)$|^(\d+)[/:](?:predict)?order[._:/-]?book$/i.exec(message.topic)
+    const parsedData = typeof message.data === 'string'
+      ? (() => { try { return JSON.parse(message.data) as unknown } catch { return undefined } })()
+      : message.data
+    const dataRecord = parsedData && typeof parsedData === 'object' ? parsedData as Record<string, unknown> : undefined
+    const nestedBook = dataRecord?.orderbook && typeof dataRecord.orderbook === 'object'
+      ? dataRecord.orderbook as Record<string, unknown>
+      : dataRecord?.orderBook && typeof dataRecord.orderBook === 'object'
+        ? dataRecord.orderBook as Record<string, unknown>
+        : undefined
+    const bookRecord = nestedBook ? { ...dataRecord, ...nestedBook } : dataRecord
+    const dataMarketId = bookRecord?.marketId ?? bookRecord?.market_id ?? bookRecord?.id ?? dataRecord?.marketId ?? dataRecord?.market_id
+    const hasBookData = Array.isArray(bookRecord?.asks) || Array.isArray(bookRecord?.bids) ||
+      Array.isArray(bookRecord?.yes) || Array.isArray(bookRecord?.no)
+    const resolvedMarketId = orderbookMatch?.[1] ?? orderbookMatch?.[2] ??
+      (dataMarketId !== undefined && (hasBookData || /order|book/i.test(message.topic)) ? String(dataMarketId) : undefined)
+    if (resolvedMarketId && bookRecord) {
+      const context = this.marketContexts.get(resolvedMarketId)
+      if (!context) return
+      const book = { success: true, data: bookRecord as PredictBookResponse['data'] }
+      const parsed = parseCategory(context.category, context.market, book, receivedAtFromBook(book.data?.updateTimestampMs, Date.now()))
+      if (!parsed) return
+      const windows = [...(this.snapshot?.windows ?? []).filter((window) => window.marketId !== parsed.marketId), parsed]
+        .sort((left, right) => left.startTime - right.startTime || left.durationMinutes - right.durationMinutes)
+      this.snapshot = { fetchedAt: Date.now(), windows }
+      this.status = {
+        connectionState: 'CONNECTED', marketCount: windows.length, updatedAt: Date.now(),
+        message: officialSocket
+          ? `官方WebSocket实时盘口已连接，最近推送 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`
+          : `网页单页面被动盘口已接收，最近推送 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}；未额外请求接口`
+      }
+      this.emitMarketData()
+      return
+    }
+    const lifecycleMatch = /^predict(?:Trading|Market)Status[/:](\d+)$/i.exec(message.topic)
+    if (lifecycleMatch && message.data && typeof message.data === 'object') {
+      const status = String((message.data as { tradingStatus?: string; status?: string }).tradingStatus ?? (message.data as { status?: string }).status ?? '')
+      if (status === 'CLOSED') {
+        this.discovery = undefined
+        if (this.snapshot) this.snapshot = { fetchedAt: Date.now(), windows: this.snapshot.windows.filter((window) => window.marketId !== lifecycleMatch[1]) }
+        this.emitMarketData()
+      }
+    }
+  }
+
+  private ingestCapturedResponse(url: string, rawBody: string, receivedAt: number): void {
+    if (!this.monitoringEnabled) return
+    let body: unknown
+    try {
+      body = JSON.parse(rawBody) as unknown
+    } catch {
+      return
+    }
+    let path: string
+    try {
+      path = new URL(url).pathname
+    } catch {
+      return
+    }
+    if (path.includes('/v1/categories')) {
+      const response = body as PredictCategoriesResponse
+      if (!Array.isArray(response.data)) return
+      this.discovery = { fetchedAt: receivedAt, categories: response.data }
+      const candidates = selectCandidates(response.data, receivedAt)
+      this.marketContexts = new Map(candidates.flatMap((context) => context.market.id ? [[String(context.market.id), context]] : []))
+      if (this.snapshot) {
+        const wanted = new Set(this.marketContexts.keys())
+        this.snapshot = { fetchedAt: receivedAt, windows: this.snapshot.windows.filter((window) => wanted.has(window.marketId)) }
+      }
+      this.status = {
+        connectionState: 'CONNECTED', marketCount: this.snapshot?.windows.length ?? 0, updatedAt: receivedAt,
+        message: candidates.length > 0
+          ? `网页单页面已捕获市场目录（${candidates.length}个 BTC 5m/15m 候选）；等待网页盘口`
+          : '网页单页面已收到市场目录，但没有匹配当前 BTC 5m/15m：可能是页面登录/地区限制或市场字段仍在轮换'
+      }
+      this.emitMarketData()
+      return
+    }
+    if (path.endsWith('/graphql')) {
+      const capturedCategories = categoriesFromGraphql(body)
+      if (capturedCategories.length === 0) return
+      const categoriesBySlug = new Map((this.discovery?.categories ?? []).map((category) => [category.slug, category]))
+      for (const category of capturedCategories) categoriesBySlug.set(category.slug, category)
+      const categories = [...categoriesBySlug.values()]
+      this.discovery = { fetchedAt: receivedAt, categories }
+      const candidates = selectCandidates(categories, receivedAt)
+      this.marketContexts = new Map(candidates.flatMap((context) => context.market.id ? [[String(context.market.id), context]] : []))
+      if (this.snapshot) {
+        const wanted = new Set(this.marketContexts.keys())
+        this.snapshot = { fetchedAt: receivedAt, windows: this.snapshot.windows.filter((window) => wanted.has(window.marketId)) }
+      }
+      this.status = {
+        connectionState: 'CONNECTED', marketCount: this.snapshot?.windows.length ?? 0, updatedAt: receivedAt,
+        message: candidates.length > 0
+          ? `网页单页面已捕获新版 GraphQL 市场目录（${candidates.length}个 BTC 5m/15m 候选）；等待页面盘口推送`
+          : '网页单页面已捕获 GraphQL，但没有匹配当前 BTC 5m/15m：页面可能只返回历史/其他资产市场'
+      }
+      this.emitMarketData()
+      return
+    }
+    const orderbookMatch = /^\/v1\/markets\/(\d+)\/orderbook$/.exec(path)
+    if (!orderbookMatch) return
+    const context = this.marketContexts.get(orderbookMatch[1])
+    if (!context) return
+    const book = body as PredictBookResponse
+    const parsed = parseCategory(context.category, context.market, book, receivedAtFromBook(book.data?.updateTimestampMs, receivedAt))
+    if (parsed) this.applyCapturedWindow(parsed, receivedAt)
+  }
+
+  private ingestCapturedWebSocketFrame(rawPayload: string): void {
+    if (!this.monitoringEnabled) return
+    let message: PredictStreamMessage
+    try {
+      message = JSON.parse(rawPayload) as PredictStreamMessage
+    } catch {
+      return
+    }
+    this.handleStreamPayload(message, false)
+  }
+
+  private applyCapturedWindow(parsed: ReadOnlyWindowQuote, receivedAt: number): void {
+    const windows = [...(this.snapshot?.windows ?? []).filter((window) => window.marketId !== parsed.marketId), parsed]
+      .sort((left, right) => left.startTime - right.startTime || left.durationMinutes - right.durationMinutes)
+    this.snapshot = { fetchedAt: receivedAt, windows }
+    this.status = {
+      connectionState: 'CONNECTED', marketCount: windows.length, updatedAt: receivedAt,
+      message: `网页单页面被动盘口已接收（${windows.length}个市场）；没有额外调用内部接口`
+    }
+    this.emitMarketData()
+  }
+
+  private syncSubscriptions(): void {
+    if (this.socket?.readyState !== WebSocket.OPEN) return
+    for (const topic of this.activeTopics) {
+      if (!this.desiredTopics.has(topic)) {
+        this.sendSubscriptionRequest('unsubscribe', topic)
+        this.activeTopics.delete(topic)
+      }
+    }
+    for (const topic of this.desiredTopics) {
+      if (this.activeTopics.has(topic)) continue
+      this.sendSubscriptionRequest('subscribe', topic)
+      this.activeTopics.add(topic)
+    }
+  }
+
+  private sendStreamRequest(payload: Record<string, unknown>): void {
+    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(payload))
+  }
+
+  private sendSubscriptionRequest(method: 'subscribe' | 'unsubscribe', topic: string): void {
+    const requestId = ++this.requestId
+    this.pendingSubscriptions.set(requestId, { method, topic })
+    this.sendStreamRequest({ method, requestId, params: [topic] })
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer || !this.socketApiKey || this.options.enableStreaming === false || !this.monitoringEnabled) return
+    const delay = Math.min(30_000, 1_000 * 2 ** Math.min(this.reconnectAttempt, 5))
+    this.reconnectAttempt += 1
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined
+      this.openMarketStream()
+    }, delay)
+    this.reconnectTimer.unref()
+  }
+
+  private closeMarketStream(): void {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = undefined
+    const socket = this.socket
+    this.socket = undefined
+    this.activeTopics.clear()
+    this.pendingSubscriptions.clear()
+    if (socket && socket.readyState < WebSocket.CLOSING) socket.close()
+  }
+
+  private emitMarketData(): void {
+    for (const listener of this.listeners) listener()
+  }
+
+  private async fetchJson<T>(url: string, apiKey: string, signal?: AbortSignal): Promise<T> {
+    const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
+    const response = await fetch(url, {
+      headers: { accept: 'application/json', 'user-agent': 'ArbDesk/0.1', 'x-api-key': apiKey }, signal: combined
+    })
+    if (!response.ok) throw new Error(`${new URL(url).hostname} HTTP ${response.status}`)
+    return await response.json() as T
+  }
+}

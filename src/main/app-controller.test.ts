@@ -339,7 +339,78 @@ describe('AppController simulation', () => {
     expect(snapshot.opportunities).toHaveLength(2)
     expect(snapshot.opportunities.every((opportunity) => opportunity.durationMinutes === 5)).toBe(true)
     expect(snapshot.opportunities.map((opportunity) => opportunity.mexcDirection)).toEqual(['UP', 'DOWN'])
+    expect(snapshot.multiVenueBoard.comparisons).toHaveLength(2)
+    expect(snapshot.multiVenueBoard.comparisons.every((comparison) => comparison.executionProvider === 'LEGACY_MEXC_POLY')).toBe(true)
+    expect(snapshot.multiVenueBoard.comparisons.map((comparison) => comparison.legs.map((leg) => leg.venueId))).toEqual([
+      ['MEXC', 'POLYMARKET'],
+      ['MEXC', 'POLYMARKET']
+    ])
     expect(snapshot.connectionDetails.mexc).toContain('5m/15m 并行监控')
+  })
+
+  it('discovers Polymarket 5m and 15m independently when MEXC only exposes 5m', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'arbdesk-independent-poly-discovery-test-'))
+    temporaryDirectories.push(directory)
+    const now = new Date('2026-08-23T10:11:30.000Z').getTime()
+    vi.setSystemTime(now)
+    const mexcStartTime = Math.floor(now / 300_000) * 300_000
+    const mexcBrowser = {
+      configure: () => undefined,
+      getCalibration: () => ({ amountInput: false, upButton: false, downButton: false, submitButton: false }),
+      getStatus: () => ({
+        mode: 'HUBSTUDIO', open: true, authenticated: true, automationAvailable: true, monitoring: true,
+        calibrated: { amountInput: false, upButton: false, downButton: false, submitButton: false }, message: 'test'
+      }),
+      fetchActiveBtcWindows: async () => [{
+        eventId: 'mexc-5m-only', durationMinutes: 5, startTime: mexcStartTime, endTime: mexcStartTime + 300_000,
+        baselinePrice: '60000', indexPrice: '60030', indexReceivedAt: now,
+        feeRate: '0.015', feeRateSource: 'HISTORY' as const,
+        outcomes: {
+          UP: { direction: 'UP' as const, symbolId: '5-up', bestAsk: '0.40', askSize: '100', levels: [], receivedAt: now },
+          DOWN: { direction: 'DOWN' as const, symbolId: '5-down', bestAsk: '0.60', askSize: '100', levels: [], receivedAt: now }
+        }
+      }]
+    } as unknown as MexcBrowserManager
+    const fetchWindows = vi.fn(async () => ([5, 15] as const).map((durationMinutes) => {
+      const durationMs = durationMinutes * 60_000
+      const startTime = Math.floor(now / durationMs) * durationMs
+      return {
+        durationMinutes, startTime, endTime: startTime + durationMs,
+        conditionId: `poly-${durationMinutes}m`, baselinePrice: '60000', indexPrice: '60030', indexReceivedAt: now,
+        outcomes: {
+          UP: { direction: 'UP' as const, tokenId: `${durationMinutes}-poly-up`, bestAsk: '0.55', askSize: '100', levels: [], receivedAt: now, feeRate: '0.07' },
+          DOWN: { direction: 'DOWN' as const, tokenId: `${durationMinutes}-poly-down`, bestAsk: '0.50', askSize: '100', levels: [], receivedAt: now, feeRate: '0.07' }
+        }
+      }
+    }))
+    const polymarketData = {
+      configureProxy: () => undefined,
+      getStatus: () => ({ connected: true, message: 'test' }),
+      fetchWindows
+    } as unknown as PolymarketMarketData
+    const controller = new AppController(new EventStore(directory), mexcBrowser, polymarketData)
+    await controller.initialize()
+
+    const snapshot = await controller.refreshOpportunities()
+
+    expect(fetchWindows).toHaveBeenCalledTimes(1)
+    expect(fetchWindows).toHaveBeenCalledWith([
+      {
+        durationMinutes: 5,
+        startTime: Math.floor(now / 300_000) * 300_000,
+        endTime: Math.floor(now / 300_000) * 300_000 + 300_000
+      },
+      {
+        durationMinutes: 15,
+        startTime: Math.floor(now / 900_000) * 900_000,
+        endTime: Math.floor(now / 900_000) * 900_000 + 900_000
+      }
+    ])
+    expect(snapshot.multiVenueBoard.platforms.find((platform) => platform.id === 'POLYMARKET')?.cycles).toEqual([
+      expect.objectContaining({ durationMinutes: 5, state: 'DEPTH_READY', marketCount: 1 }),
+      expect.objectContaining({ durationMinutes: 15, state: 'DEPTH_READY', marketCount: 1 })
+    ])
+    expect(snapshot.opportunities.every((opportunity) => opportunity.durationMinutes === 5)).toBe(true)
   })
 
   it('allows supervised automatic clicking without manual selectors', async () => {
