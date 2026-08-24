@@ -20,6 +20,11 @@ interface GatePipelineStats {
   lastRawBookAt?: number
   lastMappedBookAt?: number
   lastQuoteUpdateAt?: number
+  restBookResponses: number
+  restBookHashes: number
+  restBookDirections: number
+  websocketHashes: number
+  websocketHashMatches: number
 }
 
 interface GateBookHashBinding {
@@ -215,14 +220,16 @@ function urlContext(context: GateParseContext): { duration?: 5 | 15; marketId?: 
   // Only the REST request URL's outcome parameter identifies the returned
   // book. The page's selected outcome must not be applied to both compact
   // WebSocket asset streams.
-  const rawOutcome = source?.searchParams.get('outcome') ?? undefined
+  const rawOutcome = source?.searchParams.get('outcome') ?? source?.searchParams.get('side') ??
+    source?.searchParams.get('direction') ?? source?.searchParams.get('result') ?? undefined
   const outcomeDirection = rawOutcome ? direction({}, rawOutcome) : undefined
   return { duration, marketId, isBtc, outcomeDirection }
 }
 
 export function parseGateMarketObject(source: JsonRecord, receivedAt: number, context: GateParseContext = {}): GateMarketContext | undefined {
   const pageContext = urlContext(context)
-  const id = marketId(source) ?? pageContext.marketId
+  const fallbackMarketKey = stringValue(firstValue(source, ['market', 'mk']))
+  const id = marketId(source) ?? pageContext.marketId ?? fallbackMarketKey
   let range = timeRange(source)
   const parsedAsset = asset(source) ?? (pageContext.isBtc ? 'BTC/USD' : undefined)
   const parsedDuration = durationMinutes(source, range?.startTime, range?.endTime) ?? pageContext.duration
@@ -400,13 +407,23 @@ export class GateMarketData implements ReadOnlyVenueSource {
     let changed = false
     let observedPipeline = false
     const frameDuration = transport === 'WebSocket' ? urlContext({ pageUrl, sourceUrl }).duration : undefined
+    const restDuration = transport === 'REST' ? urlContext({ pageUrl, sourceUrl }).duration : undefined
+    const isBookRest = transport === 'REST' && /\/event-contract\/book(?:$|\?)/i.test(sourceUrl)
     walk(parsed, (item) => {
+      const restHash = isBookRest ? stringValue(firstValue(item, ['hash', 'book_hash', 'orderbook_hash'])) : undefined
+      const requestDirection = urlContext({ pageUrl, sourceUrl }).outcomeDirection
+      const hasRestBookPayload = isBookRest && (restHash !== undefined ||
+        firstValue(item, ['asset_id', 'assetId', 'asks', 'bids']) !== undefined)
+      if (restDuration && hasRestBookPayload) {
+        const stats = this.pipelineStats.get(restDuration) ?? this.newPipelineStats()
+        stats.restBookResponses += 1
+        if (restHash) stats.restBookHashes += 1
+        if (requestDirection) stats.restBookDirections += 1
+        this.pipelineStats.set(restDuration, stats)
+      }
       const market = parseGateMarketObject(item, receivedAt, { pageUrl, sourceUrl })
       if (market) {
-        const requestDirection = urlContext({ pageUrl, sourceUrl }).outcomeDirection
-        const bookHash = transport === 'REST' && /\/event-contract\/book(?:$|\?)/i.test(sourceUrl)
-          ? stringValue(firstValue(item, ['hash', 'book_hash', 'orderbook_hash']))
-          : undefined
+        const bookHash = restHash
         if (bookHash && requestDirection) {
           this.bookHashToMarket.set(bookHash, { marketId: market.marketId, direction: requestDirection, endTime: market.endTime })
           while (this.bookHashToMarket.size > 128) {
@@ -456,9 +473,13 @@ export class GateMarketData implements ReadOnlyVenueSource {
       }
       const hasBookFields = item.a !== undefined || item.b !== undefined || item.asks !== undefined || item.bids !== undefined
       if (frameDuration && explicitTokenId && hasBookFields) {
-        const stats = this.pipelineStats.get(frameDuration) ?? { rawBookFrames: 0, mappedBookFrames: 0, unmappedBookFrames: 0 }
+        const stats = this.pipelineStats.get(frameDuration) ?? this.newPipelineStats()
         stats.rawBookFrames += 1
         stats.lastRawBookAt = receivedAt
+        if (bookHash) {
+          stats.websocketHashes += 1
+          if (hashContext) stats.websocketHashMatches += 1
+        }
         if (resolvedTokenContext) {
           stats.mappedBookFrames += 1
           stats.lastMappedBookAt = receivedAt
@@ -571,14 +592,24 @@ export class GateMarketData implements ReadOnlyVenueSource {
       const rawAge = stats?.lastRawBookAt === undefined ? '无' : `${((Math.max(0, now - stats.lastRawBookAt)) / 1_000).toFixed(1)}秒`
       const mappedAge = stats?.lastMappedBookAt === undefined ? '无' : `${((Math.max(0, now - stats.lastMappedBookAt)) / 1_000).toFixed(1)}秒`
       const quoteAge = stats?.lastQuoteUpdateAt === undefined ? '无' : `${((Math.max(0, now - stats.lastQuoteUpdateAt)) / 1_000).toFixed(1)}秒`
-      return `${duration}m 原始WS ${rawAge} / 映射${mappedAge} / 盘口${quoteAge} / 未映射${stats?.unmappedBookFrames ?? 0}`
+      const rest = stats ? `REST hash ${stats.restBookHashes}/${stats.restBookResponses}·方向${stats.restBookDirections}` : 'REST hash 无'
+      const ws = stats ? `WS h ${stats.websocketHashes}·命中${stats.websocketHashMatches}` : 'WS h 无'
+      return `${duration}m 原始WS ${rawAge} / 映射${mappedAge} / 盘口${quoteAge} / 未映射${stats?.unmappedBookFrames ?? 0} / ${rest} / ${ws}`
     }).join('；')
   }
 
   private notePipelineQuoteUpdate(duration: 5 | 15, receivedAt: number): void {
-    const stats = this.pipelineStats.get(duration) ?? { rawBookFrames: 0, mappedBookFrames: 0, unmappedBookFrames: 0 }
+    const stats = this.pipelineStats.get(duration) ?? this.newPipelineStats()
     stats.lastQuoteUpdateAt = receivedAt
     this.pipelineStats.set(duration, stats)
+  }
+
+  private newPipelineStats(): GatePipelineStats {
+    return {
+      rawBookFrames: 0, mappedBookFrames: 0, unmappedBookFrames: 0,
+      restBookResponses: 0, restBookHashes: 0, restBookDirections: 0,
+      websocketHashes: 0, websocketHashMatches: 0
+    }
   }
 
   private captureAccountCounts(payload: unknown, sourceUrl: string, receivedAt: number): void {

@@ -282,6 +282,42 @@ describe('GateMarketData', () => {
     })
   })
 
+  it('maps the real base-page book responses by market key when eventId is absent from the page URL', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-24T15:42:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-15m'
+    const wsUrl = 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web'
+    source.ingest(JSON.stringify({ code: 0, data: {
+      hash: 'rest-hash-up', asset_id: 'rest-up-token', market: 'ge_896004_3810000',
+      asks: [['0.41', '10']], bids: []
+    } }), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/book?market_id=3810000&outcome=Up', pageUrl)
+    source.ingest(JSON.stringify({ code: 0, data: {
+      hash: 'rest-hash-down', asset_id: 'rest-down-token', market: 'ge_896004_3810000',
+      asks: [['0.59', '11']], bids: []
+    } }), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/book?market_id=3810000&outcome=Down', pageUrl)
+    source.ingest(JSON.stringify({ result: {
+      mk: 'ge_896004_3810000', aid: 'rest-up-token', h: 'ws-sequence-not-rest-hash',
+      a: [['0.40', '12']], b: []
+    } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+    source.ingest(JSON.stringify({ result: {
+      mk: 'ge_896004_3810000', aid: 'rest-down-token', h: 'ws-sequence-not-rest-hash-2',
+      a: [['0.60', '13']], b: []
+    } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+
+    expect(source.getLatestWindows()[0]).toMatchObject({
+      marketId: 'ge_896004_3810000', durationMinutes: 15,
+      outcomes: {
+        UP: { outcomeId: 'rest-up-token', bestAsk: '0.4', askSize: '12' },
+        DOWN: { outcomeId: 'rest-down-token', bestAsk: '0.6', askSize: '13' }
+      }
+    })
+    expect(source.getStatus().message).toContain('REST hash 2/2·方向2')
+    expect(source.getStatus().message).toContain('WS h 2·命中0')
+  })
+
   it('maps Gate websocket market_id tokens and removes an expired round on refresh', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-23T12:32:00.000Z'))
