@@ -792,6 +792,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const displayedProfit = (comparison: MultiVenueComparison): string => snapshot?.settings.autoOpenEnabled
     ? comparison.autoOrderPotentialProfit
     : comparison.potentialProfit
+  const predictFunHasApiKey = Boolean(predictFunCredentials?.configured || predictFunApiKey.trim().length >= 8)
 
   useEffect(() => {
     if (!selected?.id || !(Number(quantity) > 0)) {
@@ -2198,9 +2199,12 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
               </div>
             </details>
             <details className="settings-module credential-section">
-              <summary><div><strong>Limitless / Predict.fun / Gate / Kalshi</strong><span className={limitlessCredentials?.configured && predictFunCredentials?.tradingConfigured && gateCredentials?.configured ? 'ready-text' : ''}>Limitless {limitlessCredentials?.configured ? '已配置' : '待配置'} · Predict {predictFunCredentials?.tradingConfigured ? '已配置' : '仅行情'} · Gate {gateCredentials?.configured ? '已配置' : '仅行情'} · Kalshi {kalshiCredentials?.configured ? (snapshot.settings.kalshiLiveEnabled ? '实盘开关已开' : '已配置') : '仅行情'}</span><small>行情连接；交易身份由系统安全存储加密</small></div><ChevronRight /></summary>
+              <summary><div><strong>四个平台接入</strong><span>Limitless / Predict.fun / Gate / Kalshi</span><small>分别管理行情页面、可选凭据和实盘开关</small></div><ChevronRight /></summary>
               <div className="settings-module-body">
-                <p>公开行情与交易身份分离。秘密值只在主进程按需解密，页面、普通设置、日志和状态快照都不会收到私钥原文；留空保存不会覆盖已存秘密。</p>
+                <p>公开行情与交易身份分离。Predict.fun 和 Gate 没有 API Key 也可以只靠已登录页面监听行情；Key 仅用于可选账户/余额联调。秘密值只在主进程按需解密，页面、普通设置、日志和状态快照都不会收到私钥原文。</p>
+                <details className="credential-platform-card" open>
+                  <summary><div><strong>Limitless</strong><span>{limitlessCredentials?.configured ? '交易身份已配置' : '需要 Token + 钱包私钥才可做账户联调'}</span><small>API 交易身份与 Base 钱包</small></div><ChevronRight /></summary>
+                  <div className="credential-platform-body">
                 <div className="credential-route-card">
                   <strong>Limitless 交易身份</strong>
                   <span>在 Limitless 的 API Tokens 页面派生带 trading scope 的 Token ID 和 Token Secret，再填写 Base 钱包私钥。钱包地址和 Profile ID 由软件自动验证读取。</span>
@@ -2218,7 +2222,12 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 {limitlessCredentials?.message && <div className="browser-status-detail"><span>LIMIT</span><p>{limitlessCredentials.message}{limitlessCredentials.profileId ? ` · Profile ${limitlessCredentials.profileId}` : ''}{limitlessCredentials.walletAddress ? ` · 钱包 ${shortAddress(limitlessCredentials.walletAddress)}` : ''}</p></div>}
                 <button className="wide-secondary safe-preparation-button" onClick={() => void prepareLimitlessWithoutSubmitting()} disabled={busy || !limitlessCredentials?.configured}><ShieldCheck aria-hidden="true" />完整联调 Limitless（绝不下单）</button>
                 {limitlessPreparation && <PreparationReportView report={limitlessPreparation} />}
+                  </div>
+                </details>
 
+                <details className="credential-platform-card">
+                  <summary><div><strong>Predict.fun</strong><span>{predictFunCredentials?.tradingConfigured ? '交易身份已配置' : '无 API Key 时仅页面行情监听'}</span><small>API Key 可选；真实页面交互另行布防</small></div><ChevronRight /></summary>
+                  <div className="credential-platform-body">
                 <div className="credential-route-card">
                   <strong>Predict.fun 交易身份</strong>
                   <span>网页账户通常选择 Predict Account；Deposit Address 是账户地址，Privy 私钥对应的 signer 地址会由软件本地派生。</span>
@@ -2226,6 +2235,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <label className="settings-field" htmlFor="predict-fun-api-key">Predict.fun 主网 API Key（官方API模式必填；网页扫描可留空）
                   <input id="predict-fun-api-key" type={revealPlatformSecrets ? 'text' : 'password'} value={predictFunApiKey} onChange={(event) => setPredictFunApiKey(event.target.value)} placeholder={predictFunCredentials?.configured ? '已保存；填写新值可替换' : '从 Predict.fun 官方申请后粘贴'} spellCheck={false} autoComplete="new-password" />
                 </label>
+                {predictFunHasApiKey ? <>
                 <label className="settings-field" htmlFor="predict-fun-account-type">Predict.fun 账户类型
                   <select id="predict-fun-account-type" value={predictFunAccountType} onChange={(event) => setPredictFunAccountType(event.target.value as 'PREDICT_ACCOUNT' | 'EOA')}>
                     <option value="PREDICT_ACCOUNT">Predict Account（网页智能钱包）</option>
@@ -2239,6 +2249,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   <input id="predict-fun-private-key" type={revealPlatformSecrets ? 'text' : 'password'} value={predictFunPrivateKey} onChange={(event) => setPredictFunPrivateKey(event.target.value)} placeholder={predictFunCredentials?.hasSignerPrivateKey ? '已保存；留空不修改' : '0x 开头的 32 字节私钥'} spellCheck={false} autoComplete="new-password" />
                 </label>
                 <label className="credential-reveal"><input type="checkbox" checked={revealPlatformSecrets} onChange={(event) => setRevealPlatformSecrets(event.target.checked)} /><span>临时显示本次尚未保存的密钥输入</span></label>
+                </> : <div className="credential-notice"><Network aria-hidden="true" /><span>当前没有 API Key：下面账户地址和私钥无需填写，软件会继续使用 Predict.fun 页面自身的 REST/WebSocket 监听行情。</span></div>}
                 <div className="credential-notice"><KeyRound aria-hidden="true" /><span>API Key 使用系统钥匙串加密，不写入普通设置文件。盘口通过 WebSocket 实时更新；REST 每15秒发现轮次、每30秒校准，断线时才临时回退。</span></div>
                 <button className="wide-secondary" onClick={() => void savePredictFunCredentials()} disabled={busy || !predictFunCredentials?.encryptionAvailable || (!predictFunCredentials?.configured && predictFunApiKey.trim().length < 8)}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <LockKeyhole aria-hidden="true" />}加密保存 Predict.fun 身份</button>
                 <button className="wide-secondary" onClick={() => void openPredictFunPage()} disabled={busy}><ExternalLink aria-hidden="true" />打开 Predict.fun 单页面行情</button>
@@ -2251,11 +2262,19 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 {predictFunCredentials?.message && <div className="browser-status-detail"><span>PRED</span><p>{predictFunCredentials.message}{predictFunCredentials.apiKeyMasked ? ` · ${predictFunCredentials.apiKeyMasked}` : ''}{predictFunCredentials.signerAddress ? ` · signer ${shortAddress(predictFunCredentials.signerAddress)}` : ''}</p></div>}
                 <button className="wide-secondary safe-preparation-button" onClick={() => void preparePredictFunWithoutSubmitting()} disabled={busy || !predictFunCredentials?.tradingConfigured}><ShieldCheck aria-hidden="true" />完整联调 Predict.fun（绝不下单）</button>
                 {predictFunPreparation && <PreparationReportView report={predictFunPreparation} />}
+                  </div>
+                </details>
 
+                <details className="credential-platform-card">
+                  <summary><div><strong>Gate</strong><span>{gateCredentials?.configured ? '只读 API 身份已配置' : '无 Key：使用指纹页面监听行情'}</span><small>Hubstudio 页面接管、订单链路捕获和实盘门禁</small></div><ChevronRight /></summary>
+                  <div className="credential-platform-body">
                 <div className="credential-route-card">
                   <strong>Gate 事件合约</strong>
                   <span>Gate 账户通过 Hubstudio 指纹浏览器页面接管；BTC 5分钟、15分钟盘口和事件订单都只复用页面自身会话。</span>
                 </div>
+                <details className="credential-help">
+                  <summary>可选：Gate APIv4 只读账户身份（没有 Key 可跳过）</summary>
+                  <div>
                 <label className="settings-field" htmlFor="gate-api-key">Gate APIv4 Key（账户只读联调；公开扫描可留空）
                   <input id="gate-api-key" type={revealPlatformSecrets ? 'text' : 'password'} value={gateApiKey} onChange={(event) => setGateApiKey(event.target.value)} placeholder={gateCredentials?.apiKeyMasked ? `已保存 ${gateCredentials.apiKeyMasked}；留空不修改` : 'Gate → API管理 → APIv4 Keys'} spellCheck={false} autoComplete="new-password" />
                 </label>
@@ -2264,6 +2283,8 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 </label>
                 <div className="credential-notice"><KeyRound aria-hidden="true" /><span>建议在 Gate 创建仅“现货/保证金只读”的 APIv4 Key，并设置 IP 白名单；不要开启交易或提现权限。软件的 Gate 联调守卫仅放行一个 GET 余额接口。</span></div>
                 <button className="wide-secondary" onClick={() => void saveGateCredentials()} disabled={busy || !gateCredentials?.encryptionAvailable || (!gateCredentials?.configured && (!gateApiKey || !gateApiSecret))}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <LockKeyhole aria-hidden="true" />}加密保存 Gate 只读身份</button>
+                  </div>
+                </details>
                 <button className="wide-secondary" onClick={() => void openGatePage()} disabled={busy}><ExternalLink aria-hidden="true" />打开 Gate 事件合约单页面</button>
                 <button className="wide-secondary" onClick={() => void stopGatePage()} disabled={busy}><Square aria-hidden="true" />停止 Gate 监听并释放页面</button>
                 <div className="credential-notice"><Network aria-hidden="true" /><span>配置 Hubstudio 环境后会接管已登录的 Gate 标签页；未配置时才使用独立只读页面。默认不下单，必须先手动捕获真实订单结构。</span></div>
@@ -2280,7 +2301,12 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>捕获模式不会自动提交订单；实盘开关默认关闭。订单 POST 超时或状态不明时只做回读，不会重复发送。</span></div>
                 <button className="wide-secondary safe-preparation-button" onClick={() => void prepareGateWithoutSubmitting()} disabled={busy || !gateCredentials?.configured}><ShieldCheck aria-hidden="true" />完整联调 Gate（绝不下单）</button>
                 {gatePreparation && <PreparationReportView report={gatePreparation} />}
+                  </div>
+                </details>
 
+                <details className="credential-platform-card">
+                  <summary><div><strong>Kalshi</strong><span>{kalshiCredentials?.configured ? (snapshot.settings.kalshiLiveEnabled ? '实盘开关已开' : '身份已配置') : '公开行情可不配 Key'}</span><small>Key ID、RSA 私钥和人工双腿开关</small></div><ChevronRight /></summary>
+                  <div className="credential-platform-body">
                 <div className="credential-route-card">
                   <strong>Kalshi 行情、账户与人工实盘入口</strong>
                   <span>Kalshi 当前只接入 KXBTC15M 15分钟市场；5分钟市场不纳入扫描。真实执行仅支持 MEXC↔Kalshi 或 Polymarket↔Kalshi 双腿流程，默认关闭，不会自动下单。</span>
@@ -2302,6 +2328,8 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 {kalshiPageStatus && <div className="browser-status-detail"><span>K页</span><p>{kalshiPageStatus.message}</p></div>}
                 <button className="wide-secondary safe-preparation-button" onClick={() => void prepareKalshiWithoutSubmitting()} disabled={busy || !kalshiCredentials?.configured}><ShieldCheck aria-hidden="true" />完整联调 Kalshi（绝不下单）</button>
                 {kalshiPreparation && <PreparationReportView report={kalshiPreparation} />}
+                  </div>
+                </details>
               </div>
             </details>
             <details className="settings-module credential-section">
