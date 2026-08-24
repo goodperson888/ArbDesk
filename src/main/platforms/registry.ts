@@ -72,15 +72,17 @@ const venues: RegisteredVenue[] = [
   {
     id: 'GATE',
     label: 'Gate',
-    integrationState: 'READ_ONLY',
+    // The adapter is live-capable, but the runtime keeps the live switch off
+    // until a user-captured event-order schema is verified.
+    integrationState: 'LIVE',
     supportedSubjects: ['BTC'],
     supportedIntervals: ['5m', '15m'],
     capabilities: {
       marketDiscovery: true,
       realtimeBook: true,
-      placeOrder: false,
+      placeOrder: true,
       cancelOrder: false,
-      fillStream: false,
+      fillStream: true,
       exitPosition: false,
       splitMerge: false
     }

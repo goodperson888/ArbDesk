@@ -189,14 +189,22 @@ Predict.fun 当前不在网页中自动生成主网 API Key，需要通过官方
 
 ## 三、Gate 事件合约
 
-Gate 的 BTC/ETH 事件合约支持 5分钟、15分钟、1小时和4小时。ArbDesk 当前只纳入 BTC 5分钟和15分钟，并保持只读。官方网页入口是 [Gate Event Contracts](https://www.gate.com/trade-events)。
+Gate 的 BTC/ETH 事件合约支持 5分钟、15分钟、1小时和4小时。ArbDesk 当前只纳入 BTC 5分钟和15分钟；Gate 订单执行使用已登录的 Hubstudio 指纹浏览器页面，默认关闭。官方网页入口是 [Gate Event Contracts](https://www.gate.com/trade-events)。
 
 ### 只扫描行情，不配置 Key
 
-1. 正常启动 ArbDesk；软件在后台只创建一个持久 Gate 事件合约页面。
+1. 正常启动 ArbDesk；如果设置中已有 Hubstudio 环境 ID，软件会在该指纹环境中接管现有 Gate 标签页，不会复制 Cookie 或新建第二个指纹环境。
 2. 进入 `设置 → 账户与环境 → Limitless / Predict.fun / Gate` 查看 `GATE页` 状态。
-3. 若页面超时，点击 `打开 Gate 事件合约单页面`，在该窗口检查网络、地区资格或由你本人登录。
-4. 软件只被动解析该页面自身事件合约 REST/WebSocket 流量，不复制 Cookie/Token，不另发内部行情轮询，也不通过页面点击下单。
+3. 若页面超时，点击 `打开 Gate 事件合约单页面`，在指纹浏览器中检查网络、地区资格或登录状态。
+4. 软件只被动解析该页面自身事件合约 REST/WebSocket 流量，不另发内部行情轮询。
+
+### 捕获 Gate 事件订单结构
+
+1. 确认 Gate 指纹浏览器已登录并打开目标 BTC 5m/15m 事件页。
+2. 点击 `开启 Gate 订单捕获模式（只等你手动下单）`。
+3. 由你本人在 Gate 页面完成一次最小金额订单。此动作不是程序自动提交；程序只记录 endpoint、方法、字段名和返回状态。
+4. 页面显示“已捕获订单结构”后，先点击 `完整联调 Gate（绝不下单）` 检查行情、余额和捕获字段，再按需开启 Gate 实盘开关。
+5. 捕获结构只保存在本次运行内存中；Cookie、Authorization、签名和完整请求体不会写入文件。订单 POST 超时或状态不明只进入回读，不自动重发。
 
 ### 配置 APIv4 只读身份
 
@@ -209,7 +217,7 @@ Gate 的 BTC/ETH 事件合约支持 5分钟、15分钟、1小时和4小时。Arb
 5. 将 Key 和只显示一次的 Secret 填入 ArbDesk，点击 `加密保存 Gate 只读身份`。
 6. 点击 `完整联调 Gate（绝不下单）`。软件只会签名调用官方 `GET /api/v4/spot/accounts`，验证身份并读取 USDT 可用/锁定余额。
 
-Gate 公开 APIv4 文档目前没有事件合约专用的市场、持仓、委托或订单端点。ArbDesk 不会猜端点，不会使用 `/spot/orders` 冒充事件合约订单，也不会构造或提交事件合约订单。事件合约盘口来自网页被动流量；持仓/委托 API、离线构单和真实成交回报要等 Gate 发布正式接口后再接。
+Gate 公开 APIv4 文档目前没有已确认的事件合约专用市场、持仓、委托或订单端点。ArbDesk 不会猜端点，也不会使用 `/spot/orders` 冒充事件合约订单；订单请求必须来自用户手动捕获的 Gate 页面真实请求。若页面需要动态签名而捕获请求无法在当前会话复用，Gate 会继续保持只读并提示人工处理。
 
 官方参考：[Gate APIv4 鉴权](https://www.gate.com/docs/developers/apiv4/en/)；[Gate 事件合约 FAQ](https://www.gate.com/zh/help/event-contracts/faq/100550/gate-event-contracts-faq)。
 

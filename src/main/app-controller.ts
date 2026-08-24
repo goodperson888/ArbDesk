@@ -33,6 +33,7 @@ import { buildLegacyMultiVenueBoard } from './platforms/legacy-board-adapter'
 import { buildReadOnlyComparisons, normalizeLegacyWindows } from './platforms/read-only-board-adapter'
 import { EventStore } from './services/event-store'
 import type { MexcBrowserManager } from './services/mexc-browser'
+import type { FingerprintBrowserRuntime } from './services/fingerprint-browser-runtime'
 import { SimulatedPolymarketBroker, type PolymarketBroker } from './services/polymarket'
 import type { PolymarketLiveBroker, PolymarketTradingCapacity } from './services/polymarket-live'
 import { PolymarketMarketData, type PolymarketWindowQuote } from './services/polymarket-market-data'
@@ -58,6 +59,7 @@ const DEFAULT_SETTINGS: RiskSettings = {
   mexcAutomationEnabled: false,
   polymarketLiveEnabled: false,
   kalshiLiveEnabled: false,
+  gateLiveEnabled: false,
   allowUnprofitableTestTrade: false,
   autoOpenEnabled: false,
   autoOpenQuantityMode: 'FIXED',
@@ -158,7 +160,8 @@ export class AppController {
     private readonly liveBroker?: PolymarketLiveBroker,
     private readonly liveExecutionEnabled = process.env.ARB_ENABLE_LIVE_EXECUTION === 'true',
     private readonly multiVenueData?: MultiVenueMarketData,
-    private readonly executionSessionStore?: ExecutionSessionStore
+    private readonly executionSessionStore?: ExecutionSessionStore,
+    private readonly fingerprintRuntime?: FingerprintBrowserRuntime
   ) {
     this.mexcBrowser.onMarketData?.(() => this.scheduleStreamingSnapshot())
     this.polymarketData.onMarketData?.(() => this.scheduleStreamingSnapshot())
@@ -198,6 +201,7 @@ export class AppController {
       hubstudioContainerCode: this.settings.hubstudioContainerCode,
       elementMode: this.settings.mexcElementMode
     })
+    this.fingerprintRuntime?.configure({ containerCode: this.settings.hubstudioContainerCode })
     this.polymarketData.configureProxy(this.settings.polymarketProxyUrl)
     this.liveBroker?.configureProxy(this.settings.polymarketProxyUrl)
     this.recentEvents = await this.store.loadRecentEvents(80)
@@ -461,7 +465,7 @@ export class AppController {
       'mode', 'maxCapitalPerTrade', 'minConditionalReturnPct', 'maxQuoteAgeMs',
       'maxHedgeSlippage', 'stopBeforeExpirySeconds', 'settlementDistanceRules', 'mexcBrowserMode',
       'mexcElementMode', 'hubstudioContainerCode', 'polymarketProxyUrl', 'mexcAutomationEnabled',
-      'polymarketLiveEnabled', 'allowUnprofitableTestTrade', 'autoOpenQuantityMode',
+      'polymarketLiveEnabled', 'gateLiveEnabled', 'allowUnprofitableTestTrade', 'autoOpenQuantityMode',
       'autoOpenFixedQuantity', 'autoOpenMaxQuantityPct', 'maxRecoveryLossUsdt',
       'polymarketHedgeRetryCount', 'polymarketHedgeMode', 'autoOpenStabilityMs'
     ]
@@ -557,6 +561,10 @@ export class AppController {
       if (next.mode !== 'ASSISTED') throw new Error('Kalshi双腿实盘目前只允许在人工监督模式启用')
       if (!this.liveExecutionEnabled) throw new Error('实盘总开关未启用；开发环境请用 npm run dev:live 启动ArbDesk')
     }
+    if (next.gateLiveEnabled) {
+      if (next.mode !== 'ASSISTED') throw new Error('Gate 事件合约真实下单只允许在人工监督模式启用')
+      if (!this.liveExecutionEnabled) throw new Error('实盘总开关未启用；开发环境请用 npm run dev:live 启动ArbDesk')
+    }
     if (next.allowUnprofitableTestTrade && next.mode !== 'ASSISTED') {
       throw new Error('小额亏损联调只允许在人工监督模式启用')
     }
@@ -566,6 +574,7 @@ export class AppController {
       hubstudioContainerCode: next.hubstudioContainerCode,
       elementMode: next.mexcElementMode
     })
+    this.fingerprintRuntime?.configure({ containerCode: next.hubstudioContainerCode })
     this.polymarketData.configureProxy(next.polymarketProxyUrl)
     this.liveBroker?.configureProxy(next.polymarketProxyUrl)
     await this.store.saveSettings(next)

@@ -1,5 +1,7 @@
 import { app, BrowserWindow, shell } from 'electron'
+import type { CDPSession, Page } from 'playwright-core'
 import type { GatePageCaptureStatus } from '../../shared/types'
+import type { FingerprintBrowserRuntime } from './fingerprint-browser-runtime'
 
 // The duration-specific route only keeps the 15m contract stream active on
 // current Gate builds. The event-contract index page carries both BTC 5m and
@@ -24,8 +26,30 @@ export interface GateCapturedWebSocketFrame {
   pageUrl?: string
 }
 
+export interface GateCapturedRequest {
+  url: string
+  method: string
+  headers?: Record<string, string>
+  body?: string
+  receivedAt: number
+  pageUrl?: string
+}
+
+export interface GatePreparedOrderRequest {
+  endpoint: string
+  method: string
+  body: string
+  pageUrl?: string
+}
+
+export interface GateCapturedHttpResponse {
+  status: number
+  body: string
+}
+
 export interface GatePageCaptureSource {
   getStatus(): GatePageCaptureStatus
+  onRequest(listener: (event: GateCapturedRequest) => void): () => void
   onResponse(listener: (event: GateCapturedResponse) => void): () => void
   onWebSocketFrame(listener: (event: GateCapturedWebSocketFrame) => void): () => void
   onStatus(listener: (status: GatePageCaptureStatus) => void): () => void
@@ -37,6 +61,10 @@ interface CdpResponseReceived {
   requestId?: string
   type?: string
   response?: { url?: string; mimeType?: string; status?: number }
+}
+
+interface CdpRequestWillBeSent {
+  request?: { url?: string; method?: string; headers?: Record<string, string>; postData?: string }
 }
 
 interface CdpWebSocketCreated {
@@ -73,6 +101,8 @@ export function isGateEventResponse(rawUrl: string): boolean {
 
 export class GatePageCapture implements GatePageCaptureSource {
   private window?: BrowserWindow
+  private fingerprintPage?: Page
+  private fingerprintNetworkSession?: CDPSession
   private startPromise?: Promise<void>
   private stopping = false
   private destroying = false
@@ -85,10 +115,11 @@ export class GatePageCapture implements GatePageCaptureSource {
   private loadedRollSlot?: number
   private rollPromise?: Promise<void>
   private responseListeners = new Set<(event: GateCapturedResponse) => void>()
+  private requestListeners = new Set<(event: GateCapturedRequest) => void>()
   private frameListeners = new Set<(event: GateCapturedWebSocketFrame) => void>()
   private statusListeners = new Set<(status: GatePageCaptureStatus) => void>()
 
-  constructor() {
+  constructor(private readonly fingerprintRuntime?: FingerprintBrowserRuntime) {
     app.once('before-quit', () => {
       this.stopping = true
       this.window?.destroy()
@@ -96,10 +127,33 @@ export class GatePageCapture implements GatePageCaptureSource {
   }
 
   getStatus(): GatePageCaptureStatus { return { ...this.status } }
+  canExecuteOrders(): boolean { return Boolean(this.fingerprintPage && !this.fingerprintPage.isClosed()) }
+
+  async executeCapturedOrder(request: GatePreparedOrderRequest): Promise<GateCapturedHttpResponse> {
+    const method = request.method.toUpperCase()
+    if (!isGateHost(request.endpoint) || !['POST', 'PUT', 'PATCH'].includes(method)) throw new Error('Gate 页面订单请求不受安全范围允许')
+    const page = this.fingerprintPage
+    if (!page || page.isClosed()) throw new Error('Gate 指纹浏览器标签页不可用，未发送订单')
+    return await page.evaluate(async (input: { endpoint: string; method: string; body: string }) => {
+      const response = await fetch(input.endpoint, {
+        method: input.method,
+        credentials: 'include',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: input.body,
+        signal: AbortSignal.timeout(5_000)
+      })
+      return { status: response.status, body: await response.text() }
+    }, { endpoint: request.endpoint, method, body: request.body })
+  }
 
   onResponse(listener: (event: GateCapturedResponse) => void): () => void {
     this.responseListeners.add(listener)
     return () => this.responseListeners.delete(listener)
+  }
+
+  onRequest(listener: (event: GateCapturedRequest) => void): () => void {
+    this.requestListeners.add(listener)
+    return () => this.requestListeners.delete(listener)
   }
 
   onWebSocketFrame(listener: (event: GateCapturedWebSocketFrame) => void): () => void {
@@ -113,6 +167,16 @@ export class GatePageCapture implements GatePageCaptureSource {
   }
 
   async start(show = false): Promise<void> {
+    if (this.fingerprintPage && !this.fingerprintPage.isClosed()) {
+      if (show) await this.fingerprintPage.bringToFront()
+      return
+    }
+    if (this.fingerprintRuntime?.isConfigured()) {
+      if (this.startPromise) { await this.startPromise; if (show) await this.fingerprintPage?.bringToFront(); return }
+      this.startPromise = this.createFingerprintPage(show)
+      try { await this.startPromise } finally { this.startPromise = undefined }
+      return
+    }
     if (this.window && !this.window.isDestroyed()) {
       await this.refreshForCurrentRoll(this.window)
       if (show) this.open()
@@ -132,6 +196,16 @@ export class GatePageCapture implements GatePageCaptureSource {
   }
 
   stop(): void {
+    if (this.fingerprintPage && !this.fingerprintPage.isClosed()) {
+      this.destroying = true
+      void this.fingerprintNetworkSession?.detach().catch(() => undefined)
+      this.fingerprintNetworkSession = undefined
+      // This page belongs to the user's fingerprint browser. Detach CDP but
+      // never close the logged-in tab when only monitoring is stopped.
+      this.fingerprintPage = undefined
+      this.setStatus('IDLE', 'Gate 指纹浏览器页面监听已停止')
+      return
+    }
     const window = this.window
     if (!window || window.isDestroyed()) return
     this.destroying = true
@@ -139,12 +213,57 @@ export class GatePageCapture implements GatePageCaptureSource {
   }
 
   open(): void {
+    if (this.fingerprintPage && !this.fingerprintPage.isClosed()) {
+      void this.fingerprintPage.bringToFront()
+      return
+    }
     if (!this.window || this.window.isDestroyed()) {
       void this.start(true)
       return
     }
     this.window.show()
     this.window.focus()
+  }
+
+  private async createFingerprintPage(show: boolean): Promise<void> {
+    this.setStatus('STARTING', '正在接管已登录的 Gate 指纹浏览器标签页；只监听页面自身请求')
+    let page: Page
+    try {
+      page = await this.fingerprintRuntime!.attach('GATE', {
+        hosts: ['gate.com', 'gate.io', 'gateio.ws', 'gateio.live'],
+        createIfMissing: false
+      })
+    } catch (error) {
+      this.setStatus('DISCONNECTED', `Gate 指纹浏览器接管失败：${error instanceof Error ? error.message : String(error)}`)
+      return
+    }
+    this.fingerprintPage = page
+    page.on('close', () => {
+      if (this.fingerprintPage !== page) return
+      this.fingerprintPage = undefined
+      this.fingerprintNetworkSession = undefined
+      this.setStatus('DISCONNECTED', 'Gate 指纹浏览器标签页已关闭')
+    })
+    if (show) await page.bringToFront()
+    try {
+      const session = await page.context().newCDPSession(page)
+      this.fingerprintNetworkSession = session
+      await session.send('Network.enable')
+      session.on('Network.requestWillBeSent', (rawParams) => this.handleRequest(rawParams as CdpRequestWillBeSent, page.url()))
+      session.on('Network.responseReceived', (rawParams) => { void this.handlePlaywrightResponse(session, page, rawParams as CdpResponseReceived) })
+      session.on('Network.webSocketCreated', (rawParams) => {
+        const event = rawParams as CdpWebSocketCreated
+        if (event.requestId && event.url && isGateHost(event.url)) this.socketUrls.set(event.requestId, event.url)
+      })
+      session.on('Network.webSocketClosed', (rawParams) => {
+        const requestId = (rawParams as { requestId?: string }).requestId
+        if (requestId) this.socketUrls.delete(requestId)
+      })
+      session.on('Network.webSocketFrameReceived', (rawParams) => this.handleFrame(rawParams as CdpWebSocketFrame, page.url()))
+      this.setStatus('CONNECTED', this.captureStatusMessage('已接管指纹浏览器'))
+    } catch (error) {
+      this.setStatus('DISCONNECTED', `Gate 指纹浏览器网络监听失败：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   private async createWindow(show: boolean): Promise<void> {
@@ -242,6 +361,10 @@ export class GatePageCapture implements GatePageCaptureSource {
       this.setStatus('DISCONNECTED', `无法启用 Gate 网络监听：${error instanceof Error ? error.message : String(error)}`)
     })
     debug.on('message', (_event, method, rawParams) => {
+      if (method === 'Network.requestWillBeSent') {
+        this.handleRequest(rawParams as CdpRequestWillBeSent, window.webContents.getURL())
+        return
+      }
       if (method === 'Network.responseReceived') {
         void this.handleResponse(window, rawParams as CdpResponseReceived)
         return
@@ -283,7 +406,23 @@ export class GatePageCapture implements GatePageCaptureSource {
     }
   }
 
-  private handleFrame(event: CdpWebSocketFrame): void {
+  private handleRequest(event: CdpRequestWillBeSent, pageUrl?: string): void {
+    const request = event.request
+    const url = request?.url ?? ''
+    const method = request?.method?.toUpperCase() ?? 'GET'
+    if (!isGateHost(url) || !['POST', 'PUT', 'PATCH'].includes(method)) return
+    const captured: GateCapturedRequest = {
+      url,
+      method,
+      headers: request?.headers,
+      body: request?.postData,
+      receivedAt: Date.now(),
+      pageUrl
+    }
+    for (const listener of this.requestListeners) listener(captured)
+  }
+
+  private handleFrame(event: CdpWebSocketFrame, pageUrl = this.window?.webContents.getURL()): void {
     if (!event.requestId || event.response?.opcode !== 1 || typeof event.response.payloadData !== 'string') return
     const url = this.socketUrls.get(event.requestId)
     if (!url) return
@@ -293,15 +432,32 @@ export class GatePageCapture implements GatePageCaptureSource {
     // ticker names interchangeably. Keep this broad enough for the actual
     // book stream while dropping heartbeats and UI telemetry.
     if (!/event|predict|contract|order[._-]?book|depth|market|book|asks|bids|ticker/i.test(`${url}\n${payload}`)) return
-    const captured = { url, payload, receivedAt: Date.now(), pageUrl: this.window?.webContents.getURL() }
+    const captured = { url, payload, receivedAt: Date.now(), pageUrl }
     this.webSocketFrameCount += 1
     this.lastCaptureAt = captured.receivedAt
     this.setStatus('CONNECTED', this.captureStatusMessage())
     for (const listener of this.frameListeners) listener(captured)
   }
 
-  private captureStatusMessage(): string {
-    return `Gate 单页面被动监听在线；已捕获 ${this.responseCount} 个事件合约响应、${this.webSocketFrameCount} 个 Gate WebSocket 帧，没有额外调用内部接口`
+  private async handlePlaywrightResponse(session: CDPSession, page: Page, event: CdpResponseReceived): Promise<void> {
+    const url = event.response?.url ?? ''
+    if (!event.requestId || !isGateEventResponse(url) || !['XHR', 'Fetch'].includes(event.type ?? '')) return
+    try {
+      const result = await session.send('Network.getResponseBody', { requestId: event.requestId }) as { body?: string; base64Encoded?: boolean }
+      if (!result.body) return
+      const body = result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf8') : result.body
+      const captured = { url, body, receivedAt: Date.now(), pageUrl: page.url() }
+      this.responseCount += 1
+      this.lastCaptureAt = captured.receivedAt
+      this.setStatus('CONNECTED', this.captureStatusMessage('已接管指纹浏览器'))
+      for (const listener of this.responseListeners) listener(captured)
+    } catch {
+      // Cached, redirected or evicted responses can disappear before CDP reads them.
+    }
+  }
+
+  private captureStatusMessage(prefix = '单页面'): string {
+    return `Gate ${prefix}监听在线；已捕获 ${this.responseCount} 个事件合约响应、${this.webSocketFrameCount} 个 Gate WebSocket 帧，没有额外调用内部接口`
   }
 
   private setStatus(state: GatePageCaptureStatus['state'], message: string): void {

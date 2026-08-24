@@ -2,6 +2,7 @@ import { createHash, createHmac } from 'node:crypto'
 import type { VenuePreparationReport, VenuePreparationStage, VenuePreparationStageStatus } from '../../shared/types'
 import type { GateCredentialStore, GateCredentials } from './gate-credential-store'
 import type { GateMarketData } from './gate-market-data'
+import type { GateOrderCapture } from './gate-order-capture'
 
 const GATE_API_BASE = 'https://api.gateio.ws'
 const REQUEST_TIMEOUT_MS = 6_000
@@ -72,7 +73,8 @@ export class GatePreparationService {
   constructor(
     private readonly credentials: GateCredentialStore,
     private readonly marketData: GateMarketData,
-    private readonly fetchImpl: FetchLike = fetch
+    private readonly fetchImpl: FetchLike = fetch,
+    private readonly orderCapture?: GateOrderCapture
   ) {}
 
   async prepare(): Promise<VenuePreparationReport> {
@@ -144,6 +146,9 @@ export class GatePreparationService {
         openOrderCount !== undefined || positionCount !== undefined
           ? `来自已登录 Gate 单页面自身响应 · 持仓 ${positionCount ?? '—'} · 活动委托 ${openOrderCount ?? '—'} · 未额外请求`
           : 'Gate 公开 APIv4 尚未发布事件合约专用账户端点；页面当前也未产生账户响应，没有用现货委托冒充事件委托')
+      const captureSummary = this.orderCapture?.getSummary()
+      record.add('order-capture', 'Gate 事件合约订单结构捕获', captureSummary?.captured ? 'PASS' : 'SKIPPED',
+        captureSummary?.captured ? `已捕获 ${captureSummary.method ?? '订单'} 结构 · ${captureSummary.requestFields?.join(', ') ?? '字段待识别'} · 未保存 Cookie、签名和完整请求体` : '尚未捕获；请在已登录指纹浏览器中开启捕获模式并手动完成一次最小订单')
       record.add('offline-order', '事件合约离线构单', 'SKIPPED', '真实下单不在本阶段；未猜测未公开订单结构，也未生成可能被误提交的载荷')
       record.add('submission-guard', '真实订单提交硬禁令', 'PASS', '仅允许 GET /api/v4/spot/accounts；POST、PUT、PATCH、DELETE 与所有订单路径均在请求前拒绝')
     } catch {

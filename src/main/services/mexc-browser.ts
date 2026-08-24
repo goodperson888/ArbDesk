@@ -22,6 +22,7 @@ import {
 import { parseLatestMexcSettlement, parseMexcFill, type MexcFillLogRow, type MexcFillMatch } from '../domain/mexc-fill'
 import { decodeMexcPredictionFrame } from '../domain/mexc-prediction-frame'
 import { canAttemptHubstudioReconnect, hubstudioMarketDuration } from '../domain/hubstudio-connection'
+import type { FingerprintBrowserRuntime } from './fingerprint-browser-runtime'
 
 const MEXC_URL = 'https://prediction.mexc.com/prediction-markets/all'
 const HUBSTUDIO_API = 'http://127.0.0.1:6873'
@@ -227,7 +228,7 @@ export class MexcBrowserManager {
   private arbFetchInitScriptPages = new WeakSet<Page>()
   private mexcRequestsBlockedUntil = 0
 
-  constructor(private readonly configPath: string) {
+  constructor(private readonly configPath: string, private readonly fingerprintRuntime?: FingerprintBrowserRuntime) {
     this.selectorStore = this.loadSelectors()
     ipcMain.on('mexc:automation-result', (event, result: AutomationResult) => {
       if (event.sender !== this.embeddedWindow?.webContents) return
@@ -801,6 +802,11 @@ export class MexcBrowserManager {
 
   private async openHubstudio(): Promise<MexcBrowserStatus> {
     if (!this.hubstudioContainerCode) throw new Error('请先在设置中填写Hubstudio环境ID')
+    if (this.fingerprintRuntime?.isConfigured()) {
+      if (await this.adoptFingerprintPage({ bringToFront: true, createIfMissing: true, refreshAccount: true })) {
+        return this.status('已通过通用指纹浏览器运行时连接MEXC页面', true, this.hubstudioPage?.url())
+      }
+    }
     if (this.hubstudioPage && !this.hubstudioPage.isClosed()) {
       if (this.hubstudioConnectedContainerCode !== this.hubstudioContainerCode) {
         throw new Error(`当前仍连接Hubstudio环境 ${this.hubstudioConnectedContainerCode ?? '未知'}；请先关闭该环境或重启ArbDesk，再切换环境ID。`)
@@ -854,6 +860,7 @@ export class MexcBrowserManager {
     options: { bringToFront: boolean; createIfMissing: boolean; refreshAccount: boolean }
   ): Promise<boolean> {
     if (!this.hubstudioContainerCode || this.mode !== 'HUBSTUDIO') return false
+    if (this.fingerprintRuntime?.isConfigured()) return await this.adoptFingerprintPage(options)
     if (this.hubstudioPage && !this.hubstudioPage.isClosed()) {
       if (options.bringToFront) await this.hubstudioPage.bringToFront()
       return true
@@ -891,6 +898,44 @@ export class MexcBrowserManager {
       this.hubstudioPassiveConnectPromise = undefined
     })
     return await this.hubstudioPassiveConnectPromise
+  }
+
+  private async adoptFingerprintPage(options: { bringToFront: boolean; createIfMissing: boolean; refreshAccount: boolean }): Promise<boolean> {
+    try {
+      const page = await this.fingerprintRuntime!.attach('MEXC', {
+        hosts: ['prediction.mexc.com', 'mexc.com'],
+        createIfMissing: options.createIfMissing,
+        startupUrl: MEXC_URL
+      })
+      this.hubstudioPage = page
+      this.hubstudioBrowser = page.context().browser() ?? undefined
+      this.hubstudioConnectedContainerCode = this.hubstudioContainerCode
+      this.hubstudioDebuggingPort = undefined
+      this.instrumentHubstudioPage(page)
+      this.adoptExistingHubstudioOrderPages(page.context().pages())
+      await this.startHubstudioWebSocketMonitoring(page)
+      page.on('close', () => {
+        if (this.hubstudioPage !== page) return
+        this.hubstudioPage = undefined
+        this.hubstudioAuthenticated = false
+      })
+      page.on('domcontentloaded', () => {
+        void this.refreshHubstudioAuthentication()
+        void this.syncHubstudioPredictionSubscriptions().catch(() => undefined)
+      })
+      if (options.bringToFront) await page.bringToFront()
+      this.startHubstudioMonitoring()
+      await this.refreshHubstudioAuthentication()
+      if (options.refreshAccount) {
+        await this.refreshAccountState().catch(() => undefined)
+        this.lastHubstudioAccountRefreshAt = Date.now()
+      }
+      this.lastHubstudioConnectionError = undefined
+      return true
+    } catch (error) {
+      this.lastHubstudioConnectionError = error instanceof Error ? error.message : String(error)
+      return false
+    }
   }
 
   private async connectHubstudioBrowser(

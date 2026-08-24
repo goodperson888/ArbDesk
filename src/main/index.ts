@@ -10,6 +10,8 @@ import { PredictFunCredentialStore } from './services/predict-fun-credential-sto
 import { LimitlessCredentialStore } from './services/limitless-credential-store'
 import { GateCredentialStore } from './services/gate-credential-store'
 import { GatePageCapture } from './services/gate-page-capture'
+import { GateOrderCapture } from './services/gate-order-capture'
+import { GateBrowserOrderTransport } from './services/gate-order-transport'
 import { GateMarketData } from './services/gate-market-data'
 import { GatePreparationService } from './services/gate-preparation'
 import { KalshiCredentialStore } from './services/kalshi-credential-store'
@@ -25,6 +27,7 @@ import { LimitlessMarketData } from './services/limitless-market-data'
 import { MultiVenueMarketData } from './services/multi-venue-market-data'
 import { LimitlessPreparationService, PredictFunPreparationService } from './services/venue-preparation'
 import { LicenseService } from './services/license-service'
+import { FingerprintBrowserRuntime } from './services/fingerprint-browser-runtime'
 import { LICENSE_PUBLIC_KEY_PEM } from './license-public-key'
 import type { LicenseSummary } from '../shared/types'
 
@@ -113,7 +116,8 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   const dataDirectory = join(app.getPath('userData'), 'data')
   const store = new EventStore(dataDirectory)
   const executionSessionStore = new ExecutionSessionStore(dataDirectory)
-  const mexcBrowser = new MexcBrowserManager(join(app.getPath('userData'), 'data', 'mexc-selectors.json'))
+  const fingerprintRuntime = new FingerprintBrowserRuntime()
+  const mexcBrowser = new MexcBrowserManager(join(app.getPath('userData'), 'data', 'mexc-selectors.json'), fingerprintRuntime)
   const polymarketCredentials = new PolymarketCredentialStore(join(app.getPath('userData'), 'data', 'polymarket-credentials.json'))
   const polymarketLive = new PolymarketLiveBroker(polymarketCredentials)
   const predictFunCredentials = new PredictFunCredentialStore(join(dataDirectory, 'predict-fun-credentials.json'))
@@ -130,7 +134,9 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     // irrelevant resources/frames, and the settings page can stop it.
     { pageCapture: predictFunPageCapture, autoStartPageCapture: true }
   )
-  const gatePageCapture = new GatePageCapture()
+  const gatePageCapture = new GatePageCapture(fingerprintRuntime)
+  const gateOrderCapture = new GateOrderCapture(gatePageCapture, () => gatePageCapture.canExecuteOrders())
+  const gateOrderTransport = new GateBrowserOrderTransport(gateOrderCapture, gatePageCapture)
   const gateMarketData = new GateMarketData(gatePageCapture, { autoStartPageCapture: true })
   const kalshiPageCapture = new KalshiPageCapture()
   const kalshiMarketData = new KalshiMarketData(() => kalshiCredentials.getCredentials().catch(() => undefined), kalshiPageCapture)
@@ -158,7 +164,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   ])
   const limitlessPreparation = new LimitlessPreparationService(limitlessCredentials, limitlessMarketData)
   const predictFunPreparation = new PredictFunPreparationService(predictFunCredentials, predictFunMarketData)
-  const gatePreparation = new GatePreparationService(gateCredentials, gateMarketData)
+  const gatePreparation = new GatePreparationService(gateCredentials, gateMarketData, fetch, gateOrderCapture)
   const kalshiPreparation = new KalshiPreparationService(kalshiCredentials, kalshiMarketData, kalshiFetch)
   const controller = new AppController(
     store,
@@ -167,7 +173,8 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     polymarketLive,
     app.isPackaged || process.env.ARB_ENABLE_LIVE_EXECUTION === 'true',
     multiVenueData,
-    executionSessionStore
+    executionSessionStore,
+    fingerprintRuntime
   )
   await controller.initialize()
   const kalshiTrading = new KalshiTradingService(
@@ -181,6 +188,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     mexc: mexcBrowser,
     polymarket: polymarketLive,
     kalshi: kalshiTrading,
+    gate: gateOrderTransport,
     settings: () => controller.getSnapshot().settings,
     liveExecutionEnabled: app.isPackaged || process.env.ARB_ENABLE_LIVE_EXECUTION === 'true',
     executionSessionStore
@@ -324,6 +332,13 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   ipcMain.handle('gate:open-page', () => requireActiveLicense(() => gateMarketData.openPageCapture()))
   ipcMain.handle('gate:stop-page', () => requireActiveLicense(() => { gateMarketData.stopPageCapture() }))
   ipcMain.handle('gate:page-capture-status', () => requireActiveLicense(() => gateMarketData.getPageCaptureStatus()))
+  ipcMain.handle('gate:start-order-capture', async () => requireActiveLicense(async () => {
+    gateOrderCapture.startCapture()
+    await gateMarketData.openPageCapture()
+    return gateOrderCapture.getSummary()
+  }))
+  ipcMain.handle('gate:order-capture-summary', () => requireActiveLicense(() => gateOrderCapture.getSummary()))
+  ipcMain.handle('gate:clear-order-capture', () => requireActiveLicense(() => { gateOrderCapture.clear(); return gateOrderCapture.getSummary() }))
   ipcMain.handle('gate:prepare-without-submit', () => requireActiveLicense(() => gatePreparation.prepare()))
   ipcMain.handle('gate:update-credentials', (_event, request) => requireActiveLicense(async () => {
     const summary = await gateCredentials.update(request)

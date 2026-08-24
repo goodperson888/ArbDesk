@@ -254,6 +254,8 @@ export interface RiskSettings {
   polymarketLiveEnabled: boolean
   /** Kalshi 单腿实盘下单总开关；默认关闭，且不受自动开单开关影响。 */
   kalshiLiveEnabled?: boolean
+  /** Gate 事件合约页面下单总开关；默认关闭，且必须先捕获真实订单结构。 */
+  gateLiveEnabled?: boolean
   allowUnprofitableTestTrade: boolean
   autoOpenEnabled: boolean
   autoOpenQuantityMode: 'FIXED' | 'MAX_PERCENT'
@@ -519,6 +521,17 @@ export interface GatePageCaptureStatus {
   lastCaptureAt?: number
 }
 
+export interface GateOrderCaptureSummary {
+  captured: boolean
+  executionReady?: boolean
+  endpoint?: string
+  method?: string
+  requestFields?: string[]
+  pageUrl?: string
+  capturedAt?: number
+  message: string
+}
+
 export interface GateCredentialSummary {
   configured: boolean
   encryptionAvailable: boolean
@@ -661,6 +674,9 @@ export interface ArbAppApi {
   openGatePage(): Promise<void>
   stopGatePage(): Promise<void>
   getGatePageCaptureStatus(): Promise<GatePageCaptureStatus>
+  startGateOrderCapture(): Promise<GateOrderCaptureSummary>
+  getGateOrderCaptureSummary(): Promise<GateOrderCaptureSummary>
+  clearGateOrderCapture(): Promise<GateOrderCaptureSummary>
   prepareGateWithoutSubmitting(): Promise<VenuePreparationReport>
   getKalshiCredentialSummary(): Promise<KalshiCredentialSummary>
   updateKalshiCredentials(request: UpdateKalshiCredentialsRequest): Promise<KalshiCredentialSummary>

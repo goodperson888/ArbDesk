@@ -1,13 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GatePageCaptureStatus } from '../../shared/types'
 import { GateMarketData, parseGateMarketObject } from './gate-market-data'
-import type { GateCapturedResponse, GateCapturedWebSocketFrame, GatePageCaptureSource } from './gate-page-capture'
+import type { GateCapturedRequest, GateCapturedResponse, GateCapturedWebSocketFrame, GatePageCaptureSource } from './gate-page-capture'
 
 class FakeGateCapture implements GatePageCaptureSource {
   status: GatePageCaptureStatus = { state: 'IDLE', message: 'idle' }
   responses: Array<(event: GateCapturedResponse) => void> = []
   frames: Array<(event: GateCapturedWebSocketFrame) => void> = []
   statuses: Array<(status: GatePageCaptureStatus) => void> = []
+  requests: Array<(event: GateCapturedRequest) => void> = []
   start = vi.fn(async () => {
     this.status = { state: 'CONNECTED', message: 'single Gate page online', updatedAt: Date.now() }
     for (const listener of this.statuses) listener(this.status)
@@ -15,6 +16,7 @@ class FakeGateCapture implements GatePageCaptureSource {
   stop = vi.fn()
   getStatus(): GatePageCaptureStatus { return { ...this.status } }
   onResponse(listener: (event: GateCapturedResponse) => void): () => void { this.responses.push(listener); return () => undefined }
+  onRequest(listener: (event: GateCapturedRequest) => void): () => void { this.requests.push(listener); return () => undefined }
   onWebSocketFrame(listener: (event: GateCapturedWebSocketFrame) => void): () => void { this.frames.push(listener); return () => undefined }
   onStatus(listener: (status: GatePageCaptureStatus) => void): () => void { this.statuses.push(listener); return () => undefined }
   emitResponse(value: unknown): void { for (const listener of this.responses) listener({ url: 'https://api.gateio.ws/event/markets', body: JSON.stringify(value), receivedAt: Date.now() }) }

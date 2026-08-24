@@ -39,8 +39,8 @@
 - `src/main/platforms/legacy-board-adapter.ts`：把现有 MEXC/Polymarket 机会只读映射为通用机会榜。
 - `src/main/services/limitless-market-data.ts`：Limitless BTC 5m/15m 市场发现与盘口，只读。
 - `src/main/services/predict-fun-market-data.ts`：Predict.fun BTC 5m/15m 市场发现与盘口，只读。
-- `src/main/services/gate-market-data.ts`：Gate 事件合约网页响应/推送的容错解析和 BTC 5m/15m 双向盘口标准化，只读。
-- `src/main/services/gate-page-capture.ts`：只启动一个 Gate `/trade-events` 页面并被动监听事件合约流量。
+- `src/main/services/gate-market-data.ts`：Gate 事件合约网页响应/推送的容错解析和 BTC 5m/15m 双向盘口标准化。
+- `src/main/services/gate-page-capture.ts`、`gate-order-capture.ts`、`gate-order-transport.ts`：复用通用指纹浏览器页面，捕获用户手动订单结构并在显式门禁下执行一次页面会话订单。
 - `src/main/services/kalshi-market-data.ts`：读取 KXBTC15M 开放市场、YES/NO 互补盘口并接入默认只读扫描；当前不纳入 5 分钟周期。
 - `src/main/services/kalshi-preparation.ts`：Kalshi API 身份、余额、持仓、委托只读联调和本地 RSA-PSS 草稿签名；该准备流程仍保持只读。
 - `src/main/services/kalshi-trading.ts`：供双腿协调器调用的 Kalshi V2 FOK 第二腿；不再暴露独立单腿 IPC 入口。
@@ -73,7 +73,7 @@
 - Limitless 公开 API 不需要密钥。只读取 `automationType=lumy`、CLOB、BTC、5m/15m 市场。
 - Predict.fun 主网没有 API Key 时只启动一个持久网页，并通过 Electron CDP 被动读取网页自身的 categories/orderbook 响应与 WebSocket 帧；不复制网页凭据、不额外调用内部接口。配置官方 Key 后优先使用请求头鉴权 WebSocket，REST 只访问 categories 与 orderbook。
 - Predict.fun API Key 使用系统钥匙串加密，不进入普通设置、日志或页面快照。
-- Gate 无公开事件合约 API。软件只启动一个 `/trade-events` 页面并被动读取页面自身事件合约流量；APIv4 Key 只用于官方 `GET /api/v4/spot/accounts` 身份/USDT 余额检查。
+- Gate 没有在项目中确认的公开事件合约 API。软件优先接管用户已登录的 `/trade-events` 页面并被动读取页面自身流量；APIv4 Key 只用于官方 `GET /api/v4/spot/accounts` 身份/USDT 余额检查。订单必须来自用户手动捕获的真实请求，不能猜端点或改用现货订单接口。
 - Kalshi 默认读取 KXBTC15M 的公开 Markets/Orderbook；当前不纳入 5 分钟周期。配置 API Key ID + RSA 私钥后，准备按钮仍只允许签名读取余额、持仓和活动委托；真实路径仅开放 MEXC↔Kalshi、Polymarket↔Kalshi 双腿人工 FOK，撤单、自动下单、充值、提现和划转均未接入。
 - Limitless 的 HMAC Token ID/Secret、Profile ID、Base 钱包私钥，以及 Predict.fun 的账户类型、Deposit Address、Privy/EOA 私钥都从软件设置页录入；秘密字段由 Electron 系统安全存储加密，渲染进程只接收掩码、派生地址和配置状态。
 - Limitless/Predict.fun 的市场目录缓存 15 秒、盘口快照缓存 4 秒；Kalshi 市场目录和盘口使用 15 秒缓存；所有来源同一轮刷新使用 in-flight Promise 去重。Gate/Predict.fun 默认各保持一个后台被动页面，用户可在设置页停止并销毁页面；不会按机会组合重复开页或请求。
@@ -89,7 +89,7 @@
 - Predict.fun JWT 仅保存在主进程内存并按过期时间复用，不持久化、不发送给渲染进程。
 - 两个平台使用各自官方 SDK 生成订单字段并完成本地 EIP-712 签名。页面只收到签名哈希和阶段结果，不收到私钥、JWT、签名原文或完整订单载荷。
 - 安全传输层仅允许 GET；Predict.fun 额外只允许 `POST /v1/auth`。`POST /orders`、撤单、授权、赎回和提现请求会在发出前直接抛错。
-- Gate 联调使用独立的精确白名单，只放行 `GET https://api.gateio.ws/api/v4/spot/accounts`；所有其他路径和所有非 GET 方法都会在请求前拒绝。事件合约持仓、委托与构单因官方 API 尚未公开而明确标记为跳过，不用现货接口冒充。
+- Gate 余额联调使用独立白名单，只放行 `GET https://api.gateio.ws/api/v4/spot/accounts`；事件订单则只允许已捕获 schema 对应的 Gate 页面请求，未知 endpoint、字段不完整、超时和未知回执都拒绝或进入回读，不自动重试。
 - Kalshi 准备联调只允许 `GET /portfolio/balance`、`GET /portfolio/positions`、`GET /portfolio/orders`；订单草稿和 RSA-PSS 签名只在内存中生成。独立实盘服务只允许官方 V2 `POST /portfolio/events/orders`，使用 FOK、单次提交和请求前价格/深度/到期校验。
 - 零余额、零 Gas 和缺少 allowance 记为待资金，不妨碍验证身份、账户读取和本地构单签名。链上 RPC 暂时不可用也不会退化为真实提交。
 
@@ -100,4 +100,4 @@
 - Predict.fun BTC Up/Down：Chainlink BTC/USDT，使用结束前一根 5 分钟 K 线收盘，平价按 50/50 处理。
 - Gate BTC 事件合约：周期起点目标价与到期 Chainlink BTC/USD TWAP 比较，`TWAP >= 起点` 为 Up，平价归 Up；手续费仍需按单市场/账户实测，因此只显示毛边际。
 - 因取价对、观察方法和平价规则不同，两者与现有市场默认归类为 `CONDITIONAL`，只显示毛边际并强制 `BLOCKED`。
-- 新平台跨平台比较不会进入自动开单；现有 MEXC + Polymarket 对冲执行器保持不变。比较票据包含 Kalshi 且另一腿为 MEXC/Polymarket 时显示双腿人工执行按钮，Limitless/Predict.fun/Gate 仍为观察路线。
+- 新平台跨平台比较不会进入自动开单；现有 MEXC + Polymarket 对冲执行器保持不变。比较票据包含 Kalshi 且另一腿为 MEXC/Polymarket/Gate 时显示双腿人工执行按钮，Gate 仍需完成捕获和实盘开关。

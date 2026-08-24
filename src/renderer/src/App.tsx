@@ -46,6 +46,7 @@ import type {
   ExecutionPlan,
   EmergencyAccessSnapshot,
   GateCredentialSummary,
+  GateOrderCaptureSummary,
   GatePageCaptureStatus,
   KalshiCredentialSummary,
   KalshiPageCaptureStatus,
@@ -633,6 +634,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [predictFunPreparation, setPredictFunPreparation] = useState<VenuePreparationReport>()
   const [gateCredentials, setGateCredentials] = useState<GateCredentialSummary>()
   const [gatePageStatus, setGatePageStatus] = useState<GatePageCaptureStatus>()
+  const [gateOrderCapture, setGateOrderCapture] = useState<GateOrderCaptureSummary>()
   const [gateApiKey, setGateApiKey] = useState('')
   const [gateApiSecret, setGateApiSecret] = useState('')
   const [gatePreparation, setGatePreparation] = useState<VenuePreparationReport>()
@@ -715,6 +717,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       void window.arbApp.getMexcStatus().then(setMexcStatus)
       void window.arbApp.getPredictFunPageCaptureStatus().then(setPredictFunPageStatus)
       void window.arbApp.getGatePageCaptureStatus().then(setGatePageStatus)
+      void window.arbApp.getGateOrderCaptureSummary().then(setGateOrderCapture)
       void window.arbApp.getKalshiPageCaptureStatus().then(setKalshiPageStatus)
     }
     refreshStatus()
@@ -1211,6 +1214,16 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     setGatePageStatus(await window.arbApp.getGatePageCaptureStatus())
   }
 
+  async function startGateOrderCapture(): Promise<void> {
+    const result = await run(() => window.arbApp.startGateOrderCapture(), 'Gate 捕获模式已开启；请在指纹浏览器中手动完成一次最小订单，程序不会自动提交')
+    if (result) setGateOrderCapture(result)
+  }
+
+  async function clearGateOrderCapture(): Promise<void> {
+    const result = await run(() => window.arbApp.clearGateOrderCapture(), 'Gate 订单捕获结构已清除，恢复只读模式')
+    if (result) setGateOrderCapture(result)
+  }
+
   async function prepareGateWithoutSubmitting(): Promise<void> {
     const result = await run(() => window.arbApp.prepareGateWithoutSubmitting(), 'Gate 非下单联调完成；没有发送真实订单')
     if (result) setGatePreparation(result)
@@ -1246,7 +1259,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   async function executeSelectedMultiVenue(): Promise<void> {
     if (!snapshot || !selectedComparison || !selectedKalshiLeg?.marketId) return
     const otherLeg = selectedComparison.legs.find((leg) => leg.venueId !== 'KALSHI')
-    if (!otherLeg || (otherLeg.venueId !== 'MEXC' && otherLeg.venueId !== 'POLYMARKET')) {
+    if (!otherLeg || (otherLeg.venueId !== 'MEXC' && otherLeg.venueId !== 'POLYMARKET' && otherLeg.venueId !== 'GATE')) {
       setMessage('当前机会没有可真实执行的第二平台；仍是观察机会')
       return
     }
@@ -1264,6 +1277,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     }
     if (otherLeg.venueId === 'POLYMARKET' && !snapshot.settings.polymarketLiveEnabled) {
       setMessage('Polymarket↔Kalshi 双腿执行需要开启 Polymarket 实盘对冲')
+      return
+    }
+    if (otherLeg.venueId === 'GATE' && !snapshot.settings.gateLiveEnabled) {
+      setMessage('Gate↔Kalshi 双腿执行需要开启 Gate 实盘下单，并先完成订单结构捕获')
       return
     }
     const quantity = Math.floor(Math.min(
@@ -1326,6 +1343,21 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       if (!confirmed) return
     }
     const result = await run(() => window.arbApp.updateSettings({ kalshiLiveEnabled: enabling }))
+    if (result) setSnapshot({ ...snapshot, settings: result })
+  }
+
+  async function toggleGateLive(): Promise<void> {
+    if (!snapshot) return
+    const enabling = !snapshot.settings.gateLiveEnabled
+    if (enabling) {
+      if (!gateOrderCapture?.captured || !gateOrderCapture.executionReady) {
+        setMessage('请先在已接管的 Gate 指纹浏览器页面完成订单捕获；独立只读页面不能执行订单')
+        return
+      }
+      const confirmed = window.confirm('Gate 订单结构已捕获。开启后，确认的 Gate 双腿机会才会允许发送一次真实订单；未知结果不会自动重试。确认开启？')
+      if (!confirmed) return
+    }
+    const result = await run(() => window.arbApp.updateSettings({ gateLiveEnabled: enabling }))
     if (result) setSnapshot({ ...snapshot, settings: result })
   }
 
@@ -2207,7 +2239,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
 
                 <div className="credential-route-card">
                   <strong>Gate 事件合约</strong>
-                  <span>BTC/ETH 5分钟、15分钟盘口通过 Gate 网页单页被动捕获；APIv4 Key 只用于验证账户身份和读取共享现货账户的 USDT 余额。</span>
+                  <span>Gate 账户通过 Hubstudio 指纹浏览器页面接管；BTC 5分钟、15分钟盘口和事件订单都只复用页面自身会话。</span>
                 </div>
                 <label className="settings-field" htmlFor="gate-api-key">Gate APIv4 Key（账户只读联调；公开扫描可留空）
                   <input id="gate-api-key" type={revealPlatformSecrets ? 'text' : 'password'} value={gateApiKey} onChange={(event) => setGateApiKey(event.target.value)} placeholder={gateCredentials?.apiKeyMasked ? `已保存 ${gateCredentials.apiKeyMasked}；留空不修改` : 'Gate → API管理 → APIv4 Keys'} spellCheck={false} autoComplete="new-password" />
@@ -2219,9 +2251,16 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <button className="wide-secondary" onClick={() => void saveGateCredentials()} disabled={busy || !gateCredentials?.encryptionAvailable || (!gateCredentials?.configured && (!gateApiKey || !gateApiSecret))}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <LockKeyhole aria-hidden="true" />}加密保存 Gate 只读身份</button>
                 <button className="wide-secondary" onClick={() => void openGatePage()} disabled={busy}><ExternalLink aria-hidden="true" />打开 Gate 事件合约单页面</button>
                 <button className="wide-secondary" onClick={() => void stopGatePage()} disabled={busy}><Square aria-hidden="true" />停止 Gate 监听并释放页面</button>
-                <div className="credential-notice"><Network aria-hidden="true" /><span>软件只监听这一页自身的事件合约 REST/WebSocket 流量，不复制网页会话、不额外调用内部行情接口，也不会点击或调用下单、撤单、划转。</span></div>
+                <div className="credential-notice"><Network aria-hidden="true" /><span>配置 Hubstudio 环境后会接管已登录的 Gate 标签页；未配置时才使用独立只读页面。默认不下单，必须先手动捕获真实订单结构。</span></div>
                 {gatePageStatus && <div className="browser-status-detail"><span>GATE页</span><p>{gatePageStatus.message}</p></div>}
+                {gateOrderCapture && <div className="browser-status-detail"><span>订单捕获</span><p>{gateOrderCapture.message}{gateOrderCapture.endpoint ? ` · ${gateOrderCapture.method} ${gateOrderCapture.endpoint}` : ''}{gateOrderCapture.requestFields?.length ? ` · 字段 ${gateOrderCapture.requestFields.join(', ')}` : ''}</p></div>}
                 {gateCredentials?.message && <div className="browser-status-detail"><span>GATE</span><p>{gateCredentials.message}{gateCredentials.apiKeyMasked ? ` · ${gateCredentials.apiKeyMasked}` : ''}</p></div>}
+                <button className="wide-secondary" onClick={() => void startGateOrderCapture()} disabled={busy}><ShieldAlert aria-hidden="true" />开启 Gate 订单捕获模式（只等你手动下单）</button>
+                <button className={`wide-secondary ${snapshot.settings.gateLiveEnabled ? 'live-toggle enabled' : ''}`} onClick={() => void toggleGateLive()} disabled={busy || !gateOrderCapture?.captured || !gateOrderCapture.executionReady}>
+                  {snapshot.settings.gateLiveEnabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}Gate 事件合约实盘：{snapshot.settings.gateLiveEnabled ? '已开启（点击关闭）' : '默认关闭'}
+                </button>
+                {gateOrderCapture?.captured && <button className="wide-secondary" onClick={() => void clearGateOrderCapture()} disabled={busy}><Trash2 aria-hidden="true" />清除捕获结构并恢复只读</button>}
+                <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>捕获模式不会自动提交订单；实盘开关默认关闭。订单 POST 超时或状态不明时只做回读，不会重复发送。</span></div>
                 <button className="wide-secondary safe-preparation-button" onClick={() => void prepareGateWithoutSubmitting()} disabled={busy || !gateCredentials?.configured}><ShieldCheck aria-hidden="true" />完整联调 Gate（绝不下单）</button>
                 {gatePreparation && <PreparationReportView report={gatePreparation} />}
 

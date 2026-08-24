@@ -6,7 +6,7 @@
 
 Limitless、Predict.fun、Gate 与 Kalshi 的 Token/API Key、钱包和资金准备步骤见：[平台凭据配置指南](docs/platform-credential-setup.zh-CN.md)。
 
-Kalshi 的 KXBTC15M 已接入默认市场扫描（当前不纳入 5 分钟周期）；设置页可单独开启 MEXC↔Kalshi 或 Polymarket↔Kalshi 双腿人工执行，默认关闭，不支持自动下单、撤单或账户变更。两平台没有原子交易：系统先确认首腿真实成交，再按实际数量发送 Kalshi FOK；第二腿失败会进入恢复态，网络超时不会自动重试。Gate/Predict.fun 各自自动启动一个后台被动页面（Predict.fun 没有 API Key 时仍可正常工作），设置页提供“停止监听并释放页面”；后台页面会节流并过滤无关资源，避免长期占用过多 CPU/内存。
+Kalshi 的 KXBTC15M 已接入默认市场扫描（当前不纳入 5 分钟周期）；设置页可单独开启 MEXC↔Kalshi、Polymarket↔Kalshi 或 Gate↔Kalshi 双腿人工执行，默认关闭，不支持自动下单、撤单或账户变更。两平台没有原子交易：系统先确认首腿真实成交，再按实际数量发送第二腿；第二腿失败会进入恢复态，网络超时不会自动重试。Gate/Predict.fun 各自自动启动一个后台被动页面（Predict.fun 没有 API Key 时仍可正常工作），Gate 配置 Hubstudio 后会接管已登录指纹页；后台页面会节流并过滤无关资源，避免长期占用过多 CPU/内存。
 
 ## 已实现
 
@@ -22,7 +22,7 @@ Kalshi 的 KXBTC15M 已接入默认市场扫描（当前不纳入 5 分钟周期
 - 按套利组持久保存双腿历史、成交与剩余持仓，支持MEXC单腿、Polymarket单腿及双腿中途平仓；
 - `CONDITIONAL` 结算风险标识；
 - MEXC 内嵌登录窗口与持久 Cookie 容器；
-- 可选 Hubstudio 指纹浏览器环境，通过 Local API + CDP 监控和操作页面；
+- 通用 Hubstudio 指纹浏览器运行时，通过一条 Local API + CDP 连接复用 MEXC、Gate 等多个已登录平台页面；
 - 从 MEXC 页面同源公开接口读取当前 BTC 5m/15m 事件、UP/DOWN symbolId 和盘口深度；
 - MEXC 金额框、UP、DOWN、提交按钮的可视化校准；
 - `MEXC 成交 → Polymarket 对冲` 强制状态机；
@@ -35,7 +35,7 @@ Kalshi 的 KXBTC15M 已接入默认市场扫描（当前不纳入 5 分钟周期
 - Polymarket 签名类型、funder、签名私钥和 L2 API 凭据配置页；秘密凭据由 Electron `safeStorage` 使用系统钥匙串加密，渲染进程只看到状态和掩码；
 - Predict.fun 无 API Key 时使用单个网页的被动网络监听，不复制网页凭据、不额外调用内部接口；默认保持一个后台页面，设置页可停止并释放；配置 Key 后优先使用官方 REST/WebSocket；
 - Limitless 与 Predict.fun 均提供“完整联调（绝不下单）”：手动触发身份、账户、持仓、委托、链上余额/授权读取，并用官方 SDK 在本地构建和签名测试订单；真实提交、撤单和授权交易由请求白名单硬性禁止；
-- Gate 事件合约通过一个网页被动读取 BTC 5m/15m 双向盘口；默认保持一个后台页面，设置页可停止并释放。APIv4 Key 仅用于一个官方只读余额接口。Gate 事件合约订单 API 尚未公开，因此不会猜测下单/委托接口，也不会把现货接口当作事件合约接口；
+- Gate 事件合约通过已登录指纹浏览器页面被动读取 BTC 5m/15m 双向盘口；订单捕获模式只记录用户手动最小订单的字段结构，不保存 Cookie、签名或完整请求体。捕获验证后才允许显式开启 Gate↔Kalshi 人工双腿实盘；APIv4 Key 仍只用于官方只读余额接口，不把现货接口当作事件合约接口；
 - 默认关闭真实资金与 MEXC 实验自动点击。
 - 启动前限时授权门禁：未授权或到期时不挂载交易主界面；若到期时仍有未处理敞口，只保留最小化的恢复与平仓页面。
 
@@ -79,7 +79,7 @@ npm run package:win
 1. 启动应用，先复制机器码并输入管理员签发的限时授权码；授权通过前不会加载交易主界面。
 2. 进入主界面后默认处于“模拟模式”，选择机会与对齐份额，先完整跑通模拟执行。
 3. 在设置中切换“人工监督”。
-4. 在设置中选择“内嵌浏览器”或“Hubstudio”。Hubstudio 用户需填写环境 ID，并由 ArbDesk 打开该环境。
+4. 在设置中选择“内嵌浏览器”或“Hubstudio”。Hubstudio 用户需填写环境 ID；该环境可被 MEXC 和 Gate 共用，ArbDesk 会按平台接管已登录标签页。
 5. 打开 MEXC 监督窗口并正常登录。
 6. 依次校准金额输入框、UP 按钮、DOWN 按钮、确认下单按钮。两种浏览器模式分别保存校准结果。
 7. 准备 MEXC 第一腿后，以 MEXC 页面实际成交记录为准填写成交量和均价。
@@ -98,6 +98,8 @@ npm run package:win
 3. 点击“保存并使用Hubstudio”，再点击“打开Hubstudio环境”；
 4. ArbDesk 调用 `http://127.0.0.1:6873/api/v1/browser/start`，取得 `debuggingPort` 后通过 Playwright CDP 连接；环境已经运行时也会尝试从其进程监听端口直接附加；
 5. 在 Hubstudio 窗口中登录并完成该模式独立的四项网页元素校准。连接后软件会分别预热当前 5 分钟和 15 分钟交易页，实际执行优先复用对应页面，不在下单热路径临时切换周期。
+
+Gate 首次开启真实执行前，在设置的 Gate 区域点击“开启 Gate 订单捕获模式”，然后在同一指纹浏览器标签页中由你手动完成一次最小订单。程序只捕获实际请求结构；确认页面返回订单号和状态后，再手动开启 Gate 实盘开关。捕获失败或响应不明确时仍保持只读，不会自动重试。
 
 当前本地工作副本已预填环境 ID `1643173278`。ArbDesk 不保存 Hubstudio `app_id` 或 `app_secret`，这些凭证由 Hubstudio Local API 自己管理。
 

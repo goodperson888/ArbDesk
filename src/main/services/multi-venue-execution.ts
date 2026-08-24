@@ -9,9 +9,11 @@ import type {
 import type { MexcBrowserManager } from './mexc-browser'
 import type { PolymarketLiveBroker } from './polymarket-live'
 import type { KalshiTradingService } from './kalshi-trading'
+import type { GateOrderTransport } from '../platforms/adapters/gate-adapter'
 import { MexcVenueAdapter } from '../platforms/adapters/mexc-adapter'
 import { PolymarketVenueAdapter } from '../platforms/adapters/polymarket-adapter'
 import { KalshiVenueAdapter } from '../platforms/adapters/kalshi-adapter'
+import { GateVenueAdapter } from '../platforms/adapters/gate-adapter'
 import { TwoLegExecutionMachine } from '../domain/two-leg-execution'
 import type { ExecutionSessionStore } from './execution-session-store'
 
@@ -21,6 +23,7 @@ interface PairExecutionDependencies {
   mexc: MexcBrowserManager
   polymarket?: PolymarketLiveBroker
   kalshi: KalshiTradingService
+  gate?: GateOrderTransport
   settings: () => RiskSettings
   liveExecutionEnabled: boolean
   executionSessionStore?: ExecutionSessionStore
@@ -29,8 +32,8 @@ interface PairExecutionDependencies {
 function pairFor(legs: MultiVenueExecutionLegRequest[]): { first: MultiVenueExecutionLegRequest; second: MultiVenueExecutionLegRequest } {
   const kalshi = legs.find((leg) => leg.venueId === 'KALSHI')
   const other = legs.find((leg) => leg.venueId !== 'KALSHI')
-  if (!kalshi || !other || (other.venueId !== 'MEXC' && other.venueId !== 'POLYMARKET')) {
-    throw new Error('当前仅支持 MEXC↔Kalshi 或 Polymarket↔Kalshi 双腿执行')
+  if (!kalshi || !other || !['MEXC', 'POLYMARKET', 'GATE'].includes(other.venueId)) {
+    throw new Error('当前双腿执行需要 MEXC、Polymarket 或 Gate 与 Kalshi 组成已验证路线')
   }
   // Keep the mature route ordering: MEXC's web order is the lead leg and
   // Polymarket's FAK is the lead leg for the direct-API route. Kalshi is always
@@ -47,16 +50,20 @@ export class MultiVenueExecutionService {
     this.adapters.set('MEXC', new MexcVenueAdapter(dependencies.mexc))
     if (dependencies.polymarket) this.adapters.set('POLYMARKET', new PolymarketVenueAdapter(dependencies.polymarket))
     this.adapters.set('KALSHI', new KalshiVenueAdapter(dependencies.kalshi))
+    if (dependencies.gate) this.adapters.set('GATE', new GateVenueAdapter(dependencies.gate, { liveEnabledProvider: () => dependencies.settings().gateLiveEnabled === true }))
   }
 
   async execute(request: MultiVenueExecutionRequest): Promise<MultiVenueExecutionReceipt> {
     const settings = this.dependencies.settings()
     if (!this.dependencies.liveExecutionEnabled) throw new Error('当前构建未开启实盘执行门禁')
-    if (!settings.kalshiLiveEnabled) throw new Error('请先开启 Kalshi 人工实盘下单开关')
     if (settings.mode !== 'ASSISTED') throw new Error('双腿实盘目前只允许人工监督模式')
     if (!request.confirmed) throw new Error('未完成双腿真实下单二次确认')
     if (!Array.isArray(request.legs) || request.legs.length !== 2) throw new Error('双腿执行必须提供两个平台腿')
     const { first, second } = pairFor(request.legs)
+    for (const leg of request.legs) {
+      if (leg.venueId === 'KALSHI' && !settings.kalshiLiveEnabled) throw new Error('请先开启 Kalshi 人工实盘下单开关')
+      if (leg.venueId === 'GATE' && !settings.gateLiveEnabled) throw new Error('请先开启 Gate 实盘下单开关')
+    }
     const quantity = new Decimal(request.quantity)
     if (!quantity.isFinite() || quantity.lt(1)) throw new Error('双腿执行数量必须至少为 1 份')
     if (quantity.gt(new Decimal(first.availableQuantity)) || quantity.gt(new Decimal(second.availableQuantity))) {
@@ -71,6 +78,7 @@ export class MultiVenueExecutionService {
     if (totalCapital.gt(new Decimal(settings.maxCapitalPerTrade))) throw new Error(`双腿预计本金 ${totalCapital.toFixed(2)} 超过单笔上限 ${settings.maxCapitalPerTrade}`)
     if (first.venueId === 'MEXC' && !settings.mexcAutomationEnabled) throw new Error('MEXC↔Kalshi 双腿执行需要先开启 MEXC 自动提交')
     if (first.venueId === 'POLYMARKET' && !settings.polymarketLiveEnabled) throw new Error('Polymarket↔Kalshi 双腿执行需要先开启 Polymarket 实盘对冲')
+    if (first.venueId === 'GATE' && !settings.gateLiveEnabled) throw new Error('Gate↔Kalshi 双腿执行需要先开启 Gate 实盘下单')
 
     const sessionId = randomUUID()
     await this.dependencies.executionSessionStore?.begin(sessionId, request.comparisonId)

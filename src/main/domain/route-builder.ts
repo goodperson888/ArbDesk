@@ -83,7 +83,7 @@ function legs(route: BidirectionalRoute, now: number): MultiVenueLeg[] {
 
 export function routeToComparison(route: BidirectionalRoute, settings: RiskSettings, now: number): MultiVenueComparison {
   const includesKalshi = route.left.venueId === 'KALSHI' || route.right.venueId === 'KALSHI'
-  const kalshiPairSupported = includesKalshi && [route.left.venueId, route.right.venueId].some((venue) => venue === 'MEXC' || venue === 'POLYMARKET')
+  const kalshiPairSupported = includesKalshi && [route.left.venueId, route.right.venueId].some((venue) => venue === 'MEXC' || venue === 'POLYMARKET' || venue === 'GATE')
   const maxAge = route.quoteAgeMs
   const blockReasons = [
     includesKalshi ? '跨平台双腿执行需人工确认；按首腿实际成交量对冲第二腿' : '新平台当前只读，尚未开放该路线下单',

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { defaultManualExecutionConditions, defaultSettlementDistanceRules } from '../../shared/defaults'
 import type { RiskSettings } from '../../shared/types'
 import type { ReadOnlyWindowQuote } from '../platforms/read-only-types'
-import { buildBidirectionalRoutes } from './route-builder'
+import { buildBidirectionalRoutes, routeToComparison } from './route-builder'
 
 const settings: RiskSettings = {
   mode: 'SIMULATION', maxCapitalPerTrade: '100', minConditionalReturnPct: '0', maxQuoteAgeMs: 8_000,
@@ -47,5 +47,10 @@ describe('bidirectional route builder', () => {
     const ordered = buildBidirectionalRoutes([market('MEXC'), market('POLYMARKET')], settings, 10_100).map((route) => route.routeId)
     const reversed = buildBidirectionalRoutes([market('POLYMARKET'), market('MEXC')], settings, 10_100).map((route) => route.routeId)
     expect(reversed).toEqual(ordered)
+  })
+
+  it('marks Gate↔Kalshi routes as manually executable once both legs have compatible windows', () => {
+    const route = buildBidirectionalRoutes([market('GATE'), market('KALSHI')], settings, 10_100)[0]
+    expect(routeToComparison(route, settings, 10_100).status).toBe('MANUAL_EXECUTABLE')
   })
 })
