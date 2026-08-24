@@ -128,6 +128,19 @@ function askLevels(source: JsonRecord): OrderBookLevel[] {
   return values.map(level).filter((value): value is OrderBookLevel => Boolean(value)).sort((left, right) => Number(left.price) - Number(right.price))
 }
 
+function isExplicitEmptyBookFrame(source: JsonRecord): boolean {
+  return Array.isArray(source.a) && Array.isArray(source.b) && source.a.length === 0 && source.b.length === 0
+}
+
+function hasZeroAskUpdate(source: JsonRecord): boolean {
+  if (!Array.isArray(source.a)) return false
+  return source.a.some((value) => {
+    if (Array.isArray(value)) return Number(value[1]) === 0
+    const item = record(value)
+    return item ? Number(firstValue(item, ['size', 's', 'quantity', 'qty', 'amount', 'volume', 'q'])) === 0 : false
+  })
+}
+
 function outcomeQuote(source: JsonRecord, fallbackDirection: string | undefined, receivedAt: number): ReadOnlyOutcomeQuote | undefined {
   const parsedDirection = direction(source, fallbackDirection)
   if (!parsedDirection) return undefined
@@ -406,6 +419,22 @@ export class GateMarketData implements ReadOnlyVenueSource {
             direction: tokenContext.direction, outcomeId: tokenId!, bestAsk: levels[0].price, askSize: levels[0].size,
             levels, receivedAt
           }
+          changed = true
+        } else if (context && context.outcomes[tokenContext.direction] && isExplicitEmptyBookFrame(item)) {
+          // Gate sends incremental order-book frames with empty `a`/`b`
+          // arrays when no ask level changed. They are still live updates;
+          // retain the last known ask while advancing freshness so a quiet
+          // side is not incorrectly marked stale after the global 8s cutoff.
+          context.outcomes[tokenContext.direction] = {
+            ...context.outcomes[tokenContext.direction]!,
+            receivedAt
+          }
+          changed = true
+        } else if (context && hasZeroAskUpdate(item)) {
+          // A zero-size ask is a deletion, not a heartbeat. Be conservative
+          // when only a delta is available: remove the cached quote instead
+          // of presenting an old price/depth as fresh.
+          delete context.outcomes[tokenContext.direction]
           changed = true
         }
       }

@@ -194,6 +194,44 @@ describe('GateMarketData', () => {
     })
   })
 
+  it('refreshes quote freshness on empty incremental orderbook frames', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-24T15:42:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-5m?eventId=896001&outcome=Up'
+    const wsUrl = 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web'
+    const startTime = Date.now() - 60_000
+    source.ingest(JSON.stringify({ id: '896001', event_name: 'BTC 5m Up or Down', period: '5m', start_time: startTime, end_time: startTime + 300_000,
+      clob_token_ids: ['gate-up-token-2', 'gate-down-token-2'] }), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/events/896001', pageUrl)
+    source.ingest(JSON.stringify({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      aid: 'gate-up-token-2', a: [['0.41', '98.22']], b: [['0.40', '10']]
+    } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+    source.ingest(JSON.stringify({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      aid: 'gate-down-token-2', a: [['0.59', '88.22']], b: [['0.58', '10']]
+    } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+    const initial = source.getLatestWindows()[0].outcomes.UP
+    vi.advanceTimersByTime(10_000)
+    source.ingest(JSON.stringify({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      aid: 'gate-up-token-2', id: 'malformed-without-book-fields'
+    } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+    expect(source.getLatestWindows()[0].outcomes.UP?.receivedAt).toBe(initial?.receivedAt)
+    source.ingest(JSON.stringify({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      aid: 'gate-up-token-2', a: [], b: [], id: 'book-update-2', timestamp: 1787586010000
+    } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+
+    expect(source.getLatestWindows()[0].outcomes.UP).toMatchObject({
+      bestAsk: initial?.bestAsk,
+      askSize: initial?.askSize,
+      receivedAt: Date.now()
+    })
+    source.ingest(JSON.stringify({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      aid: 'gate-up-token-2', a: [['0.41', '0']], b: [], id: 'book-update-3'
+    } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+    expect(source.getLatestWindows()).toEqual([])
+  })
+
   it('maps Gate websocket market_id tokens and removes an expired round on refresh', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-23T12:32:00.000Z'))
