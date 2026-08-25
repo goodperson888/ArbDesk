@@ -1408,10 +1408,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       setMessage(`输入 ${orderQuantity.toFixed(2)} 份超过当前两边可执行上限 ${maxQuantity.toFixed(2)} 份`)
       return
     }
-    const confirmation = window.confirm(
-      `即将执行双腿真实订单（不是原子交易）：\n\n${otherLeg.venueLabel} ${otherLeg.direction} ${orderQuantity.toFixed(2)}份 @ ${Number(otherLeg.price).toFixed(4)}（约 $${(orderQuantity * Number(otherLeg.price)).toFixed(2)}）\n→ 成交回读后再发送\nKalshi ${selectedKalshiLeg.direction} ${orderQuantity.toFixed(2)}份 @ ${Number(selectedKalshiLeg.price).toFixed(4)}（约 $${(orderQuantity * Number(selectedKalshiLeg.price)).toFixed(2)}）\n\n如果第一腿成交、第二腿失败，会进入恢复态，不会自动重复下单。确认继续？`
-    )
-    if (!confirmation) return
     const request: MultiVenueExecutionCommand = {
       comparisonId: selectedComparison.id,
       quantity: orderQuantity.toFixed(2),
