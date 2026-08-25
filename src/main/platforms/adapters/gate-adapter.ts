@@ -68,10 +68,11 @@ export class GateVenueAdapter implements VenueAdapter {
 
   async waitForFill(receipt: VenueOrderReceipt, request: VenueExecutionRequest): Promise<VenueFill | undefined> {
     if (receipt.status === 'FILLED' || receipt.status === 'PARTIAL') {
-      if (!receipt.orderId || !receipt.averagePrice) return undefined
-      return {
-        venueId: 'GATE', orderId: receipt.orderId, direction: request.direction, quantity: receipt.filledQuantity,
-        averagePrice: receipt.averagePrice, filledAt: receipt.receivedAt, verificationSource: 'DIRECT_RECEIPT'
+      if (receipt.orderId && receipt.averagePrice) {
+        return {
+          venueId: 'GATE', orderId: receipt.orderId, direction: request.direction, quantity: receipt.filledQuantity,
+          averagePrice: receipt.averagePrice, filledAt: receipt.receivedAt, verificationSource: 'DIRECT_RECEIPT'
+        }
       }
     }
     if (!receipt.orderId) return undefined

@@ -96,6 +96,28 @@ describe('GateOrderCapture', () => {
     expect(capture.getResult('gate-1')).toMatchObject({ orderId: 'gate-1', status: 'FILLED', filledQuantity: '2', averagePrice: '0.50' })
   })
 
+  it('parses Gate order history records that use id, filled_size, and fill_price aliases', () => {
+    const capture = new GateOrderCapture()
+    capture.observeResponse({
+      url: 'https://www.gate.com/apiw/v2/event-contract/orders/history',
+      status: 200,
+      body: JSON.stringify({ data: { items: [{ id: 'gate-history-1', status: 'COMPLETED', filled_size: '2', fill_price: '0.49' }] } }),
+      receivedAt: Date.now()
+    })
+    expect(capture.getResult('gate-history-1')).toMatchObject({ orderId: 'gate-history-1', status: 'FILLED', filledQuantity: '2', averagePrice: '0.49' })
+  })
+
+  it('uses the client order id when Gate omits a platform order id', () => {
+    const capture = new GateOrderCapture()
+    capture.observeResponse({
+      url: 'https://www.gate.com/apiw/v2/event-contract/place-order',
+      status: 200,
+      body: JSON.stringify({ data: { client_order_id: 'client-only-1', status: 'accepted' } }),
+      receivedAt: Date.now()
+    })
+    expect(capture.getResult('client-only-1')).toMatchObject({ orderId: 'client-only-1', status: 'ACCEPTED' })
+  })
+
   it('uses the passive Gate WebSocket stream for fill readback', () => {
     const frames: Array<(event: GateCapturedWebSocketFrame) => void> = []
     const capture = new GateOrderCapture({
@@ -105,6 +127,17 @@ describe('GateOrderCapture', () => {
     })
     frames[0]?.({ url: 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web', direction: 'RECEIVED', payload: JSON.stringify({ order_id: 'gate-ws-1', status: 'filled', filled_quantity: '2', avg_price: '0.49' }), receivedAt: Date.now() })
     expect(capture.getResult('gate-ws-1')).toMatchObject({ status: 'FILLED', filledQuantity: '2', averagePrice: '0.49' })
+  })
+
+  it('does not treat a sent order frame as a real fill', () => {
+    const frames: Array<(event: GateCapturedWebSocketFrame) => void> = []
+    const capture = new GateOrderCapture({
+      onRequest: () => () => undefined,
+      onResponse: () => () => undefined,
+      onWebSocketFrame: (listener) => { frames.push(listener); return () => undefined }
+    })
+    frames[0]?.({ url: 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web', direction: 'SENT', payload: JSON.stringify({ order_id: 'gate-sent-1', status: 'filled', filled_quantity: '2', avg_price: '0.49' }), receivedAt: Date.now() })
+    expect(capture.getResult('gate-sent-1')).toBeUndefined()
   })
 
   it('records a complete sanitized request/response/websocket trace until capture is stopped', () => {

@@ -35,4 +35,26 @@ describe('GateBrowserOrderTransport', () => {
     const sent = execute.mock.calls[0]![0]
     expect(JSON.parse(sent.body)).toMatchObject({ market_id: 'new', quantity: '2', price: '0.5' })
   })
+
+  it('accepts a nested Gate submit response whose order id is data.id', async () => {
+    const capture = new GateOrderCapture()
+    const executePageOrder = vi.fn(async () => ({
+      status: 200,
+      body: JSON.stringify({ data: { id: 'gate-submit-1', status: 'accepted', filled_size: '0' } })
+    }))
+    const transport = new GateBrowserOrderTransport(capture, { executeCapturedOrder: vi.fn(), executePageOrder, canExecutePageOrders: () => true })
+    const result = await transport.submit({ marketId: 'event-1', outcomeId: 'token-up', direction: 'UP', quantity: '2', limitPrice: '0.5', startTime: Date.now(), endTime: Date.now() + 300_000, quoteReceivedAt: Date.now(), timeInForce: 'FOK', clientOrderId: 'client-submit-1' })
+    expect(result).toMatchObject({ orderId: 'gate-submit-1', status: 'ACCEPTED', filledQuantity: '0' })
+  })
+
+  it('waits briefly for a passive fill response without sending another request', async () => {
+    const capture = new GateOrderCapture()
+    const transport = new GateBrowserOrderTransport(capture, { executeCapturedOrder: vi.fn() })
+    const pending = transport.reconcile('gate-delayed-1')
+    setTimeout(() => capture.observeResponse({
+      url: 'https://www.gate.com/apiw/v2/event-contract/orders/history', status: 200,
+      body: JSON.stringify({ data: { items: [{ id: 'gate-delayed-1', status: 'FILLED', filled_size: '1', avg_price: '0.51' }] } }), receivedAt: Date.now()
+    }), 25)
+    await expect(pending).resolves.toMatchObject({ orderId: 'gate-delayed-1', status: 'FILLED', filledQuantity: '1', averagePrice: '0.51' })
+  })
 })

@@ -89,7 +89,12 @@ function legs(route: BidirectionalRoute, now: number): MultiVenueLeg[] {
 export function routeToComparison(route: BidirectionalRoute, settings: RiskSettings, now: number): MultiVenueComparison {
   const includesKalshi = route.left.venueId === 'KALSHI' || route.right.venueId === 'KALSHI'
   const kalshiPairSupported = includesKalshi && [route.left.venueId, route.right.venueId].some((venue) => venue === 'MEXC' || venue === 'POLYMARKET' || venue === 'GATE')
-  const maxAge = route.quoteAgeMs
+  const comparisonLegs = legs(route, now)
+  const maxAge = Math.max(...comparisonLegs.map((leg) => leg.quoteAgeMs))
+  const staleLegs = comparisonLegs.filter((leg) => leg.quoteAgeMs > settings.maxQuoteAgeMs)
+  const staleReason = staleLegs.length > 0
+    ? `行情过期：${staleLegs.map((leg) => `${leg.venueLabel} ${Math.round(leg.quoteAgeMs / 1_000)} 秒`).join('；')}未收到价格或有效流观测（门槛 ${Math.round(settings.maxQuoteAgeMs / 1_000)} 秒）`
+    : ''
   const executableDepth = new Decimal(route.executableQuantity)
   const depthReady = executableDepth.gte(1)
   const blockReasons = [
@@ -97,11 +102,10 @@ export function routeToComparison(route: BidirectionalRoute, settings: RiskSetti
     route.matchClass === 'EXACT'
       ? kalshiPairSupported ? '双腿没有跨平台原子事务；第二腿失败会进入恢复态' : '交易连接器尚未接入'
       : '结算源、取价方式或平价规则不完全一致',
-    maxAge > settings.maxQuoteAgeMs ? `行情过期：最慢一腿 ${Math.round(maxAge / 1_000)} 秒未收到价格或有效流观测（门槛 ${Math.round(settings.maxQuoteAgeMs / 1_000)} 秒）` : '',
+    staleReason,
     !depthReady ? '当前至少一腿没有可执行深度，无法确定安全下单份额' : '',
     !route.left.feeVerified || !route.right.feeVerified ? '手续费模型尚未完成实盘校验，当前仅显示毛边际' : ''
   ].filter(Boolean)
-  const comparisonLegs = legs(route, now)
   return {
     id: route.routeId,
     asset: route.left.asset, durationMinutes: route.left.durationMinutes, startTime: route.left.startTime, endTime: route.left.endTime,

@@ -49,4 +49,13 @@ describe('GateVenueAdapter', () => {
     expect(submit).toHaveBeenCalledTimes(1)
     expect(reconcile).toHaveBeenCalledTimes(1)
   })
+
+  it('reconciles a filled status when the submit response has no average price', async () => {
+    const reconcile = vi.fn(async () => ({ orderId: 'gate-order-3', status: 'FILLED' as const, filledQuantity: '2', averagePrice: '0.52' }))
+    const adapter = new GateVenueAdapter(transport({ submit: vi.fn(async () => ({ orderId: 'gate-order-3', status: 'FILLED' as const, filledQuantity: '2' })), reconcile }), { liveEnabled: true })
+    const receipt = await adapter.submitOrder(baseRequest)
+    const fill = await adapter.waitForFill(receipt, baseRequest)
+    expect(fill).toMatchObject({ orderId: 'gate-order-3', quantity: '2', averagePrice: '0.52' })
+    expect(reconcile).toHaveBeenCalledTimes(1)
+  })
 })

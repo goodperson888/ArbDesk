@@ -27,6 +27,74 @@ export interface GateCapturedOrderResult {
   message?: string
 }
 
+const ORDER_ID_KEYS = ['order_id', 'orderId', 'order_no', 'orderNo', 'orderID', 'client_order_id', 'clientOrderId', 'id'] as const
+const STATUS_KEYS = ['status', 'order_status', 'orderStatus', 'state', 'order_state', 'orderState'] as const
+const FILLED_QUANTITY_KEYS = [
+  'filled_quantity', 'filledQuantity', 'executed_quantity', 'executedQuantity',
+  'filled_size', 'filledSize', 'deal_size', 'dealSize', 'matched_size', 'matchedSize',
+  'size_filled', 'sizeFilled', 'filled_amount', 'filledAmount', 'executed_size', 'executedSize',
+  'matched_quantity', 'matchedQuantity'
+] as const
+const AVERAGE_PRICE_KEYS = [
+  'avg_price', 'average_price', 'avgPrice', 'averagePrice', 'fill_price', 'fillPrice',
+  'deal_price', 'dealPrice', 'executed_price', 'executedPrice', 'matched_price', 'matchedPrice'
+] as const
+
+function firstField(record: Record<string, unknown>, keys: readonly string[]): unknown {
+  for (const key of keys) if (record[key] !== undefined && record[key] !== null) return record[key]
+  return undefined
+}
+
+function normalizeOrderStatus(value: unknown, httpStatus = 200): GateCapturedOrderResult['status'] {
+  const raw = String(value ?? '').toUpperCase()
+  if (/FILLED|EXECUTED|COMPLETED|DONE/.test(raw)) return 'FILLED'
+  if (/PARTIAL/.test(raw)) return 'PARTIAL'
+  if (/CANCEL/.test(raw)) return 'CANCELED'
+  if (/REJECT|FAIL|ERROR/.test(raw) || httpStatus >= 400) return 'REJECTED'
+  if (/ACCEPT|OPEN|REST|PENDING|NEW/.test(raw) || (httpStatus >= 200 && httpStatus < 300)) return 'ACCEPTED'
+  return 'UNKNOWN'
+}
+
+/** Normalize the order-shaped records emitted by Gate place-order, order history, and WS events. */
+export function parseGateOrderRecord(value: unknown, httpStatus = 200): GateCapturedOrderResult | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const item = value as Record<string, unknown>
+  const id = firstField(item, ORDER_ID_KEYS)
+  if (typeof id !== 'string' && typeof id !== 'number') return undefined
+  const rawStatus = firstField(item, STATUS_KEYS)
+  const filled = firstField(item, FILLED_QUANTITY_KEYS)
+  const average = firstField(item, AVERAGE_PRICE_KEYS)
+  const normalizedKeys = new Set(Object.keys(item).map((key) => key.toLowerCase().replace(/[-_]/g, '')))
+  const explicitOrderId = ORDER_ID_KEYS.slice(0, -1).some((key) => item[key] !== undefined && item[key] !== null)
+  const orderSignals = rawStatus !== undefined || filled !== undefined || average !== undefined ||
+    ['side', 'marketid', 'eventid', 'tokenid', 'outcomeid', 'ordertype', 'orderstatus'].some((key) => normalizedKeys.has(key))
+  // A bare `id` occurs on many unrelated Gate objects. Only treat it as an order
+  // id when the record also has an order/fill signal.
+  if (!explicitOrderId && !orderSignals) return undefined
+  const filledQuantity = filled === undefined ? '0' : String(filled)
+  const averagePrice = average === undefined ? undefined : String(average)
+  const status = normalizeOrderStatus(rawStatus, httpStatus)
+  return {
+    orderId: String(id), status, filledQuantity, averagePrice,
+    message: typeof item.message === 'string' ? item.message : undefined
+  }
+}
+
+export function parseGateOrderResults(body: string, httpStatus = 200): GateCapturedOrderResult[] {
+  let parsed: unknown
+  try { parsed = JSON.parse(body) } catch { return [] }
+  const results: GateCapturedOrderResult[] = []
+  const visit = (value: unknown): void => {
+    const result = parseGateOrderRecord(value, httpStatus)
+    if (result) results.push(result)
+    if (!value || typeof value !== 'object') return
+    if (Array.isArray(value)) { for (const child of value) visit(child); return }
+    for (const child of Object.values(value as Record<string, unknown>)) visit(child)
+  }
+  visit(parsed)
+  return results
+}
+
 export type GateOrderTraceKind = 'REQUEST' | 'RESPONSE' | 'WEBSOCKET'
 
 export interface GateOrderTraceEntry {
@@ -155,7 +223,10 @@ export class GateOrderCapture {
     if (source) {
       const stopRequest = source.onRequest((event) => this.observe(event))
       const stopResponse = source.onResponse((event) => this.observeResponse(event))
-      const stopWebSocket = source.onWebSocketFrame?.((event) => this.observeResponse({ url: event.url, body: event.payload, receivedAt: event.receivedAt }))
+      const stopWebSocket = source.onWebSocketFrame?.((event) => {
+        if (event.direction === 'SENT') return
+        this.observeResponse({ url: event.url, body: event.payload, receivedAt: event.receivedAt })
+      })
       this.unsubscribe = () => { stopRequest(); stopResponse(); stopWebSocket?.(); this.stopNetworkCapture?.(); this.stopNetworkCapture = undefined }
     }
   }
@@ -232,29 +303,7 @@ export class GateOrderCapture {
   }
 
   observeResponse(event: GateCapturedResponse): void {
-    let parsed: unknown
-    try { parsed = JSON.parse(event.body) } catch { return }
-    const visit = (value: unknown): void => {
-      if (!value || typeof value !== 'object') return
-      if (Array.isArray(value)) { for (const child of value) visit(child); return }
-      const item = value as Record<string, unknown>
-      const id = item.order_id ?? item.orderId
-      const rawStatus = String(item.status ?? item.order_status ?? item.orderStatus ?? '').toUpperCase()
-      if ((typeof id === 'string' || typeof id === 'number') && rawStatus) {
-        const normalizedStatus: GateCapturedOrderResult['status'] = /FILLED|EXECUTED|COMPLETED|DONE/.test(rawStatus)
-          ? 'FILLED' : /PARTIAL/.test(rawStatus) ? 'PARTIAL' : /CANCEL/.test(rawStatus) ? 'CANCELED'
-            : /REJECT|FAIL|ERROR/.test(rawStatus) ? 'REJECTED' : /ACCEPT|OPEN|REST/.test(rawStatus) ? 'ACCEPTED' : 'UNKNOWN'
-        const result: GateCapturedOrderResult = {
-          orderId: String(id), status: normalizedStatus,
-          filledQuantity: String(item.filled_quantity ?? item.filledQuantity ?? item.executed_quantity ?? item.executedQuantity ?? '0'),
-          averagePrice: item.avg_price !== undefined ? String(item.avg_price) : item.average_price !== undefined ? String(item.average_price) : undefined,
-          message: typeof item.message === 'string' ? item.message : undefined
-        }
-        this.results.set(result.orderId, result)
-      }
-      for (const child of Object.values(item)) visit(child)
-    }
-    visit(parsed)
+    for (const result of parseGateOrderResults(event.body, event.status ?? 200)) this.results.set(result.orderId, result)
   }
 
   buildRequest(request: VenueExecutionRequest): GatePreparedRequest {

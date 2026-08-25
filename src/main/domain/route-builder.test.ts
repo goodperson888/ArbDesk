@@ -61,7 +61,9 @@ describe('bidirectional route builder', () => {
       DOWN: { ...market('GATE').outcomes.DOWN!, receivedAt: 1_000 }
     } }
     const route = buildBidirectionalRoutes([staleGate, market('KALSHI')], settings, 10_100)[0]
-    expect(routeToComparison(route, settings, 10_100).status).toBe('STALE')
+    const comparison = routeToComparison(route, settings, 10_100)
+    expect(comparison.status).toBe('STALE')
+    expect(comparison.blockReasons.find((reason) => reason.startsWith('行情过期'))).toContain('Gate')
   })
 
   it('keeps an unchanged quote fresh when its stream was observed recently', () => {
