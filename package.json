@@ -13,9 +13,10 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "dist": "npm run test && npm run build && electron-builder --dir",
-    "package:mac": "npm run test && npm run build && electron-builder --mac zip",
-    "package:win": "npm run test && npm run build && electron-builder --win --publish never",
+    "dist": "node scripts/package-profile.mjs --profile=btc-gate-kalshi --target=dir",
+    "package:mac": "node scripts/package-profile.mjs --profile=btc-gate-kalshi --target=mac",
+    "package:win": "node scripts/package-profile.mjs --profile=btc-gate-kalshi --target=win",
+    "package:profile": "node scripts/package-profile.mjs",
     "license:keygen": "node scripts/license-keygen.mjs",
     "license:issue": "node scripts/license-issue.mjs"
   },

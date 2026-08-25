@@ -2,9 +2,21 @@ name: Build Windows installer
 
 on:
   workflow_dispatch:
+    inputs:
+      market_profile:
+        description: 选择安装包包含的平台
+        required: true
+        default: btc-gate-kalshi
+        type: choice
+        options:
+          - btc-gate-kalshi
+          - btc-all
 
 permissions:
   contents: write
+
+env:
+  MARKET_PROFILE: ${{ inputs.market_profile }}
 
 jobs:
   windows:
@@ -68,7 +80,7 @@ jobs:
         shell: pwsh
         run: |
           $timer = [System.Diagnostics.Stopwatch]::StartNew()
-          npx --no-install electron-builder --win --publish never 2>&1 | Tee-Object -FilePath package-win.log
+          node scripts/package-profile.mjs --profile=$env:MARKET_PROFILE --target=win --skip-checks 2>&1 | Tee-Object -FilePath package-win.log
           $buildExit = $LASTEXITCODE
           $timer.Stop()
           Add-Content -Path $env:GITHUB_ENV -Value "PACKAGE_SECONDS=$([math]::Round($timer.Elapsed.TotalSeconds, 2))"
@@ -101,7 +113,8 @@ jobs:
             if (-not [string]::IsNullOrWhiteSpace($_)) { $totalSeconds += [double]$_ }
           }
 
-          $exeFiles = @(Get-ChildItem -Path release -Filter *.exe -File -ErrorAction SilentlyContinue)
+          $profileOutput = Join-Path 'release' $env:MARKET_PROFILE
+          $exeFiles = @(Get-ChildItem -Path $profileOutput -Filter *.exe -File -ErrorAction SilentlyContinue)
           $exeSummary = if ($exeFiles.Count -eq 0) {
             '未生成'
           } else {
@@ -128,6 +141,7 @@ jobs:
           **运行环境：** $env:RUNNER_OS / $env:ImageOS $env:ImageVersion / $env:RUNNER_NAME<br>
           **Electron 下载缓存命中：** $cacheHit<br>
           **提交：** ``$env:GITHUB_SHA``
+          **市场 Profile：** ``$env:MARKET_PROFILE``
 
           > 阶段合计不包含 Checkout、Node.js 初始化、缓存恢复和产物上传耗时；这些仍可从 Actions 步骤时间直接查看。
           "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
@@ -143,8 +157,8 @@ jobs:
       - name: Upload Windows installer
         uses: actions/upload-artifact@v7
         with:
-          name: ArbDesk-Windows-Installer
-          path: release/*.exe
+          name: ArbDesk-${{ inputs.market_profile }}-Windows-Installer
+          path: release/${{ inputs.market_profile }}/*.exe
           if-no-files-found: error
           retention-days: 7
 
@@ -155,12 +169,13 @@ jobs:
         run: |
           $version = (Get-Content package.json | ConvertFrom-Json).version
           $tag = "v$version"
-          $exe = (Get-ChildItem -Path release -Filter *.exe -File | Select-Object -First 1).FullName
+          $profileOutput = Join-Path 'release' $env:MARKET_PROFILE
+          $exe = (Get-ChildItem -Path $profileOutput -Filter *.exe -File | Select-Object -First 1).FullName
           if (-not $exe) { throw "未找到安装包" }
           $notes = @"
-          ArbDesk $tag
+          ArbDesk $tag — $env:MARKET_PROFILE
 
-          下载下方附件 ArbDesk-Setup-*.exe 安装即可。
+          下载下方带有 ``$env:MARKET_PROFILE`` 标识的 ArbDesk 安装包即可。
           "@
           gh release create $tag $exe --title "ArbDesk $tag" --notes $notes --verify-tag=false 2>$null
           if ($LASTEXITCODE -ne 0) {

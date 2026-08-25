@@ -1,0 +1,7 @@
+{
+  "id": "btc-gate-kalshi",
+  "subjects": ["BTC"],
+  "intervals": ["15m"],
+  "venues": ["GATE", "KALSHI"],
+  "routes": ["GATE:KALSHI"]
+}

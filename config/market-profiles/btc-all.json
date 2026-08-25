@@ -1,0 +1,7 @@
+{
+  "id": "btc-all",
+  "subjects": ["BTC"],
+  "intervals": ["5m", "15m"],
+  "venues": ["MEXC", "POLYMARKET", "LIMITLESS", "PREDICT_FUN", "GATE", "KALSHI"],
+  "routes": ["*"]
+}
