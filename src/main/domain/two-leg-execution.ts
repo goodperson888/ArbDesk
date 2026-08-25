@@ -60,9 +60,11 @@ export class TwoLegExecutionMachine {
     if (!Array.isArray(request.legs) || request.legs.length !== 2) throw new Error('双腿执行必须提供两个平台腿')
     const quantity = new Decimal(request.quantity)
     if (!quantity.isFinite() || quantity.lt(1)) throw new Error('双腿执行数量必须至少为 1 份')
-    if (request.endTime - Date.now() < 20_000) throw new Error('市场距离结算不足 20 秒，已拒绝双腿下单')
+    const stopBeforeExpirySeconds = request.stopBeforeExpirySeconds ?? 20
+    const maxQuoteAgeMs = request.maxQuoteAgeMs ?? MAX_QUOTE_AGE_MS
+    if (request.endTime - Date.now() < stopBeforeExpirySeconds * 1_000) throw new Error(`市场距离结算不足 ${stopBeforeExpirySeconds} 秒，已拒绝双腿下单`)
     for (const leg of request.legs) {
-      if (!Number.isFinite(leg.quoteAgeMs) || leg.quoteAgeMs > MAX_QUOTE_AGE_MS) throw new Error(`${leg.venueId} 行情已过期，已拒绝双腿下单`)
+      if (!Number.isFinite(leg.quoteAgeMs) || leg.quoteAgeMs > maxQuoteAgeMs) throw new Error(`${leg.venueId} 行情已过期，已拒绝双腿下单`)
       if (!leg.marketId || !leg.outcomeId) throw new Error(`${leg.venueId} 缺少市场或结果 ID`)
     }
     const firstIndex = request.firstLegIndex ?? 0
@@ -99,7 +101,14 @@ export class TwoLegExecutionMachine {
         return { sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt, message: `${firstAdapter.venueId} 未产生有效成交，未发送 ${secondLabel}；请人工核对订单` }
       }
 
-      const secondQuantity = filledQuantity
+      // The first venue can report more precision than the second venue accepts.
+      // Normalize once, then use the same target for the order, receipt, and
+      // completion comparison; otherwise 7.19 would be judged smaller than
+      // the raw first fill 7.192 even though the second leg is fully aligned.
+      const secondQuantity = filledQuantity.toDecimalPlaces(2, Decimal.ROUND_DOWN)
+      if (secondQuantity.lt(1)) {
+        return { sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt, message: `${firstAdapter.venueId} 实际成交 ${filledQuantity.toFixed(3)} 份，按第二腿精度归一化后不足 1 份，未发送第二腿；请人工处理` }
+      }
       const secondRequest = executionRequest(request, secondIndex, secondQuantity, sessionId)
       secondReceipt = setVenue(legReceipt(secondRequest, secondQuantity), secondAdapter.venueId)
       await secondAdapter.preflightOrder(secondRequest)
@@ -113,8 +122,9 @@ export class TwoLegExecutionMachine {
       if (!secondFill) throw new Error(`${secondAdapter.venueId} 第二腿已提交但未读取到真实成交`)
       secondReceipt = setVenue(legReceipt(secondRequest, secondQuantity, new Decimal(secondFill.quantity).gte(secondQuantity) ? 'FILLED' : 'PARTIAL', secondFill), secondAdapter.venueId)
       if (new Decimal(secondFill.quantity).gte(secondQuantity)) {
-        const partialNote = filledQuantity.lt(quantity) ? `（首腿原计划${quantity.toFixed(2)}份，实际成交${filledQuantity.toFixed(2)}份）` : ''
-        return { sessionId, comparisonId: request.comparisonId, status: 'HEDGED', firstLeg: firstReceipt, secondLeg: secondReceipt, message: `双腿已对齐：${firstAdapter.venueId} ${secondQuantity.toFixed(2)} 份 → ${secondAdapter.venueId} ${secondReceipt.filledQuantity} 份${partialNote}` }
+        const partialNote = filledQuantity.lt(quantity) ? `（首腿原计划${quantity.toFixed(2)}份，实际成交${filledQuantity.toFixed(3)}份）` : ''
+        const precisionNote = filledQuantity.gt(secondQuantity) ? `（按第二腿精度对齐${secondQuantity.toFixed(2)}份）` : ''
+        return { sessionId, comparisonId: request.comparisonId, status: 'HEDGED', firstLeg: firstReceipt, secondLeg: secondReceipt, message: `双腿已对齐：${firstAdapter.venueId} ${secondQuantity.toFixed(2)} 份 → ${secondAdapter.venueId} ${secondReceipt.filledQuantity} 份${partialNote}${precisionNote}` }
       }
       return { sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt, secondLeg: secondReceipt, message: `第一腿已成交，但 ${secondAdapter.venueId} 仅成交 ${secondReceipt.filledQuantity} / ${secondQuantity.toFixed(2)} 份；已进入恢复态，未自动重试` }
     } catch (error) {

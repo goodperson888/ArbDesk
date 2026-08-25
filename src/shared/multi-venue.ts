@@ -151,9 +151,17 @@ export interface MultiVenueExecutionRequest {
   startTime: number
   endTime: number
   confirmed: boolean
+  maxQuoteAgeMs?: number
+  stopBeforeExpirySeconds?: number
   executionPolicy?: ExecutionPolicy
   firstLegIndex?: 0 | 1
   legs: [MultiVenueExecutionLegRequest, MultiVenueExecutionLegRequest]
+}
+
+export interface MultiVenueExecutionCommand {
+  comparisonId: string
+  quantity: string
+  confirmed: boolean
 }
 
 export interface MultiVenueExecutionLegReceipt {

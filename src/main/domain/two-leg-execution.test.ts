@@ -71,4 +71,19 @@ describe('two-leg execution machine', () => {
     expect(receipt.message).not.toContain('首腿已提交')
     expect(second.submitOrder).not.toHaveBeenCalled()
   })
+
+  it('使用调用方传入的行情时效和到期截止门槛', async () => {
+    const first = adapter('A')
+    const second = adapter('B')
+    const executionRequest = {
+      ...request(),
+      endTime: Date.now() + 15_000,
+      maxQuoteAgeMs: 10_000,
+      stopBeforeExpirySeconds: 10,
+      legs: request().legs.map((leg) => ({ ...leg, quoteAgeMs: 9_000 })) as MultiVenueExecutionRequest['legs']
+    }
+
+    const receipt = await new TwoLegExecutionMachine().execute(executionRequest, new Map([['A', first], ['B', second]]))
+    expect(receipt.status).toBe('HEDGED')
+  })
 })

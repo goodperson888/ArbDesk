@@ -29,6 +29,7 @@ import { LimitlessPreparationService, PredictFunPreparationService } from './ser
 import { LicenseService } from './services/license-service'
 import { FingerprintBrowserRuntime } from './services/fingerprint-browser-runtime'
 import { LICENSE_PUBLIC_KEY_PEM } from './license-public-key'
+import { loadMarketProfile, profileAllowsVenue } from './services/market-profile'
 import type { LicenseSummary } from '../shared/types'
 
 let mainWindow: BrowserWindow | undefined
@@ -114,6 +115,7 @@ async function createWindow(): Promise<void> {
 
 if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   const dataDirectory = join(app.getPath('userData'), 'data')
+  const marketProfile = await loadMarketProfile(app.isPackaged ? join(process.resourcesPath, 'market-profile.json') : process.env.ARB_MARKET_PROFILE_PATH)
   const store = new EventStore(dataDirectory)
   const executionSessionStore = new ExecutionSessionStore(dataDirectory)
   const fingerprintRuntime = new FingerprintBrowserRuntime()
@@ -132,7 +134,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     // Predict.fun commonly has no API key. Keep one background passive page
     // as the default source; the capture layer throttles Chromium and filters
     // irrelevant resources/frames, and the settings page can stop it.
-    { pageCapture: predictFunPageCapture, autoStartPageCapture: true }
+    { pageCapture: predictFunPageCapture, autoStartPageCapture: profileAllowsVenue(marketProfile, 'PREDICT_FUN') }
   )
   const gatePageCapture = new GatePageCapture(fingerprintRuntime)
   const gateOrderCapture = new GateOrderCapture(gatePageCapture, () => gatePageCapture.canExecuteOrders())
@@ -145,7 +147,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     // No prior sanitized trace is normal on first run. Page monitoring remains available.
   }
   const gateOrderTransport = new GateBrowserOrderTransport(gateOrderCapture, gatePageCapture)
-  const gateMarketData = new GateMarketData(gatePageCapture, { autoStartPageCapture: true })
+  const gateMarketData = new GateMarketData(gatePageCapture, { autoStartPageCapture: profileAllowsVenue(marketProfile, 'GATE') })
   const kalshiPageCapture = new KalshiPageCapture()
   const kalshiMarketData = new KalshiMarketData(() => kalshiCredentials.getCredentials().catch(() => undefined), kalshiPageCapture)
   // Kalshi 的 API 请求与 Polymarket 共用应用代理。直连 DNS 在部分网络环境
@@ -169,7 +171,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     predictFunMarketData,
     gateMarketData,
     kalshiMarketData
-  ])
+  ], marketProfile)
   const limitlessPreparation = new LimitlessPreparationService(limitlessCredentials, limitlessMarketData)
   const predictFunPreparation = new PredictFunPreparationService(predictFunCredentials, predictFunMarketData)
   const gatePreparation = new GatePreparationService(gateCredentials, gateMarketData, fetch, gateOrderCapture)
@@ -182,7 +184,8 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     app.isPackaged || process.env.ARB_ENABLE_LIVE_EXECUTION === 'true',
     multiVenueData,
     executionSessionStore,
-    fingerprintRuntime
+    fingerprintRuntime,
+    marketProfile
   )
   await controller.initialize()
   const kalshiTrading = new KalshiTradingService(
@@ -198,6 +201,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     kalshi: kalshiTrading,
     gate: gateOrderTransport,
     settings: () => controller.getSnapshot().settings,
+    comparisonProvider: (comparisonId) => controller.getSnapshot().multiVenueBoard.comparisons.find((comparison) => comparison.id === comparisonId),
     liveExecutionEnabled: app.isPackaged || process.env.ARB_ENABLE_LIVE_EXECUTION === 'true',
     executionSessionStore
   })

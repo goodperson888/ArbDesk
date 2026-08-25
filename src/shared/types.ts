@@ -1,4 +1,4 @@
-import type { MultiVenueBoardSnapshot, MultiVenueExecutionReceipt, MultiVenueExecutionRequest, MultiVenueExecutionSession } from './multi-venue'
+import type { MultiVenueBoardSnapshot, MultiVenueExecutionCommand, MultiVenueExecutionReceipt, MultiVenueExecutionSession } from './multi-venue'
 
 export type Venue = 'MEXC' | 'POLYMARKET'
 export type Direction = 'UP' | 'DOWN'
@@ -332,6 +332,7 @@ export interface AppSnapshot {
   multiVenueBoard: MultiVenueBoardSnapshot
   multiVenueReceipt?: MultiVenueExecutionReceipt
   multiVenueExecutionSessions: MultiVenueExecutionSession[]
+  multiVenueExecutionHistory: MultiVenueExecutionSession[]
   orderHistory: ArbitrageOrderRecord[]
   activeSession?: ExecutionSession
   recoverySessions: ExecutionSession[]
@@ -691,7 +692,7 @@ export interface ArbAppApi {
   stopKalshiPage(): Promise<void>
   getKalshiPageCaptureStatus(): Promise<KalshiPageCaptureStatus>
   prepareKalshiWithoutSubmitting(): Promise<VenuePreparationReport>
-  executeMultiVenue(request: MultiVenueExecutionRequest): Promise<MultiVenueExecutionReceipt>
+  executeMultiVenue(request: MultiVenueExecutionCommand): Promise<MultiVenueExecutionReceipt>
   listMultiVenueExecutionSessions(): Promise<MultiVenueExecutionSession[]>
   markMultiVenueExecutionSessionRecovered(sessionId: string, note?: string): Promise<MultiVenueExecutionSession[]>
   onSnapshot(listener: (snapshot: AppSnapshot) => void): () => void

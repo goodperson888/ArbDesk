@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto'
-import Decimal from 'decimal.js'
 import type { RiskSettings } from '../../shared/types'
 import type {
+  MultiVenueComparison,
+  MultiVenueExecutionCommand,
   MultiVenueExecutionLegRequest,
   MultiVenueExecutionReceipt,
   MultiVenueExecutionRequest
 } from '../../shared/multi-venue'
+import { evaluateEntryGates } from '../../shared/entry-gates'
 import type { MexcBrowserManager } from './mexc-browser'
 import type { PolymarketLiveBroker } from './polymarket-live'
 import type { KalshiTradingService } from './kalshi-trading'
@@ -17,14 +19,13 @@ import { GateVenueAdapter } from '../platforms/adapters/gate-adapter'
 import { TwoLegExecutionMachine } from '../domain/two-leg-execution'
 import type { ExecutionSessionStore } from './execution-session-store'
 
-const MAX_QUOTE_AGE_MS = 8_000
-
 interface PairExecutionDependencies {
   mexc: MexcBrowserManager
   polymarket?: PolymarketLiveBroker
   kalshi: KalshiTradingService
   gate?: GateOrderTransport
   settings: () => RiskSettings
+  comparisonProvider: (comparisonId: string) => MultiVenueComparison | undefined
   liveExecutionEnabled: boolean
   executionSessionStore?: ExecutionSessionStore
 }
@@ -53,37 +54,54 @@ export class MultiVenueExecutionService {
     if (dependencies.gate) this.adapters.set('GATE', new GateVenueAdapter(dependencies.gate, { liveEnabledProvider: () => dependencies.settings().gateLiveEnabled === true }))
   }
 
-  async execute(request: MultiVenueExecutionRequest): Promise<MultiVenueExecutionReceipt> {
+  async execute(command: MultiVenueExecutionCommand): Promise<MultiVenueExecutionReceipt> {
     const settings = this.dependencies.settings()
     if (!this.dependencies.liveExecutionEnabled) throw new Error('当前构建未开启实盘执行门禁')
     if (settings.mode !== 'ASSISTED') throw new Error('双腿实盘目前只允许人工监督模式')
-    if (!request.confirmed) throw new Error('未完成双腿真实下单二次确认')
-    if (!Array.isArray(request.legs) || request.legs.length !== 2) throw new Error('双腿执行必须提供两个平台腿')
-    const { first, second } = pairFor(request.legs)
-    for (const leg of request.legs) {
-      if (leg.venueId === 'KALSHI' && !settings.kalshiLiveEnabled) throw new Error('请先开启 Kalshi 人工实盘下单开关')
-      if (leg.venueId === 'GATE' && !settings.gateLiveEnabled) throw new Error('请先开启 Gate 实盘下单开关')
-    }
-    const quantity = new Decimal(request.quantity)
-    if (!quantity.isFinite() || quantity.lt(1)) throw new Error('双腿执行数量必须至少为 1 份')
-    if (quantity.gt(new Decimal(first.availableQuantity)) || quantity.gt(new Decimal(second.availableQuantity))) {
-      throw new Error('双腿执行数量超过当前任一平台盘口深度')
-    }
-    if (request.endTime - Date.now() < 20_000) throw new Error('市场距离结算不足 20 秒，已拒绝双腿下单')
-    for (const leg of request.legs) {
-      if (!Number.isFinite(leg.quoteAgeMs) || leg.quoteAgeMs > MAX_QUOTE_AGE_MS) throw new Error(`${leg.venueId} 行情已过期，已拒绝双腿下单`)
-      if (!leg.marketId || (leg.venueId !== 'KALSHI' && !leg.outcomeId)) throw new Error(`${leg.venueId} 缺少市场或结果 ID`)
-    }
-    const totalCapital = quantity.mul(first.price).add(quantity.mul(second.price))
-    if (totalCapital.gt(new Decimal(settings.maxCapitalPerTrade))) throw new Error(`双腿预计本金 ${totalCapital.toFixed(2)} 超过单笔上限 ${settings.maxCapitalPerTrade}`)
-    if (first.venueId === 'MEXC' && !settings.mexcAutomationEnabled) throw new Error('MEXC↔Kalshi 双腿执行需要先开启 MEXC 自动提交')
-    if (first.venueId === 'POLYMARKET' && !settings.polymarketLiveEnabled) throw new Error('Polymarket↔Kalshi 双腿执行需要先开启 Polymarket 实盘对冲')
-    if (first.venueId === 'GATE' && !settings.gateLiveEnabled) throw new Error('Gate↔Kalshi 双腿执行需要先开启 Gate 实盘下单')
+    if (!command.confirmed) throw new Error('未完成双腿真实下单二次确认')
+    const comparison = this.dependencies.comparisonProvider(command.comparisonId)
+    if (!comparison) throw new Error('机会已变化或不再存在，请重新选择后下单')
+    if (comparison.executionProvider !== 'MULTI_VENUE' || comparison.legs.length !== 2) throw new Error('当前机会不是可执行的多平台双腿路线')
+    const requestLegs: [MultiVenueExecutionLegRequest, MultiVenueExecutionLegRequest] = [
+      { ...comparison.legs[0] },
+      { ...comparison.legs[1] }
+    ]
+    const { first, second } = pairFor(requestLegs)
+    const otherLiveReady = first.venueId === 'MEXC'
+      ? settings.mexcAutomationEnabled
+      : first.venueId === 'POLYMARKET'
+        ? settings.polymarketLiveEnabled
+        : first.venueId === 'GATE' && settings.gateLiveEnabled
+    const gateReport = evaluateEntryGates({
+      mode: 'MANUAL', quantity: command.quantity, allInCostPerShare: comparison.allInCostPerShare,
+      conditionalReturnPct: comparison.conditionalReturnPct, edgeKind: comparison.edgeKind,
+      matchClass: comparison.matchClass, endTime: comparison.endTime, now: Date.now(),
+      maxCapitalPerTrade: settings.maxCapitalPerTrade, minConditionalReturnPct: settings.minConditionalReturnPct,
+      maxQuoteAgeMs: settings.maxQuoteAgeMs, stopBeforeExpirySeconds: settings.stopBeforeExpirySeconds,
+      manualConditions: settings.manualExecutionConditions, executionIdle: true,
+      readiness: [
+        { id: 'kalshi-live', label: 'Kalshi 实盘开关已开启', passed: settings.kalshiLiveEnabled === true, blockReason: '请先开启 Kalshi 人工实盘下单开关' },
+        { id: `${first.venueId.toLowerCase()}-live`, label: `${first.venueId} 首腿实盘已就绪`, passed: Boolean(otherLiveReady), blockReason: `${first.venueId} 首腿实盘尚未开启` }
+      ],
+      legs: requestLegs.map((leg) => ({
+        ...leg,
+        venueLabel: comparison.legs.find((candidate) => candidate.venueId === leg.venueId)?.venueLabel ?? leg.venueId,
+        minimumQuantity: leg.venueId === 'KALSHI' ? '1' : undefined,
+        minimumNotionalUsd: leg.venueId === 'GATE' ? '5' : undefined
+      }))
+    })
+    if (!gateReport.allowed) throw new Error(gateReport.firstBlockReason ?? '当前入场条件未通过')
 
     const sessionId = randomUUID()
-    await this.dependencies.executionSessionStore?.begin(sessionId, request.comparisonId)
+    await this.dependencies.executionSessionStore?.begin(sessionId, command.comparisonId)
     const orderedRequest: MultiVenueExecutionRequest = {
-      ...request,
+      comparisonId: command.comparisonId,
+      quantity: command.quantity,
+      confirmed: command.confirmed,
+      startTime: comparison.startTime,
+      endTime: comparison.endTime,
+      maxQuoteAgeMs: settings.maxQuoteAgeMs,
+      stopBeforeExpirySeconds: settings.stopBeforeExpirySeconds,
       sessionId,
       legs: [first, second],
       firstLegIndex: 0,
