@@ -1,9 +1,11 @@
 import Decimal from 'decimal.js'
 import type { MultiVenueComparison, MultiVenueLeg, MultiVenueMatchClass } from '../../shared/multi-venue'
+import type { MarketProfile } from '../../shared/market-profile'
 import type { Direction, RiskSettings } from '../../shared/types'
 import type { ReadOnlyOutcomeQuote, ReadOnlyWindowQuote } from '../platforms/read-only-types'
 import type { ResolutionFingerprint } from '../platforms/contracts'
 import { getVenueDescriptor } from '../platforms/registry'
+import { profileAllowsRoute } from '../services/market-profile'
 
 export type RouteDirection = 'A_TO_B' | 'B_TO_A'
 
@@ -39,7 +41,8 @@ function compatibleWindow(left: ReadOnlyWindowQuote, right: ReadOnlyWindowQuote)
     left.startTime === right.startTime && left.endTime === right.endTime
 }
 
-function makeRoute(left: ReadOnlyWindowQuote, right: ReadOnlyWindowQuote, direction: RouteDirection, settings: RiskSettings, now: number): BidirectionalRoute | undefined {
+function makeRoute(left: ReadOnlyWindowQuote, right: ReadOnlyWindowQuote, direction: RouteDirection, settings: RiskSettings, now: number, profile?: MarketProfile): BidirectionalRoute | undefined {
+  if (profile && !profileAllowsRoute(profile, left.venueId, right.venueId)) return undefined
   const leftDirection: Direction = direction === 'A_TO_B' ? 'UP' : 'DOWN'
   const rightDirection: Direction = leftDirection === 'UP' ? 'DOWN' : 'UP'
   const leftQuote = left.outcomes[leftDirection]
@@ -60,7 +63,7 @@ function makeRoute(left: ReadOnlyWindowQuote, right: ReadOnlyWindowQuote, direct
   }
 }
 
-export function buildBidirectionalRoutes(windows: ReadOnlyWindowQuote[], settings: RiskSettings, now: number): BidirectionalRoute[] {
+export function buildBidirectionalRoutes(windows: ReadOnlyWindowQuote[], settings: RiskSettings, now: number, profile?: MarketProfile): BidirectionalRoute[] {
   const stableWindows = [...windows].sort((left, right) => left.venueId.localeCompare(right.venueId) || left.marketId.localeCompare(right.marketId))
   const routes: BidirectionalRoute[] = []
   for (let leftIndex = 0; leftIndex < stableWindows.length; leftIndex += 1) {
@@ -69,7 +72,7 @@ export function buildBidirectionalRoutes(windows: ReadOnlyWindowQuote[], setting
       const right = stableWindows[rightIndex]
       if (!compatibleWindow(left, right)) continue
       for (const direction of ['A_TO_B', 'B_TO_A'] as const) {
-        const route = makeRoute(left, right, direction, settings, now)
+        const route = makeRoute(left, right, direction, settings, now, profile)
         if (route) routes.push(route)
       }
     }

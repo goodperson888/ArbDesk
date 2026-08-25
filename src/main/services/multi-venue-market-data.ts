@@ -1,17 +1,21 @@
 import type { VenueId } from '../../shared/multi-venue'
+import type { MarketProfile } from '../../shared/market-profile'
 import type { ReadOnlyVenueSource, ReadOnlyVenueStatus, ReadOnlyWindowQuote } from '../platforms/read-only-types'
+import { profileAllowsVenue, profileAllowsWindow } from './market-profile'
 
 export class MultiVenueMarketData {
+  private readonly sources: ReadOnlyVenueSource[]
   private windowsByVenue = new Map<VenueId, ReadOnlyWindowQuote[]>()
   private enabledByVenue = new Map<VenueId, boolean>()
   private inFlight?: Promise<ReadOnlyWindowQuote[]>
   private listeners = new Set<() => void>()
 
-  constructor(private readonly sources: ReadOnlyVenueSource[]) {
-    for (const source of sources) {
+  constructor(sources: ReadOnlyVenueSource[], private readonly profile?: MarketProfile) {
+    this.sources = profile ? sources.filter((source) => profileAllowsVenue(profile, source.venueId)) : sources
+    for (const source of this.sources) {
       this.enabledByVenue.set(source.venueId, true)
       source.onMarketData?.(() => {
-        if (source.getLatestWindows) this.windowsByVenue.set(source.venueId, source.getLatestWindows())
+        if (source.getLatestWindows) this.windowsByVenue.set(source.venueId, this.filterWindows(source.getLatestWindows()))
         for (const listener of this.listeners) listener()
       })
     }
@@ -65,8 +69,12 @@ export class MultiVenueMarketData {
     const activeSources = this.sources.filter((source) => this.isVenueMonitoringEnabled(source.venueId))
     const results = await Promise.allSettled(activeSources.map((source) => source.fetchWindows(signal)))
     results.forEach((result, index) => {
-      if (result.status === 'fulfilled') this.windowsByVenue.set(activeSources[index].venueId, result.value)
+      if (result.status === 'fulfilled') this.windowsByVenue.set(activeSources[index].venueId, this.filterWindows(result.value))
     })
     return this.getWindows()
+  }
+
+  private filterWindows(windows: ReadOnlyWindowQuote[]): ReadOnlyWindowQuote[] {
+    return this.profile ? windows.filter((window) => profileAllowsWindow(this.profile!, window)) : windows
   }
 }

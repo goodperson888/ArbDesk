@@ -22,6 +22,7 @@ import type {
   RiskSettings,
   UpdateSettingsRequest
 } from '../shared/types'
+import type { MarketProfile } from '../shared/market-profile'
 import type { MultiVenueExecutionReceipt, MultiVenueExecutionSession } from '../shared/multi-venue'
 import { defaultManualExecutionConditions, defaultSettlementDistanceRules } from '../shared/defaults'
 import { assertTransition } from './domain/execution-machine'
@@ -40,6 +41,7 @@ import { PolymarketMarketData, type PolymarketWindowQuote } from './services/pol
 import type { MultiVenueMarketData } from './services/multi-venue-market-data'
 import type { ExecutionSessionStore } from './services/execution-session-store'
 import type { MexcWindowQuote } from './services/mexc-browser'
+import { DEFAULT_MARKET_PROFILE, profileAllowsVenue, profileAllowsWindow } from './services/market-profile'
 
 const DEFAULT_SETTINGS: RiskSettings = {
   mode: 'SIMULATION',
@@ -94,6 +96,10 @@ function currentPolymarketDiscoveryWindows(now = Date.now()): Array<{
       endTime: startTime + durationMs
     }
   })
+}
+
+function sameWindowReferences<T>(left: T[], right: T[]): boolean {
+  return left.length === right.length && left.every((window, index) => window === right[index])
 }
 
 function isNonRetryablePolymarketError(message: string): boolean {
@@ -152,6 +158,7 @@ export class AppController {
   private venueMonitoring = new Map<string, boolean>()
   private multiVenueReceipt?: MultiVenueExecutionReceipt
   private multiVenueExecutionSessions: MultiVenueExecutionSession[] = []
+  private multiVenueExecutionHistory: MultiVenueExecutionSession[] = []
 
   constructor(
     private readonly store: EventStore,
@@ -161,7 +168,8 @@ export class AppController {
     private readonly liveExecutionEnabled = process.env.ARB_ENABLE_LIVE_EXECUTION === 'true',
     private readonly multiVenueData?: MultiVenueMarketData,
     private readonly executionSessionStore?: ExecutionSessionStore,
-    private readonly fingerprintRuntime?: FingerprintBrowserRuntime
+    private readonly fingerprintRuntime?: FingerprintBrowserRuntime,
+    private readonly marketProfile: MarketProfile = DEFAULT_MARKET_PROFILE
   ) {
     this.mexcBrowser.onMarketData?.(() => this.scheduleStreamingSnapshot())
     this.polymarketData.onMarketData?.(() => this.scheduleStreamingSnapshot())
@@ -171,7 +179,8 @@ export class AppController {
   async initialize(): Promise<void> {
     await this.store.initialize()
     await this.executionSessionStore?.initialize()
-    this.multiVenueExecutionSessions = await this.executionSessionStore?.listUnfinished() ?? []
+    this.multiVenueExecutionHistory = await this.executionSessionStore?.listAll() ?? []
+    this.multiVenueExecutionSessions = this.multiVenueExecutionHistory.filter((session) => ['STARTED', 'RECOVERY_REQUIRED', 'RECONCILE_REQUIRED'].includes(session.status))
     this.settings = await this.store.loadSettings(DEFAULT_SETTINGS)
     this.settings.manualExecutionConditions = defaultManualExecutionConditions(this.settings.manualExecutionConditions)
     this.settings.autoOpenEnabled = false
@@ -259,6 +268,7 @@ export class AppController {
     this.multiVenueReceipt = receipt
     if (this.executionSessionStore) {
       await this.executionSessionStore.recordReceipt(receipt)
+      this.multiVenueExecutionHistory = await this.executionSessionStore.listAll()
       this.multiVenueExecutionSessions = await this.executionSessionStore.listUnfinished()
     }
     const state: ExecutionState = receipt.status === 'HEDGED' ? 'HEDGED' : receipt.status === 'CANCELED' ? 'CANCELLED' : 'RECOVERY_REQUIRED'
@@ -279,6 +289,7 @@ export class AppController {
   async markMultiVenueExecutionSessionRecovered(sessionId: string, note?: string): Promise<MultiVenueExecutionSession[]> {
     if (!this.executionSessionStore) throw new Error('执行会话持久化尚未启用')
     await this.executionSessionStore.markRecovered(sessionId, note)
+    this.multiVenueExecutionHistory = await this.executionSessionStore.listAll()
     this.multiVenueExecutionSessions = await this.executionSessionStore.listUnfinished()
     this.broadcast(this.getSnapshot())
     return [...this.multiVenueExecutionSessions]
@@ -293,6 +304,7 @@ export class AppController {
   async setVenueMonitoring(venueId: string, enabled: boolean): Promise<AppSnapshot> {
     const known = new Set(['MEXC', 'POLYMARKET', 'LIMITLESS', 'PREDICT_FUN', 'GATE', 'KALSHI'])
     if (!known.has(venueId)) throw new Error(`不支持的平台监控开关：${venueId}`)
+    if (!profileAllowsVenue(this.marketProfile, venueId)) throw new Error(`${venueId} 不在当前构建 Profile ${this.marketProfile.id} 中`)
     this.venueMonitoring.set(venueId, enabled)
     if (venueId === 'MEXC') this.mexcBrowser.setMonitoringEnabled?.(enabled)
     else if (venueId === 'POLYMARKET') this.polymarketData.setMonitoringEnabled?.(enabled)
@@ -323,7 +335,8 @@ export class AppController {
     const readOnlyComparisons = buildReadOnlyComparisons(
       allVenueWindows,
       this.settings,
-      now
+      now,
+      this.marketProfile
     )
     return {
       generatedAt: now,
@@ -343,6 +356,7 @@ export class AppController {
       opportunities: this.opportunities,
       multiVenueReceipt: this.multiVenueReceipt,
       multiVenueExecutionSessions: this.multiVenueExecutionSessions,
+      multiVenueExecutionHistory: this.multiVenueExecutionHistory,
       multiVenueBoard: buildLegacyMultiVenueBoard({
         generatedAt: now,
         opportunities: this.opportunities,
@@ -356,6 +370,7 @@ export class AppController {
         },
         windows: allVenueWindows,
         additionalComparisons: readOnlyComparisons,
+        profile: this.marketProfile,
         monitoringEnabled: Object.fromEntries(['MEXC', 'POLYMARKET', 'LIMITLESS', 'PREDICT_FUN', 'GATE', 'KALSHI'].map((venueId) => [
           venueId,
           this.venueMonitoring.get(venueId) !== false && (venueId === 'LIMITLESS' || venueId === 'PREDICT_FUN' || venueId === 'GATE' || venueId === 'KALSHI'
@@ -1747,12 +1762,12 @@ export class AppController {
   private async loadLiveOpportunities(): Promise<AppSnapshot> {
     const supplementalRefresh = this.multiVenueData?.refresh()
     let mexcWindows: MexcWindowQuote[]
-    if (this.venueMonitoring.get('MEXC') === false) {
+    if (!profileAllowsVenue(this.marketProfile, 'MEXC') || this.venueMonitoring.get('MEXC') === false) {
       mexcWindows = []
       this.latestMexcWindows = []
       this.mexcDataMessage = 'MEXC 监控已暂停，不会主动请求市场数据'
     } else try {
-      mexcWindows = await this.mexcBrowser.fetchActiveBtcWindows()
+      mexcWindows = (await this.mexcBrowser.fetchActiveBtcWindows()).filter((window) => profileAllowsWindow(this.marketProfile, { asset: 'BTC/USD', durationMinutes: window.durationMinutes }))
       this.latestMexcWindows = mexcWindows
       const monitoredDurations = [...new Set(mexcWindows.map((window) => window.durationMinutes))]
         .sort((left, right) => left - right)
@@ -1770,7 +1785,7 @@ export class AppController {
       this.broadcast(snapshot)
       return snapshot
     }
-    if (this.venueMonitoring.get('POLYMARKET') === false) {
+    if (!profileAllowsVenue(this.marketProfile, 'POLYMARKET') || this.venueMonitoring.get('POLYMARKET') === false) {
       this.latestPolymarketWindows = []
       this.opportunities = []
       this.polymarketDataMessage = 'Polymarket 监控已暂停，不会主动请求市场数据'
@@ -1783,7 +1798,7 @@ export class AppController {
       // Polymarket has its own rolling 5m/15m markets. Discovery must not be
       // driven by whichever durations MEXC currently exposes, otherwise a
       // missing MEXC 15m market incorrectly hides Polymarket's live 15m book.
-      const polymarketWindows = await this.polymarketData.fetchWindows(currentPolymarketDiscoveryWindows())
+      const polymarketWindows = (await this.polymarketData.fetchWindows(currentPolymarketDiscoveryWindows())).filter((window) => profileAllowsWindow(this.marketProfile, { asset: 'BTC/USD', durationMinutes: window.durationMinutes }))
       this.latestPolymarketWindows = polymarketWindows
       this.polymarketDataMessage = this.polymarketData.getStatus().message
       this.opportunities = mexcWindows.length > 0
@@ -1838,9 +1853,9 @@ export class AppController {
     // for every websocket frame.
     this.streamRefreshTimer = setTimeout(() => {
       this.streamRefreshTimer = undefined
-      const mexcWindows = this.mexcBrowser.getLatestWindows?.() ?? this.latestMexcWindows
-      const polymarketWindows = this.polymarketData.getLatestWindows?.() ?? this.latestPolymarketWindows
-      const coreQuotesChanged = mexcWindows !== this.latestMexcWindows || polymarketWindows !== this.latestPolymarketWindows
+      const mexcWindows = (this.mexcBrowser.getLatestWindows?.() ?? this.latestMexcWindows).filter((window) => profileAllowsWindow(this.marketProfile, { asset: 'BTC/USD', durationMinutes: window.durationMinutes }))
+      const polymarketWindows = (this.polymarketData.getLatestWindows?.() ?? this.latestPolymarketWindows).filter((window) => profileAllowsWindow(this.marketProfile, { asset: 'BTC/USD', durationMinutes: window.durationMinutes }))
+      const coreQuotesChanged = !sameWindowReferences(mexcWindows, this.latestMexcWindows) || !sameWindowReferences(polymarketWindows, this.latestPolymarketWindows)
       if (coreQuotesChanged && mexcWindows.length > 0 && polymarketWindows.length > 0) {
         this.latestMexcWindows = mexcWindows
         this.latestPolymarketWindows = polymarketWindows

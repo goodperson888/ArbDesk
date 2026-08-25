@@ -1,9 +1,11 @@
 import Decimal from 'decimal.js'
 import type { MultiVenueBoardSnapshot, MultiVenueComparison, VenueConnectionState, VenueCycleHealth } from '../../shared/multi-venue'
+import type { MarketProfile } from '../../shared/market-profile'
 import type { Opportunity, RiskSettings } from '../../shared/types'
 import { calculateExecutableOpportunityProfit } from '../domain/opportunity-ranking'
 import { getVenueDescriptor, listRegisteredVenues } from './registry'
 import type { ReadOnlyWindowQuote } from './read-only-types'
+import { profileAllowsVenue } from '../services/market-profile'
 
 interface LegacyBoardInput {
   generatedAt: number
@@ -15,6 +17,7 @@ interface LegacyBoardInput {
   statusMessages?: Record<string, string>
   windows?: ReadOnlyWindowQuote[]
   additionalComparisons?: MultiVenueComparison[]
+  profile?: MarketProfile
 }
 
 function cycleHealth(
@@ -158,7 +161,7 @@ export function buildLegacyMultiVenueBoard(input: LegacyBoardInput): MultiVenueB
     , ...(input.additionalComparisons ?? [])
   ].sort((left, right) => left.fixedSortKey.localeCompare(right.fixedSortKey))
   const windows = input.windows ?? []
-  const platforms = listRegisteredVenues().map((venue) => {
+  const platforms = listRegisteredVenues().filter((venue) => !input.profile || profileAllowsVenue(input.profile, venue.id)).map((venue) => {
     const connectionState = venue.id === 'MEXC' || venue.id === 'POLYMARKET'
       ? input.connections[venue.id]
       : input.additionalConnections?.[venue.id] ?? 'NOT_CONFIGURED' as const

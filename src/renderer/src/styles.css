@@ -384,6 +384,11 @@ tbody tr.opportunity-row.manual-executable:hover { background: rgba(245,158,11,.
 .history-heading { flex: 0 0 auto; padding: 14px 16px; border-bottom: 1px solid var(--border-soft); }
 .history-heading h2 { margin: 2px 0 0; font-size: 17px; }
 .history-list { display: grid; gap: 8px; padding: 12px; overflow-y: auto; }
+.multi-venue-history-section { display: grid; gap: 8px; }
+.history-section-heading { display: flex; align-items: end; justify-content: space-between; gap: 12px; padding: 4px 2px; }
+.history-section-heading h3 { margin: 2px 0 0; font-size: 13px; }
+.history-section-heading > small { color: var(--muted); font-size: 9px; }
+.multi-venue-history-order { background: rgba(14,116,144,.08); }
 .history-order { padding: 11px; border: 1px solid var(--border-soft); border-radius: 10px; background: rgba(15,23,42,.45); }
 .history-order.unhedged, .history-order.recovery_required { border-color: rgba(239,68,68,.32); background: rgba(239,68,68,.06); }
 .history-order.expired { border-color: rgba(148,163,184,.22); background: rgba(30,41,59,.38); }

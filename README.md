@@ -74,6 +74,22 @@ npm run package:mac
 npm run package:win
 ```
 
+### 按市场 Profile 打包
+
+打包产物只会启动 Profile 中声明的资产、周期、平台和路线；Profile 不会携带用户密钥或本地订单记录。可用配置位于 `config/market-profiles/`。GitHub Actions 默认选择 `btc-gate-kalshi`（只启用 Gate、Kalshi 的 BTC 15m 路线），运行流水线时也可以在下拉框选择 `btc-all` 全平台包：
+
+```bash
+npm run package:profile -- --profile=btc-gate-kalshi --target=win
+```
+
+全平台开发包仍可手动构建：
+
+```bash
+npm run package:profile -- --profile=btc-all --target=mac
+```
+
+`npm run dist`、`npm run package:mac` 和 `npm run package:win` 当前也默认使用这个 Gate + Kalshi Profile。输出会放到 `release/<profile>/`，每次构建只清理该 Profile 自己的输出目录，不影响其他 Profile。以后新增 ETH 或其他平台包，只需新增一个 JSON Profile 后用同一命令构建。
+
 ## 使用流程
 
 1. 启动应用，先复制机器码并输入管理员签发的限时授权码；授权通过前不会加载交易主界面。

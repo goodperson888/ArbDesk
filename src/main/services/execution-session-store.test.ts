@@ -24,6 +24,20 @@ describe('execution session store', () => {
     expect(await store.listUnfinished()).toEqual([])
   })
 
+  it('lists completed and unfinished sessions together for history', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'arbdesk-sessions-history-'))
+    const store = new ExecutionSessionStore(directory)
+    await store.initialize()
+    await store.begin('unfinished', 'route-unfinished')
+    await store.recordReceipt({ ...receipt, sessionId: 'unfinished', comparisonId: 'route-unfinished' })
+    await store.begin('completed', 'route-completed')
+    await store.recordReceipt({ ...receipt, sessionId: 'completed', comparisonId: 'route-completed', status: 'HEDGED', secondLeg: { venueId: 'KALSHI', direction: 'DOWN', requestedQuantity: '1', filledQuantity: '1', status: 'FILLED' }, message: 'hedged' })
+    await store.markRecovered('unfinished', '人工已核对')
+
+    expect((await store.listAll()).map((session) => session.sessionId).sort()).toEqual(['completed', 'unfinished'])
+    expect((await store.listUnfinished()).map((session) => session.sessionId)).toEqual([])
+  })
+
   it('ignores corrupt records instead of failing startup', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'arbdesk-sessions-corrupt-'))
     const store = new ExecutionSessionStore(directory)

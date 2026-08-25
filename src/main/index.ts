@@ -202,6 +202,8 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     gate: gateOrderTransport,
     settings: () => controller.getSnapshot().settings,
     comparisonProvider: (comparisonId) => controller.getSnapshot().multiVenueBoard.comparisons.find((comparison) => comparison.id === comparisonId),
+    kalshiCredentialsReady: async () => (await kalshiCredentials.getSummary()).configured,
+    gateExecutionReady: () => gatePageCapture.canExecuteOrders(),
     liveExecutionEnabled: app.isPackaged || process.env.ARB_ENABLE_LIVE_EXECUTION === 'true',
     executionSessionStore
   })

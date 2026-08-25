@@ -1,10 +1,12 @@
 import type { MultiVenueComparison } from '../../shared/multi-venue'
+import type { MarketProfile } from '../../shared/market-profile'
 import type { Direction, RiskSettings } from '../../shared/types'
 import type { MexcWindowQuote } from '../services/mexc-browser'
 import type { PolymarketWindowQuote } from '../services/polymarket-market-data'
 import type { ResolutionFingerprint } from './contracts'
 import type { ReadOnlyWindowQuote } from './read-only-types'
 import { buildBidirectionalRoutes, routeToComparison } from '../domain/route-builder'
+import { profileAllowsWindow } from '../services/market-profile'
 
 function mexcResolution(window: MexcWindowQuote): ResolutionFingerprint {
   return {
@@ -59,7 +61,7 @@ export function normalizeLegacyWindows(
   return [...mexc, ...polymarket]
 }
 
-export function buildReadOnlyComparisons(windows: ReadOnlyWindowQuote[], settings: RiskSettings, now: number): MultiVenueComparison[] {
+export function buildReadOnlyComparisons(windows: ReadOnlyWindowQuote[], settings: RiskSettings, now: number, profile?: MarketProfile): MultiVenueComparison[] {
   const uniqueWindows = new Map<string, ReadOnlyWindowQuote>()
   const quality = (window: ReadOnlyWindowQuote): [number, number, number, number] => {
     const quotes = Object.values(window.outcomes).filter((quote): quote is NonNullable<typeof quote> => Boolean(quote))
@@ -78,13 +80,14 @@ export function buildReadOnlyComparisons(windows: ReadOnlyWindowQuote[], setting
     return false
   }
   for (const window of windows) {
+    if (profile && !profileAllowsWindow(profile, window)) continue
     const key = [window.venueId, window.asset, window.durationMinutes, window.startTime, window.endTime].join(':')
     const previous = uniqueWindows.get(key)
     if (!previous || isBetterQuality(window, previous)) {
       uniqueWindows.set(key, window)
     }
   }
-  return buildBidirectionalRoutes([...uniqueWindows.values()], settings, now)
+  return buildBidirectionalRoutes([...uniqueWindows.values()], settings, now, profile)
     // The mature MEXC↔Polymarket path already has its own fee/risk model and
     // execution provider. Keep it out of the supplemental board to avoid a
     // duplicate opportunity row while every other pair uses the generic route.

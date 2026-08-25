@@ -64,7 +64,11 @@ function deps() {
     submit: vi.fn(async () => ({ orderId: 'gate-order', status: 'FILLED' as const, filledQuantity: '2.00', averagePrice: '0.40' })),
     reconcile: vi.fn(async () => undefined)
   }
-  return { mexc, polymarket, kalshi, gate }
+  return {
+    mexc, polymarket, kalshi, gate,
+    kalshiCredentialsReady: vi.fn(async () => true),
+    gateExecutionReady: vi.fn(() => true)
+  }
 }
 
 describe('multi-venue Kalshi execution', () => {
@@ -169,6 +173,44 @@ describe('multi-venue Kalshi execution', () => {
 
     await expect(service.execute({ comparisonId: 'missing', quantity: '13.00', confirmed: true } as never)).rejects.toThrow('机会已变化')
     expect(mocked.gate.submit).not.toHaveBeenCalled()
+  })
+
+  it('本地 Kalshi 凭据或 Gate 捕获结构未就绪时不提交第一腿', async () => {
+    const mocked = deps()
+    const latest = comparison()
+    const service = new MultiVenueExecutionService({
+      ...mocked, settings: () => settings(), liveExecutionEnabled: true,
+      comparisonProvider: () => latest,
+      kalshiCredentialsReady: async () => false,
+      gateExecutionReady: () => false
+    } as never)
+
+    await expect(service.execute({ comparisonId: latest.id, quantity: '13.00', confirmed: true })).rejects.toThrow('Kalshi')
+    expect(mocked.gate.submit).not.toHaveBeenCalled()
+    expect(mocked.kalshi.placeOrder).not.toHaveBeenCalled()
+  })
+
+  it('已有双腿执行进行中时拒绝并发提交，避免重复首腿订单', async () => {
+    const mocked = deps()
+    const latest = comparison()
+    let releaseGate!: (value: { orderId: string; status: 'FILLED'; filledQuantity: string; averagePrice: string }) => void
+    mocked.gate.submit.mockImplementation(() => new Promise((resolve) => { releaseGate = resolve }))
+    const service = new MultiVenueExecutionService({
+      ...mocked, settings: () => settings(), liveExecutionEnabled: true,
+      comparisonProvider: () => latest
+    } as never)
+    const command = { comparisonId: latest.id, quantity: '13.00', confirmed: true }
+
+    const first = service.execute(command)
+    await vi.waitFor(() => expect(mocked.gate.submit).toHaveBeenCalledTimes(1))
+    const second = service.execute(command)
+    await Promise.resolve()
+    releaseGate({ orderId: 'gate-once', status: 'FILLED', filledQuantity: '13.00', averagePrice: '0.40' })
+    const results = await Promise.allSettled([first, second])
+
+    expect(mocked.gate.submit).toHaveBeenCalledTimes(1)
+    expect(results[0].status).toBe('fulfilled')
+    expect(results[1]).toMatchObject({ status: 'rejected', reason: expect.objectContaining({ message: expect.stringContaining('正在执行') }) })
   })
 
 })

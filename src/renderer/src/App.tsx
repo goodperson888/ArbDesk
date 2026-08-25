@@ -67,8 +67,11 @@ import type {
   SettlementDistanceRule,
   VenuePreparationReport
 } from '../../shared/types'
-import type { MultiVenueComparison, MultiVenueComparisonStatus, MultiVenueExecutionReceipt, MultiVenueExecutionRequest, VenueCycleDataState, VenueDescriptor } from '../../shared/multi-venue'
+import type { MultiVenueComparison, MultiVenueComparisonStatus, MultiVenueExecutionCommand, MultiVenueExecutionReceipt, MultiVenueExecutionSession, VenueCycleDataState, VenueDescriptor } from '../../shared/multi-venue'
+import type { EntryGateCheck } from '../../shared/entry-gates'
 import { defaultSettlementDistanceRules } from '../../shared/defaults'
+import { buildMultiVenueEntryGateReport } from './multi-venue-entry-gates'
+import { selectReadyComparisons, shouldPlayOpportunityAlert } from './opportunity-alert'
 import { routeDirectionLabel, stableRouteKey } from './route-display'
 
 interface SettlementRuleDraft {
@@ -330,14 +333,7 @@ function executionTimingSummary(session: ExecutionSession): string | undefined {
   return segments.length > 0 ? segments.join(' · ') : undefined
 }
 
-interface ExecutionCheck {
-  id: string
-  passed: boolean
-  label: string
-  condition?: keyof ManualExecutionConditions
-  enabled?: boolean
-  locked?: boolean
-}
+type ExecutionCheck = Pick<EntryGateCheck, 'id' | 'passed' | 'label'> & Partial<Pick<EntryGateCheck, 'condition' | 'enabled' | 'locked' | 'applicable'>>
 
 function ExecutionConditionsHelp({
   checks,
@@ -352,9 +348,10 @@ function ExecutionConditionsHelp({
   const triggerRef = useRef<HTMLButtonElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
   const [popoverPosition, setPopoverPosition] = useState({ left: 12, top: 12, width: 380, maxHeight: 480 })
-  const activeChecks = checks.filter((check) => check.locked || check.enabled !== false)
+  const visibleChecks = checks.filter((check) => check.applicable !== false)
+  const activeChecks = visibleChecks.filter((check) => check.locked || check.enabled !== false)
   const passed = activeChecks.filter((check) => check.passed).length
-  const ignored = checks.length - activeChecks.length
+  const ignored = visibleChecks.length - activeChecks.length
 
   useEffect(() => {
     if (!open) return
@@ -416,7 +413,7 @@ function ExecutionConditionsHelp({
   >
       <strong>手动下单条件 · {passed}/{activeChecks.length}通过{ignored > 0 ? ` · ${ignored}项忽略` : ''}</strong>
       <ul>
-        {checks.map((check) => <li key={check.id} className={check.enabled === false && !check.locked ? 'ignored' : check.passed ? 'passed' : 'blocked'}>
+        {visibleChecks.map((check) => <li key={check.id} className={check.enabled === false && !check.locked ? 'ignored' : check.passed ? 'passed' : 'blocked'}>
           {check.enabled === false && !check.locked ? <span className="condition-ignored-mark">—</span> : check.passed ? <Check aria-hidden="true" /> : <X aria-hidden="true" />}
           <span>{check.label}</span>
           {check.locked
@@ -689,8 +686,8 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [hedgeRetryCountDraft, setHedgeRetryCountDraft] = useState('8')
   const [preHedgeRatioDraft, setPreHedgeRatioDraft] = useState('50')
   const [hedgeModeDraft, setHedgeModeDraft] = useState<PolymarketHedgeMode>('PROTECTED_MARKET')
-  const previousCanExecuteRef = useRef(false)
-  const soundCooldownRef = useRef(new Map<string, number>())
+  const previousAlertCandidateRef = useRef<string | undefined>(undefined)
+  const lastOpportunityAlertAtRef = useRef(0)
 
   useEffect(() => {
     void window.arbApp.getSnapshot().then((value) => {
@@ -714,6 +711,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   // 执行面板不需要先打开设置；启动后立即读取一次 Kalshi 凭据摘要，避免把未加载误报成未配置。
   useEffect(() => {
     void window.arbApp.getKalshiCredentialSummary().then(setKalshiCredentials)
+    void window.arbApp.getGateOrderCaptureSummary().then(setGateOrderCapture)
   }, [])
 
   useEffect(() => {
@@ -787,6 +785,9 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     () => selectedComparison?.legs.find((leg) => leg.venueId === 'GATE'),
     [selectedComparison]
   )
+  // 待恢复会话不阻塞新开仓；真正执行中的旧路线仍保持互斥。
+  const recoveryPending = snapshot?.activeSession?.state === 'RECOVERY_REQUIRED'
+  const executionSessionIdle = !snapshot?.activeSession || ['HEDGED', 'CANCELLED', 'RECOVERY_REQUIRED'].includes(snapshot.activeSession.state)
   const multiVenueMaxQuantity = selectedComparison && selectedKalshiLeg && selectedOtherVenueLeg
     ? Math.floor(Math.min(
       Number(selectedComparison.executableQuantity),
@@ -812,23 +813,39 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
         : comparison.durationMinutes === durationFilter
     )
     : [], [durationFilter, snapshot])
-  const readyComparisons = useMemo(() => snapshot
-    ? visibleComparisons.filter((comparison) => {
-      const legacy = comparison.legacyOpportunityId
-        ? opportunityById.get(comparison.legacyOpportunityId)
-        : undefined
-      return comparison.status === 'EXECUTABLE' && Boolean(legacy && opportunityReady(legacy, snapshot, now))
-    })
-    : [], [now, opportunityById, snapshot, visibleComparisons])
+  const multiVenueEntryReports = useMemo(() => {
+    const reports = new Map<string, ReturnType<typeof buildMultiVenueEntryGateReport>>()
+    if (!snapshot) return reports
+    for (const comparison of visibleComparisons) {
+      if (comparison.executionProvider !== 'MULTI_VENUE' || !comparison.legs.some((leg) => leg.venueId === 'KALSHI')) continue
+      reports.set(comparison.id, buildMultiVenueEntryGateReport({
+        comparison,
+        quantity: multiVenueQuantity,
+        settings: snapshot.settings,
+        now,
+        executionIdle: executionSessionIdle,
+        kalshiReady: kalshiCredentials?.configured === true,
+        gateReady: comparison.legs.some((leg) => leg.venueId === 'GATE') ? gateOrderCapture?.executionReady === true : true
+      }))
+    }
+    return reports
+  }, [executionSessionIdle, gateOrderCapture?.executionReady, kalshiCredentials?.configured, multiVenueQuantity, now, snapshot, visibleComparisons])
+  const readyComparisons = useMemo(() => {
+    if (!snapshot) return []
+    const legacyReadyIds = new Set(visibleComparisons
+      .filter((comparison) => {
+        const legacy = comparison.legacyOpportunityId ? opportunityById.get(comparison.legacyOpportunityId) : undefined
+        return Boolean(legacy && opportunityReady(legacy, snapshot, now))
+      })
+      .map((comparison) => comparison.id))
+    return selectReadyComparisons({ comparisons: visibleComparisons, legacyReadyIds, multiVenueReports: multiVenueEntryReports })
+  }, [multiVenueEntryReports, now, opportunityById, snapshot, visibleComparisons])
   const bestComparison = useMemo(() => [...readyComparisons].sort((left, right) =>
     Number(snapshot?.settings.autoOpenEnabled ? right.autoOrderPotentialProfit : right.potentialProfit) -
       Number(snapshot?.settings.autoOpenEnabled ? left.autoOrderPotentialProfit : left.potentialProfit) ||
     Number(right.netEdgePerShare) - Number(left.netEdgePerShare) ||
     left.fixedSortKey.localeCompare(right.fixedSortKey)
   )[0], [readyComparisons, snapshot?.settings.autoOpenEnabled])
-  const bestOpportunity = bestComparison?.legacyOpportunityId
-    ? opportunityById.get(bestComparison.legacyOpportunityId)
-    : undefined
   const readyOpportunityCount = readyComparisons.length
   const orderedComparisonRows = useMemo(() => visibleComparisons
     .map((comparison) => ({
@@ -895,9 +912,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     minimumTestCapital <= 12 &&
     requestedCapital <= dynamicTestCapitalLimit
   )
-  // 需要恢复的套利组不再阻塞新开仓：主进程会在下一次执行前自动挂起它。
-  const recoveryPending = snapshot?.activeSession?.state === 'RECOVERY_REQUIRED'
-  const executionSessionIdle = !snapshot?.activeSession || ['HEDGED', 'CANCELLED', 'RECOVERY_REQUIRED'].includes(snapshot.activeSession.state)
   const effectiveConditionalReturn = currentPlan?.conditionalReturnPct ?? selected?.conditionalReturnPct ?? '0'
   const conditionalReturnPassed = Boolean(selected && snapshot && Number(effectiveConditionalReturn) >= Number(snapshot.settings.minConditionalReturnPct))
   const settlementRiskPassed = Boolean(selected && !selected.settlementRiskBlocked)
@@ -978,12 +992,23 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     { id: 'execution-idle', passed: executionSessionIdle && !busy, label: executionSessionIdle ? (recoveryPending ? '上组待恢复（不阻塞新开仓，可在历史中补单）' : busy ? '当前操作正在执行' : '当前无执行中操作') : `已有执行中套利组（${snapshot.activeSession?.state ?? '未知状态'}）`, locked: true }
   ] : []
 
+  const multiVenueGateReport = selectedComparison && snapshot && selectedKalshiLeg
+    ? buildMultiVenueEntryGateReport({
+      comparison: selectedComparison,
+      quantity: multiVenueQuantity,
+      settings: snapshot.settings,
+      now,
+      executionIdle: executionSessionIdle && !busy,
+      kalshiReady: kalshiCredentials?.configured === true,
+      gateReady: selectedGateLeg ? gateOrderCapture?.executionReady === true : true
+    })
+    : undefined
+
   useEffect(() => {
-    const bestId = bestOpportunity?.id
-    if (selectionMode !== 'FOLLOW_BEST' || !bestId || bestId === selected?.id || busy || !executionSessionIdle) return
-    setSelectedId(bestId)
-    if (bestComparison) setSelectedComparisonId(bestComparison.id)
-  }, [bestComparison, bestOpportunity?.id, busy, executionSessionIdle, selected?.id, selectionMode])
+    if (selectionMode !== 'FOLLOW_BEST' || !bestComparison || bestComparison.id === selectedComparisonId || busy || !executionSessionIdle) return
+    setSelectedComparisonId(bestComparison.id)
+    setSelectedId(bestComparison.legacyOpportunityId)
+  }, [bestComparison, busy, executionSessionIdle, selectedComparisonId, selectionMode])
 
   useEffect(() => {
     if (!snapshot) return
@@ -996,14 +1021,20 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   }, [bestComparison, orderedComparisonRows, selectedComparisonId, selectionMode, snapshot])
 
   useEffect(() => {
-    const becameExecutable = canExecute && !previousCanExecuteRef.current
-    previousCanExecuteRef.current = canExecute
-    if (!snapshot || !selected || !canExecute || !snapshot.settings.opportunitySoundEnabled) return
-    const lastAlerted = soundCooldownRef.current.get(selected.id) ?? 0
-    if (!becameExecutable && now - lastAlerted < snapshot.settings.opportunitySoundCooldownSeconds * 1_000) return
+    const currentId = bestComparison?.id
+    const previousId = previousAlertCandidateRef.current
+    previousAlertCandidateRef.current = currentId
+    if (!snapshot?.settings.opportunitySoundEnabled) return
+    if (!shouldPlayOpportunityAlert(
+      previousId,
+      currentId,
+      lastOpportunityAlertAtRef.current,
+      now,
+      snapshot.settings.opportunitySoundCooldownSeconds * 1_000
+    )) return
     playOpportunityChime(snapshot.settings.opportunitySoundVolume)
-    soundCooldownRef.current.set(selected.id, now)
-  }, [canExecute, now, selected?.id, snapshot?.settings.opportunitySoundCooldownSeconds, snapshot?.settings.opportunitySoundEnabled, snapshot?.settings.opportunitySoundVolume])
+    lastOpportunityAlertAtRef.current = now
+  }, [bestComparison?.id, now, snapshot?.settings.opportunitySoundCooldownSeconds, snapshot?.settings.opportunitySoundEnabled, snapshot?.settings.opportunitySoundVolume])
 
   useEffect(() => {
     if (!snapshot?.activeSession?.id) return
@@ -1319,6 +1350,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
 
   async function executeSelectedMultiVenue(): Promise<void> {
     if (!snapshot || !selectedComparison || !selectedKalshiLeg?.marketId) return
+    if (!multiVenueGateReport?.allowed) {
+      setMessage(multiVenueGateReport?.firstBlockReason ?? '当前双腿入场条件未通过')
+      return
+    }
     const otherLeg = selectedComparison.legs.find((leg) => leg.venueId !== 'KALSHI')
     if (!otherLeg || (otherLeg.venueId !== 'MEXC' && otherLeg.venueId !== 'POLYMARKET' && otherLeg.venueId !== 'GATE')) {
       setMessage('当前机会没有可真实执行的第二平台；仍是观察机会')
@@ -1375,13 +1410,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       `即将执行双腿真实订单（不是原子交易）：\n\n${otherLeg.venueLabel} ${otherLeg.direction} ${orderQuantity.toFixed(2)}份 @ ${Number(otherLeg.price).toFixed(4)}（约 $${(orderQuantity * Number(otherLeg.price)).toFixed(2)}）\n→ 成交回读后再发送\nKalshi ${selectedKalshiLeg.direction} ${orderQuantity.toFixed(2)}份 @ ${Number(selectedKalshiLeg.price).toFixed(4)}（约 $${(orderQuantity * Number(selectedKalshiLeg.price)).toFixed(2)}）\n\n如果第一腿成交、第二腿失败，会进入恢复态，不会自动重复下单。确认继续？`
     )
     if (!confirmation) return
-    const request: MultiVenueExecutionRequest = {
+    const request: MultiVenueExecutionCommand = {
       comparisonId: selectedComparison.id,
       quantity: orderQuantity.toFixed(2),
-      startTime: selectedComparison.startTime,
-      endTime: selectedComparison.endTime,
-      confirmed: true,
-      legs: selectedComparison.legs as unknown as MultiVenueExecutionRequest['legs']
+      confirmed: true
     }
     const result = await run(() => window.arbApp.executeMultiVenue(request), '双腿执行已完成或进入恢复态；请查看两边订单号')
     if (result) setMultiVenueReceipt(result)
@@ -1850,7 +1882,9 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                     <tr><td colSpan={9}><div className="empty-state">当前筛选下暂无真实跨平台报价。{snapshot.connectionDetails.polymarket}</div></td></tr>
                   )}
                   {orderedComparisonRows.map(({ comparison, opportunity }) => {
-                    const positive = Boolean(opportunity && opportunityReady(opportunity, snapshot, now))
+                    const positive = opportunity
+                      ? opportunityReady(opportunity, snapshot, now)
+                      : multiVenueEntryReports.get(comparison.id)?.allowed === true
                     const isSelected = comparison.id === selectedComparison?.id
                     const isBest = comparison.id === bestComparison?.id
                     const firstLeg = comparison.legs[0]
@@ -1906,9 +1940,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 </div>
                 {selectedKalshiLeg && <div className="kalshi-live-ticket">
                   <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>这是双腿执行入口：先提交 {selectedComparison.legs.find((leg) => leg.venueId !== 'KALSHI')?.venueLabel ?? '第一平台'}，读取实际成交后再提交 Kalshi FOK。两边没有原子交易，第二腿失败会进入恢复态，不会自动重复下单。</span></div>
-                  <button className="wide-secondary" onClick={() => void executeSelectedMultiVenue()} disabled={busy || selectedComparison.status !== 'MANUAL_EXECUTABLE' || !snapshot.settings.kalshiLiveEnabled || snapshot.settings.mode !== 'ASSISTED' || !selectedKalshiLeg.marketId || (Boolean(selectedGateLeg) && multiVenueRequestedQuantity < multiVenueMinimumQuantity)}>
-                    <Zap aria-hidden="true" />执行双腿（{selectedKalshiLeg.direction} → Kalshi）
-                  </button>
                   {multiVenueReceipt && multiVenueReceipt.comparisonId === selectedComparison.id && <div className="browser-status-detail"><span>双腿</span><p>{multiVenueReceipt.message} · 状态 {multiVenueReceipt.status}</p></div>}
                 </div>}
               </section>
@@ -2007,6 +2038,16 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <div className="multi-venue-plan-summary">
                   {selectedComparison.legs.map((leg) => <div key={`plan-${leg.venueId}`}><span>{leg.venueLabel} {leg.direction}</span><strong>{Number.isFinite(multiVenueRequestedQuantity) ? `${multiVenueRequestedQuantity.toFixed(2)}份` : '—'}</strong><small>{Number.isFinite(multiVenueRequestedQuantity) && Number(leg.price) > 0 ? `$${(multiVenueRequestedQuantity * Number(leg.price)).toFixed(2)}` : '金额待报价'}</small></div>)}
                 </div>
+                {selectedKalshiLeg && multiVenueGateReport && <>
+                  <div className="execute-action-row">
+                    <button className={`execute-button ${multiVenueGateReport.ignoredCount > 0 ? 'risk-override' : ''}`} onClick={() => void executeSelectedMultiVenue()} disabled={busy || !multiVenueGateReport.allowed}>
+                      {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <Zap aria-hidden="true" />}
+                      {multiVenueGateReport.ignoredCount > 0 ? '风险执行 · ' : ''}执行双腿（{selectedKalshiLeg.direction} → Kalshi）
+                    </button>
+                    <ExecutionConditionsHelp checks={multiVenueGateReport.checks} busy={busy} onToggle={(condition) => void toggleManualExecutionCondition(condition)} />
+                  </div>
+                  {!multiVenueGateReport.allowed && multiVenueGateReport.firstBlockReason && <p className="execution-note"><AlertTriangle aria-hidden="true" />禁用原因：{multiVenueGateReport.firstBlockReason}</p>}
+                </>}
                 <div className="read-only-notice"><Info aria-hidden="true" /><span>{grossComparisonNotice(selectedComparison.status)}</span></div>
                 {selectedComparison.blockReasons.length > 0 && <ul className="read-only-reasons">{selectedComparison.blockReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}
                 {selectedComparison.status !== 'MANUAL_EXECUTABLE' && <button className="execute-button read-only-execute" type="button" disabled><LockKeyhole aria-hidden="true" />{grossComparisonActionLabel(selectedComparison.status)}</button>}
@@ -2091,6 +2132,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
 
       {historyOpen && <HistoryModal
         orders={snapshot.orderHistory}
+        multiVenueSessions={snapshot.multiVenueExecutionHistory}
         busy={busy}
         onDismiss={() => setHistoryOpen(false)}
         onCloseOrder={(order, target) => {
@@ -2099,6 +2141,9 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
         }}
         onRetryHedge={(order) => {
           void run(() => window.arbApp.retryPolymarketHedge({ orderId: order.id }), `已对 ${new Date(order.createdAt).toLocaleTimeString('zh-CN', { hour12: false })} 的套利组发起补单`)
+        }}
+        onMarkMultiVenueRecovered={(sessionId) => {
+          void run(() => window.arbApp.markMultiVenueExecutionSessionRecovered(sessionId, '用户已在两边平台核对成交记录'), '跨平台执行会话已标记为已恢复')
         }}
       />}
 
@@ -2617,16 +2662,20 @@ function FormulaHelp({ compact = false, inline = false }: { compact?: boolean; i
 
 function HistoryModal({
   orders,
+  multiVenueSessions,
   busy,
   onDismiss,
   onCloseOrder,
-  onRetryHedge
+  onRetryHedge,
+  onMarkMultiVenueRecovered
 }: {
   orders: ArbitrageOrderRecord[]
+  multiVenueSessions: MultiVenueExecutionSession[]
   busy: boolean
   onDismiss: () => void
   onCloseOrder: (order: ArbitrageOrderRecord, target: CloseTarget) => void
   onRetryHedge: (order: ArbitrageOrderRecord) => void
+  onMarkMultiVenueRecovered: (sessionId: string) => void
 }): JSX.Element {
   const statusLabels: Record<ArbitrageOrderRecord['status'], string> = {
     OPENING: '开仓中', OPEN: '双腿持仓', UNHEDGED: '单腿敞口', CLOSED: '已平仓',
@@ -2640,7 +2689,27 @@ function HistoryModal({
           <button className="icon-button" onClick={onDismiss} aria-label="关闭历史订单"><X /></button>
         </div>
         <div className="history-list">
-          {orders.length === 0 ? <div className="empty-state">升级后尚无ArbDesk套利订单。</div> : orders.map((order) => {
+          {multiVenueSessions.length > 0 && <section className="multi-venue-history-section">
+            <div className="history-section-heading"><div><span className="eyebrow">MULTI-VENUE EXECUTIONS</span><h3>多平台双腿记录</h3></div><small>复用本地执行会话，不与旧 MEXC/Polymarket 订单混写</small></div>
+            {multiVenueSessions.map((session) => {
+              const receipt = session.receipt
+              const first = receipt?.firstLeg
+              const second = receipt?.secondLeg
+              const recoverable = ['STARTED', 'RECOVERY_REQUIRED', 'RECONCILE_REQUIRED'].includes(session.status)
+              const status = session.status === 'HEDGED' ? '两腿已对齐' : session.status === 'RECOVERED' ? '已恢复' : session.status === 'CANCELED' ? '已取消' : session.status === 'RECONCILE_REQUIRED' ? '需要核对' : session.status === 'RECOVERY_REQUIRED' ? '需要恢复' : '执行中'
+              return <article className={`history-order multi-venue-history-order ${recoverable ? 'recovery_required' : ''}`} key={session.sessionId}>
+                <div className="history-order-head"><div><strong>{session.comparisonId}</strong><span>执行 {new Date(session.createdAt).toLocaleString('zh-CN', { hour12: false })} · 会话 {session.sessionId}</span></div><span className="order-status">{status}</span></div>
+                <div className="history-legs">
+                  <div><span className="history-venue">{first?.venueId ?? '第一腿'} {first && <Direction direction={first.direction} />}</span><strong>{first ? `${first.filledQuantity} / ${first.requestedQuantity}份` : '未确认'}</strong>{first?.averagePrice && <small>均价 {money(first.averagePrice, 4)}</small>}{first?.orderId && <small className="history-order-id" title={first.orderId}>订单号 {first.orderId}</small>}</div>
+                  <div><span className="history-venue">{second?.venueId ?? '第二腿'} {second && <Direction direction={second.direction} />}</span><strong>{second ? `${second.filledQuantity} / ${second.requestedQuantity}份` : '未提交'}</strong>{second?.averagePrice && <small>均价 {money(second.averagePrice, 4)}</small>}{second?.orderId && <small className="history-order-id" title={second.orderId}>订单号 {second.orderId}</small>}</div>
+                  <div><span>执行结果</span><strong>{receipt?.status ?? session.status}</strong><small>{receipt?.message ?? session.recoveryNote ?? '尚无执行回执'}</small></div>
+                </div>
+                {session.recoveryNote && <p className="history-error">恢复备注：{session.recoveryNote}</p>}
+                {recoverable && <div className="history-actions"><button className="recovery-retry-button" onClick={() => onMarkMultiVenueRecovered(session.sessionId)} disabled={busy}>我已核对两边，标记已恢复</button></div>}
+              </article>
+            })}
+          </section>}
+          {orders.length === 0 && multiVenueSessions.length === 0 ? <div className="empty-state">尚无 ArbDesk 交易记录。</div> : orders.map((order) => {
             const mexcOpen = Number(order.mexc.openQuantity) > 0
             const polymarketOpen = Number(order.polymarket.openQuantity) > 0
             const closeable = Date.now() < order.endTime && !['CLOSED', 'CANCELLED', 'EXPIRED'].includes(order.status)

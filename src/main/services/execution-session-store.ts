@@ -47,10 +47,13 @@ export class ExecutionSessionStore {
     }
   }
 
+  async listAll(): Promise<MultiVenueExecutionSession[]> {
+    return (await this.list()).sort((left, right) => right.updatedAt - left.updatedAt)
+  }
+
   async listUnfinished(): Promise<MultiVenueExecutionSession[]> {
-    const sessions = await this.list()
+    const sessions = await this.listAll()
     return sessions.filter((session) => session.status === 'STARTED' || session.status === 'RECOVERY_REQUIRED' || session.status === 'RECONCILE_REQUIRED')
-      .sort((left, right) => right.updatedAt - left.updatedAt)
   }
 
   async begin(sessionId: string, comparisonId: string): Promise<MultiVenueExecutionSession> {
