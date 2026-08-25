@@ -118,6 +118,30 @@ describe('GateOrderCapture', () => {
     expect(capture.getResult('client-only-1')).toMatchObject({ orderId: 'client-only-1', status: 'ACCEPTED' })
   })
 
+  it('reads Gate event-contract compact order updates and biz order ids', () => {
+    const capture = new GateOrderCapture()
+    capture.observeResponse({
+      url: 'https://www.gate.com/apiw/v2/event-contract/place-order', status: 200,
+      body: JSON.stringify({ code: 0, data: { biz_order_id: 'biz-1', ui_status: 'PROCESSING' } }), receivedAt: Date.now()
+    })
+    capture.observeResponse({
+      url: 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web',
+      body: JSON.stringify({ channel: 'predict.poly.order', event: 'update', result: { i: 'biz-1', u: 'MATCHED', qf: '5.629', ap: '0.92' } }),
+      receivedAt: Date.now()
+    })
+    expect(capture.getResult('biz-1')).toMatchObject({ orderId: 'biz-1', status: 'FILLED', filledQuantity: '5.629', averagePrice: '0.92' })
+  })
+
+  it('updates fill readback from the network-response capture path', () => {
+    const capture = new GateOrderCapture()
+    capture.startCapture()
+    capture.observeNetworkResponse({
+      url: 'https://www.gate.com/apiw/v2/event-contract/place-order', status: 200,
+      body: JSON.stringify({ data: { biz_order_id: 'biz-network-1', ui_status: 'PROCESSING' } }), receivedAt: Date.now()
+    })
+    expect(capture.getResult('biz-network-1')).toMatchObject({ orderId: 'biz-network-1', status: 'ACCEPTED' })
+  })
+
   it('uses the passive Gate WebSocket stream for fill readback', () => {
     const frames: Array<(event: GateCapturedWebSocketFrame) => void> = []
     const capture = new GateOrderCapture({
@@ -169,5 +193,30 @@ describe('GateOrderCapture', () => {
     expect(capture.getSummary().capturing).toBe(true)
     capture.stopCapture()
     expect(capture.getSummary().capturing).toBe(false)
+  })
+
+  it('keeps order-chain entries after the high-volume websocket ring buffer rolls over', () => {
+    const capture = new GateOrderCapture()
+    capture.startCapture()
+    capture.observeNetworkRequest({
+      url: 'https://www.gate.com/apiw/v2/event-contract/place-order', method: 'POST',
+      body: JSON.stringify({ event_id: 'event-1', token_id: 'token-1', size: '2', price: '0.5', client_order_id: 'client-1' }),
+      receivedAt: Date.now()
+    })
+    capture.observeNetworkResponse({
+      url: 'https://www.gate.com/apiw/v2/event-contract/place-order', status: 200,
+      body: JSON.stringify({ code: 0, data: { order_id: 'gate-1', status: 'accepted' } }),
+      receivedAt: Date.now()
+    })
+    for (let i = 0; i < 520; i += 1) {
+      capture.observeWebSocketFrame({
+        url: 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web', direction: 'RECEIVED',
+        payload: JSON.stringify({ channel: 'predict.poly.cpi', result: { src: '5m', p: String(i) } }), receivedAt: Date.now()
+      })
+    }
+    const trace = capture.getTrace()
+    expect(trace.some((entry) => entry.kind === 'REQUEST' && entry.endpoint.includes('/place-order'))).toBe(true)
+    expect(trace.some((entry) => entry.kind === 'RESPONSE' && entry.orderIds?.includes('gate-1'))).toBe(true)
+    expect(trace.length).toBeGreaterThan(500)
   })
 })

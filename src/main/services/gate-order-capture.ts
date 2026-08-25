@@ -27,8 +27,8 @@ export interface GateCapturedOrderResult {
   message?: string
 }
 
-const ORDER_ID_KEYS = ['order_id', 'orderId', 'order_no', 'orderNo', 'orderID', 'client_order_id', 'clientOrderId', 'id'] as const
-const STATUS_KEYS = ['status', 'order_status', 'orderStatus', 'state', 'order_state', 'orderState'] as const
+const ORDER_ID_KEYS = ['order_id', 'orderId', 'order_no', 'orderNo', 'orderID', 'client_order_id', 'clientOrderId', 'biz_order_id', 'bizOrderId', 'id'] as const
+const STATUS_KEYS = ['status', 'order_status', 'orderStatus', 'state', 'order_state', 'orderState', 'ui_status'] as const
 const FILLED_QUANTITY_KEYS = [
   'filled_quantity', 'filledQuantity', 'executed_quantity', 'executedQuantity',
   'filled_size', 'filledSize', 'deal_size', 'dealSize', 'matched_size', 'matchedSize',
@@ -47,7 +47,7 @@ function firstField(record: Record<string, unknown>, keys: readonly string[]): u
 
 function normalizeOrderStatus(value: unknown, httpStatus = 200): GateCapturedOrderResult['status'] {
   const raw = String(value ?? '').toUpperCase()
-  if (/FILLED|EXECUTED|COMPLETED|DONE/.test(raw)) return 'FILLED'
+  if (/FILLED|EXECUTED|COMPLETED|DONE|MATCHED/.test(raw)) return 'FILLED'
   if (/PARTIAL/.test(raw)) return 'PARTIAL'
   if (/CANCEL/.test(raw)) return 'CANCELED'
   if (/REJECT|FAIL|ERROR/.test(raw) || httpStatus >= 400) return 'REJECTED'
@@ -59,13 +59,14 @@ function normalizeOrderStatus(value: unknown, httpStatus = 200): GateCapturedOrd
 export function parseGateOrderRecord(value: unknown, httpStatus = 200): GateCapturedOrderResult | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   const item = value as Record<string, unknown>
-  const id = firstField(item, ORDER_ID_KEYS)
+  const compactOrder = item.i !== undefined && ['u', 'qf', 'ap', 'qt', 'qr', 'ot'].some((key) => item[key] !== undefined)
+  const id = firstField(item, ORDER_ID_KEYS) ?? (compactOrder ? item.i : undefined)
   if (typeof id !== 'string' && typeof id !== 'number') return undefined
-  const rawStatus = firstField(item, STATUS_KEYS)
-  const filled = firstField(item, FILLED_QUANTITY_KEYS)
-  const average = firstField(item, AVERAGE_PRICE_KEYS)
+  const rawStatus = firstField(item, STATUS_KEYS) ?? (compactOrder ? item.u : undefined)
+  const filled = firstField(item, FILLED_QUANTITY_KEYS) ?? (compactOrder ? (item.qf ?? item.qt) : undefined)
+  const average = firstField(item, AVERAGE_PRICE_KEYS) ?? (compactOrder ? item.ap : undefined)
   const normalizedKeys = new Set(Object.keys(item).map((key) => key.toLowerCase().replace(/[-_]/g, '')))
-  const explicitOrderId = ORDER_ID_KEYS.slice(0, -1).some((key) => item[key] !== undefined && item[key] !== null)
+  const explicitOrderId = ORDER_ID_KEYS.slice(0, -1).some((key) => item[key] !== undefined && item[key] !== null) || compactOrder
   const orderSignals = rawStatus !== undefined || filled !== undefined || average !== undefined ||
     ['side', 'marketid', 'eventid', 'tokenid', 'outcomeid', 'ordertype', 'orderstatus'].some((key) => normalizedKeys.has(key))
   // A bare `id` occurs on many unrelated Gate objects. Only treat it as an order
@@ -120,6 +121,9 @@ export interface GateOrderTraceEntry {
 type GateOrderCaptureSource = Pick<GatePageCaptureSource, 'onRequest' | 'onResponse'> & Partial<Pick<GatePageCaptureSource, 'onWebSocketFrame' | 'onNetworkRequest' | 'onNetworkResponse' | 'onRawWebSocketFrame'>>
 
 const MAX_TRACE_ENTRIES = 500
+// Gate's event-contract WebSocket is very chatty. Keep a small, separate
+// order-chain buffer so a manual order cannot be evicted by later quotes.
+const MAX_ORDER_TRACE_ENTRIES = 200
 
 function bodyFields(body: string | undefined): string[] {
   if (!body) return []
@@ -152,7 +156,11 @@ function parseBody(body: string | undefined): { parsed?: unknown; format: GateOr
     const visit = (value: unknown): void => {
       if (!value || typeof value !== 'object') return
       if (Array.isArray(value)) { for (const child of value) visit(child); return }
-      for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      const record = value as Record<string, unknown>
+      if (typeof record.i === 'string' || typeof record.i === 'number') {
+        if (['u', 'qf', 'ap', 'qt', 'qr', 'ot'].some((key) => record[key] !== undefined)) orderIds.add(String(record.i))
+      }
+      for (const [key, child] of Object.entries(record)) {
         const normalized = key.toLowerCase().replace(/[-_]/g, '')
         if ((normalized === 'orderid' || normalized === 'clientorderid') && (typeof child === 'string' || typeof child === 'number')) orderIds.add(String(child))
         if (!operationName && (normalized === 'operationname' || normalized === 'operation') && typeof child === 'string') operationName = child
@@ -233,6 +241,15 @@ function isLikelyOrderEndpoint(rawUrl: string): boolean {
   }
 }
 
+function isOrderTraceEntry(entry: GateOrderTraceEntry): boolean {
+  if (isLikelyOrderEndpoint(entry.endpoint)) return true
+  const fields = [...(entry.requestFields ?? []), ...(entry.responseFields ?? [])]
+    .map((field) => field.toLowerCase().replace(/[-_]/g, ''))
+  return Boolean(entry.orderIds?.length) || fields.some((field) =>
+    /(?:^|\.)(?:orderid|clientorderid|orderstatus|filledquantity|filledsize|executedquantity|executedsize|avgprice|averageprice|fillprice|dealprice|matchedquantity|matchedsize)$/.test(field)
+  ) || (fields.some((field) => /(?:^|\.)i$/.test(field)) && fields.some((field) => /(?:^|\.)u$/.test(field)))
+}
+
 export class GateOrderCapture {
   private capturing = false
   private schema?: GateOrderSchema
@@ -240,6 +257,7 @@ export class GateOrderCapture {
   private templateBody?: unknown
   private results = new Map<string, GateCapturedOrderResult>()
   private trace: GateOrderTraceEntry[] = []
+  private orderTrace: GateOrderTraceEntry[] = []
   private traceSequence = 0
   private readonly executionReady?: () => boolean
   private readonly source?: GateOrderCaptureSource
@@ -266,6 +284,7 @@ export class GateOrderCapture {
     this.templateBody = undefined
     this.results.clear()
     this.trace = []
+    this.orderTrace = []
     this.traceSequence = 0
     this.capturing = true
     this.stopNetworkCapture?.()
@@ -297,8 +316,13 @@ export class GateOrderCapture {
 
   private pushTrace(entry: Omit<GateOrderTraceEntry, 'sequence'>): void {
     if (!this.capturing) return
-    this.trace.push({ sequence: ++this.traceSequence, ...entry })
+    const traceEntry = { sequence: ++this.traceSequence, ...entry }
+    this.trace.push(traceEntry)
     if (this.trace.length > MAX_TRACE_ENTRIES) this.trace.splice(0, this.trace.length - MAX_TRACE_ENTRIES)
+    if (isOrderTraceEntry(traceEntry)) {
+      this.orderTrace.push(traceEntry)
+      if (this.orderTrace.length > MAX_ORDER_TRACE_ENTRIES) this.orderTrace.splice(0, this.orderTrace.length - MAX_ORDER_TRACE_ENTRIES)
+    }
   }
 
   observeNetworkRequest(event: GateCapturedRequest): void {
@@ -313,6 +337,7 @@ export class GateOrderCapture {
 
   observeNetworkResponse(event: GateCapturedResponse): void {
     if (!this.capturing || !isGateHost(event.url)) return
+    for (const result of parseGateOrderResults(event.body, event.status ?? 200)) this.results.set(result.orderId, result)
     const body = parseBody(event.body)
     this.pushTrace({
       kind: 'RESPONSE', endpoint: traceEndpoint(event.url), status: event.status, resourceType: event.resourceType,
@@ -393,7 +418,9 @@ export class GateOrderCapture {
     return true
   }
   getTrace(): GateOrderTraceEntry[] {
-    return this.trace.map((entry) => ({
+    const entries = new Map<number, GateOrderTraceEntry>()
+    for (const entry of [...this.trace, ...this.orderTrace]) entries.set(entry.sequence, entry)
+    return [...entries.values()].sort((a, b) => a.sequence - b.sequence).map((entry) => ({
       ...entry,
       requestFields: entry.requestFields ? [...entry.requestFields] : undefined,
       responseFields: entry.responseFields ? [...entry.responseFields] : undefined,
@@ -404,14 +431,15 @@ export class GateOrderCapture {
 
   getSummary(): GateOrderCaptureSummary {
     const schema = this.getSchema()
+    const trace = this.getTrace()
     return schema
-      ? { captured: true, capturing: this.capturing, executionReady: this.executionReady?.() ?? false, endpoint: schema.endpoint, method: schema.method, requestFields: schema.requestFields, pageUrl: schema.pageUrl, capturedAt: schema.capturedAt, traceEntryCount: this.trace.length, candidateCount: this.trace.filter((entry) => entry.kind === 'REQUEST').length, responseCount: this.trace.filter((entry) => entry.kind === 'RESPONSE').length, webSocketCount: this.trace.filter((entry) => entry.kind === 'WEBSOCKET').length, message: this.executionReady?.() ? '已捕获 Gate 订单候选；链路仍在内存采集，可停止后导出脱敏元数据' : '已捕获订单候选，但当前不是可执行的指纹浏览器页面' }
-      : { captured: false, capturing: this.capturing, executionReady: this.executionReady?.() ?? false, traceEntryCount: this.trace.length, candidateCount: this.trace.filter((entry) => entry.kind === 'REQUEST').length, responseCount: this.trace.filter((entry) => entry.kind === 'RESPONSE').length, webSocketCount: this.trace.filter((entry) => entry.kind === 'WEBSOCKET').length, message: this.capturing ? '正在采集 Gate 页面所有脱敏网络元数据；请手动完成一次最小订单' : this.executionReady?.() ? 'Gate 指纹页面已接管；实盘订单将通过后台控件点击，不需要 API Key 或保存请求体' : '尚未接管可执行的 Gate 指纹浏览器页面' }
+      ? { captured: true, capturing: this.capturing, executionReady: this.executionReady?.() ?? false, endpoint: schema.endpoint, method: schema.method, requestFields: schema.requestFields, pageUrl: schema.pageUrl, capturedAt: schema.capturedAt, traceEntryCount: trace.length, candidateCount: trace.filter((entry) => entry.kind === 'REQUEST').length, responseCount: trace.filter((entry) => entry.kind === 'RESPONSE').length, webSocketCount: trace.filter((entry) => entry.kind === 'WEBSOCKET').length, message: this.executionReady?.() ? '已捕获 Gate 订单候选；链路仍在内存采集，可停止后导出脱敏元数据' : '已捕获订单候选，但当前不是可执行的指纹浏览器页面' }
+      : { captured: false, capturing: this.capturing, executionReady: this.executionReady?.() ?? false, traceEntryCount: trace.length, candidateCount: trace.filter((entry) => entry.kind === 'REQUEST').length, responseCount: trace.filter((entry) => entry.kind === 'RESPONSE').length, webSocketCount: trace.filter((entry) => entry.kind === 'WEBSOCKET').length, message: this.capturing ? '正在采集 Gate 页面所有脱敏网络元数据；请手动完成一次最小订单' : this.executionReady?.() ? 'Gate 指纹页面已接管；实盘订单将通过后台控件点击，不需要 API Key 或保存请求体' : '尚未接管可执行的指纹浏览器页面' }
   }
   getResult(orderId: string): GateCapturedOrderResult | undefined {
     const result = this.results.get(orderId)
     return result ? { ...result } : undefined
   }
-  clear(): void { this.stopCapture(); this.schema = undefined; this.replayEndpoint = undefined; this.templateBody = undefined; this.trace = []; this.traceSequence = 0; this.results.clear() }
+  clear(): void { this.stopCapture(); this.schema = undefined; this.replayEndpoint = undefined; this.templateBody = undefined; this.trace = []; this.orderTrace = []; this.traceSequence = 0; this.results.clear() }
   dispose(): void { this.unsubscribe?.(); this.unsubscribe = undefined }
 }

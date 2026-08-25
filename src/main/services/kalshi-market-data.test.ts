@@ -1,7 +1,21 @@
 import { describe, expect, it, vi } from 'vitest'
-import { KalshiMarketData, parseKalshiCandidate } from './kalshi-market-data'
+import { generateKeyPairSync } from 'node:crypto'
+import { HttpsProxyAgent } from 'https-proxy-agent'
+import { KALSHI_WEBSOCKET_URL, KalshiMarketData, kalshiWebSocketOptions, parseKalshiCandidate } from './kalshi-market-data'
 
 describe('Kalshi market normalization', () => {
+  it('uses Kalshi dedicated websocket host for the native authenticated stream', () => {
+    expect(KALSHI_WEBSOCKET_URL).toBe('wss://external-api-ws.kalshi.com/trade-api/ws/v2')
+  })
+
+  it('passes the configured HTTP proxy to the native websocket instead of bypassing it', () => {
+    const agent = new HttpsProxyAgent('http://127.0.0.1:7890')
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
+    const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()
+    expect(kalshiWebSocketOptions({ apiKeyId: 'key', privateKeyPem }, agent)).toMatchObject({ agent })
+    agent.destroy()
+  })
+
   it('accepts only the live BTC 15m directional binary market', () => {
     expect(parseKalshiCandidate({
       ticker: 'KXBTC-26AUG221230-5M-UP', market_type: 'binary', status: 'open',

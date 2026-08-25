@@ -3,7 +3,8 @@ import type { ReadOnlyOutcomeQuote, ReadOnlyVenueSource, ReadOnlyVenueStatus, Re
 import type { ResolutionFingerprint } from '../platforms/contracts'
 import type { KalshiCredentials } from './kalshi-credential-store'
 import { kalshiHeaders } from './kalshi-auth'
-import WebSocket from 'ws'
+import { HttpsProxyAgent } from 'https-proxy-agent'
+import WebSocket, { type ClientOptions } from 'ws'
 import type { KalshiPageCaptureSource } from './kalshi-page-capture'
 
 // The shared production host is the most reliable public market-data route in
@@ -16,7 +17,14 @@ const REQUEST_TIMEOUT_MS = 6_000
 // then read at most a small rollover set of orderbooks.
 const MAX_CANDIDATES = 4
 const BTC_SERIES = ['KXBTC15M'] as const
-const WS_URL = 'wss://api.elections.kalshi.com/trade-api/ws/v2'
+// Kalshi's dedicated WS host is the documented production endpoint. The
+// shared elections host can resolve to a different edge and currently times
+// out in some networks even when the REST API is reachable.
+export const KALSHI_WEBSOCKET_URL = 'wss://external-api-ws.kalshi.com/trade-api/ws/v2'
+
+export function kalshiWebSocketOptions(credentials: KalshiCredentials, proxyAgent?: HttpsProxyAgent<string>): ClientOptions {
+  return { headers: kalshiHeaders(credentials, 'GET', '/trade-api/ws/v2'), ...(proxyAgent ? { agent: proxyAgent } : {}) }
+}
 
 type KalshiStreamState = 'NOT_STARTED' | 'CONNECTING' | 'CONNECTED' | 'DISCONNECTED' | 'ERROR' | 'NO_CREDENTIALS'
 
@@ -147,6 +155,7 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
   private pageStartPromise?: Promise<void>
   private proxyUrl = ''
   private proxyAgent?: import('undici').ProxyAgent
+  private wsProxyAgent?: HttpsProxyAgent<string>
 
   constructor(
     private readonly credentialsProvider?: () => Promise<KalshiCredentials | undefined>,
@@ -166,6 +175,8 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
     const previous = this.proxyAgent
     this.proxyAgent = undefined
     this.proxyUrl = normalized
+    this.wsProxyAgent?.destroy()
+    this.wsProxyAgent = normalized ? new HttpsProxyAgent(normalized) : undefined
     if (previous) void previous.close().catch(() => undefined)
   }
 
@@ -441,7 +452,7 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
     this.streamKey = key
     this.streamState = 'CONNECTING'
     this.streamLastError = undefined
-    const socket = new WebSocket(WS_URL, { headers: kalshiHeaders(credentials, 'GET', '/trade-api/ws/v2') })
+    const socket = new WebSocket(KALSHI_WEBSOCKET_URL, kalshiWebSocketOptions(credentials, this.wsProxyAgent))
     this.stream = socket
     socket.once('open', () => {
       if (this.stream !== socket) return
