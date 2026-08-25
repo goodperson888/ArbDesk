@@ -45,6 +45,8 @@ interface KalshiMarket {
   openTime?: string
   closeTime?: string
   status?: string
+  exchange_index?: number
+  exchangeIndex?: number
 }
 
 interface KalshiMarketsResponse { markets?: KalshiMarket[] }
@@ -63,6 +65,7 @@ interface Candidate {
   startTime: number
   endTime: number
   durationMinutes: 5 | 15
+  exchangeIndex?: number
 }
 
 function timestamp(value: unknown): number | undefined {
@@ -100,7 +103,9 @@ export function parseKalshiCandidate(market: KalshiMarket): Candidate | undefine
   // parser strict so an unrelated/legacy 5-minute payload cannot reappear in
   // the board as a phantom cycle.
   if (durationMinutes !== 15 || !yesDirection) return undefined
-  return { market, ticker, yesDirection, startTime, endTime, durationMinutes }
+  const rawExchangeIndex = Number(market.exchange_index ?? market.exchangeIndex)
+  const exchangeIndex = Number.isInteger(rawExchangeIndex) && rawExchangeIndex >= 0 ? rawExchangeIndex : undefined
+  return { market, ticker, yesDirection, startTime, endTime, durationMinutes, exchangeIndex }
 }
 
 function decimalPrice(value: string): number | undefined {
@@ -167,6 +172,9 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
 
   getStatus(): ReadOnlyVenueStatus { return { ...this.status } }
   getLatestWindows(): ReadOnlyWindowQuote[] { return this.snapshot }
+  getExchangeIndex(ticker: string): number | undefined {
+    return this.candidates.get(ticker)?.exchangeIndex ?? this.pageContexts.get(ticker)?.candidate.exchangeIndex
+  }
   onMarketData(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
 
   configureProxy(proxyUrl: string): void {

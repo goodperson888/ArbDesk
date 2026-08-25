@@ -80,12 +80,6 @@ export class MultiVenueExecutionService {
     if (first.venueId === 'POLYMARKET' && !settings.polymarketLiveEnabled) throw new Error('Polymarket↔Kalshi 双腿执行需要先开启 Polymarket 实盘对冲')
     if (first.venueId === 'GATE' && !settings.gateLiveEnabled) throw new Error('Gate↔Kalshi 双腿执行需要先开启 Gate 实盘下单')
 
-    // Verify the second leg's credentials before any first-leg order is sent.
-    // The check is signed, read-only, cached and in-flight deduplicated inside
-    // KalshiTradingService, so an auth failure cannot leave a fresh first-leg
-    // exposure that is impossible to hedge.
-    await this.dependencies.kalshi.verifyTradingAccess()
-
     const sessionId = randomUUID()
     await this.dependencies.executionSessionStore?.begin(sessionId, request.comparisonId)
     const orderedRequest: MultiVenueExecutionRequest = {

@@ -43,9 +43,10 @@ describe('Kalshi market normalization', () => {
   it('accepts the live KXBTC15M series shape even when the API omits a title', () => {
     const candidate = parseKalshiCandidate({
       ticker: 'KXBTC15M-26AUG230330-30', market_type: 'binary', status: 'active',
+      exchange_index: 2,
       open_time: '2026-08-23T03:15:00.000Z', close_time: '2026-08-23T03:30:00.000Z'
     })
-    expect(candidate).toMatchObject({ durationMinutes: 15, yesDirection: 'UP' })
+    expect(candidate).toMatchObject({ durationMinutes: 15, yesDirection: 'UP', exchangeIndex: 2 })
   })
 
   it('keeps an unchanged quote fresh while the Kalshi page WebSocket remains active', () => {

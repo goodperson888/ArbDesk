@@ -53,7 +53,10 @@ describe('Kalshi preparation safety', () => {
     const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
     const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()
     const credentials = { getCredentials: async () => ({ apiKeyId: 'kalshi_test_key_id', privateKeyPem }) } as KalshiCredentialStore
-    const marketData = { fetchWindows: async () => [{ marketId: 'KXBTC-5M', outcomes: { UP: { bestAsk: '0.40', askSize: '2' } } }] } as unknown as KalshiMarketData
+    const marketData = {
+      fetchWindows: async () => [{ marketId: 'KXBTC15M-TEST', outcomes: { UP: { bestAsk: '0.40', askSize: '2' } } }],
+      getExchangeIndex: () => 2
+    } as unknown as KalshiMarketData
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const path = new URL(String(input)).pathname
       if (path.endsWith('/balance')) return new Response(JSON.stringify({ balance: 0, portfolio_value: 0 }), { status: 200 })
@@ -64,6 +67,7 @@ describe('Kalshi preparation safety', () => {
     const [left, right] = await Promise.all([service.prepare(), service.prepare()])
     expect(left).toBe(right)
     expect(left).toMatchObject({ venueId: 'KALSHI', orderSubmissionBlocked: true, readyExceptFunding: true, fundingReady: false, localOrderBuilt: true, localOrderSigned: true, requestCount: 3 })
+    expect(left.stages.find((stage) => stage.id === 'offline-order-build')?.detail).toContain('exchange_index 2')
     expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(fetchMock.mock.calls.some((call) => String(call[0]).includes('/events/orders'))).toBe(false)
   })

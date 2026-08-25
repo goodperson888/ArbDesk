@@ -48,7 +48,7 @@ describe('multi-venue Kalshi execution', () => {
     expect(receipt.status).toBe('HEDGED')
     expect(mocked.mexc.prepareOrder.mock.invocationCallOrder[0]).toBeLessThan(mocked.mexc.waitForFill.mock.invocationCallOrder[0])
     expect(mocked.kalshi.placeOrder).toHaveBeenCalledTimes(1)
-    expect(mocked.kalshi.verifyTradingAccess).toHaveBeenCalledTimes(1)
+    expect(mocked.kalshi.verifyTradingAccess).not.toHaveBeenCalled()
     expect((mocked.kalshi.placeOrder.mock.calls[0] as unknown as [Record<string, string>])[0]).toMatchObject({ quantity: '2.00', direction: 'DOWN' })
   })
 
@@ -83,12 +83,4 @@ describe('multi-venue Kalshi execution', () => {
     expect((mocked.kalshi.placeOrder.mock.calls[0] as unknown as [Record<string, string>])[0]).toMatchObject({ quantity: '13.00' })
   })
 
-  it('blocks the first leg when Kalshi authentication preflight fails', async () => {
-    const mocked = deps()
-    mocked.kalshi.verifyTradingAccess.mockRejectedValueOnce(new Error('Kalshi 下单前鉴权预检失败：HTTP 401'))
-    const service = new MultiVenueExecutionService({ ...mocked, settings: () => settings(), liveExecutionEnabled: true } as never)
-    await expect(service.execute(request())).rejects.toThrow('鉴权预检失败')
-    expect(mocked.mexc.prepareOrder).not.toHaveBeenCalled()
-    expect(mocked.kalshi.placeOrder).not.toHaveBeenCalled()
-  })
 })

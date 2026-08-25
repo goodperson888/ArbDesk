@@ -9,7 +9,6 @@ const API = 'https://external-api.kalshi.com/trade-api/v2'
 const ORDER_PATH = '/portfolio/events/orders'
 const REQUEST_TIMEOUT_MS = 10_000
 const MAX_QUOTE_AGE_MS = 8_000
-const AUTH_CHECK_TTL_MS = 15_000
 const ALLOWED_API_HOSTS = new Set(['api.elections.kalshi.com', 'external-api.kalshi.com'])
 
 type FetchLike = typeof fetch
@@ -44,8 +43,15 @@ export function assertKalshiTradingRequestAllowed(method: string, rawUrl: string
 
 function messageForHttp(status: number, body: string): string {
   try {
-    const parsed = JSON.parse(body) as { message?: string; code?: string; details?: string }
-    return [parsed.code, parsed.message, parsed.details].filter(Boolean).join(' · ') || `HTTP ${status}`
+    const parsed = JSON.parse(body) as {
+      message?: string; code?: string; details?: unknown
+      error?: { message?: string; code?: string; details?: unknown }
+    }
+    const source = parsed.error ?? parsed
+    const details = typeof source.details === 'string'
+      ? source.details
+      : source.details === undefined ? undefined : JSON.stringify(source.details)
+    return [source.code, source.message, details].filter(Boolean).join(' · ').slice(0, 500) || `HTTP ${status}`
   } catch { return `HTTP ${status}` }
 }
 
@@ -59,8 +65,6 @@ function outcomeToBook(direction: Direction, outcomePrice: Decimal): { side: Kal
 
 export class KalshiTradingService {
   private readonly inFlight = new Map<string, Promise<KalshiOrderReceipt>>()
-  private authCheckedAt?: number
-  private authInFlight?: Promise<void>
 
   constructor(
     private readonly credentials: KalshiCredentialStore,
@@ -69,25 +73,6 @@ export class KalshiTradingService {
     private readonly liveExecutionEnabled: boolean,
     private readonly fetchImpl: FetchLike = fetch
   ) {}
-
-  async verifyTradingAccess(): Promise<void> {
-    if (this.authCheckedAt !== undefined && Date.now() - this.authCheckedAt < AUTH_CHECK_TTL_MS) return
-    if (this.authInFlight) return await this.authInFlight
-    const operation = (async () => {
-      const credentials = await this.credentials.getCredentials()
-      const path = '/portfolio/balance'
-      const response = await this.fetchImpl(`${API}${path}`, {
-        method: 'GET',
-        headers: kalshiHeaders(credentials, 'GET', path),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-      })
-      const body = await response.text()
-      if (!response.ok) throw new Error(`Kalshi 下单前鉴权预检失败：${messageForHttp(response.status, body)}`)
-      this.authCheckedAt = Date.now()
-    })()
-    this.authInFlight = operation
-    try { await operation } finally { this.authInFlight = undefined }
-  }
 
   async placeOrder(request: PlaceKalshiOrderRequest): Promise<KalshiOrderReceipt> {
     const settings = this.settingsProvider()
@@ -124,16 +109,18 @@ export class KalshiTradingService {
     if (estimatedCost.gt(decimal(settings.maxCapitalPerTrade, '单笔本金上限'))) {
       throw new Error(`Kalshi 预计本金 ${estimatedCost.toFixed(2)} USD 超过单笔上限 ${settings.maxCapitalPerTrade} USD`)
     }
+    const exchangeIndex = this.marketData.getExchangeIndex(ticker)
+    if (exchangeIndex === undefined) throw new Error('Kalshi 当前市场缺少 exchange_index，未发送订单；请先点击完整联调刷新市场元数据')
 
     const key = [ticker, request.direction, fixedCount(quantity), fixedPrice(outcomePrice)].join('|')
     const existing = this.inFlight.get(key)
     if (existing) return await existing
-    const operation = this.submit({ ...request, ticker }, quantity, outcomePrice)
+    const operation = this.submit({ ...request, ticker }, quantity, outcomePrice, exchangeIndex)
     this.inFlight.set(key, operation)
     try { return await operation } finally { this.inFlight.delete(key) }
   }
 
-  private async submit(request: PlaceKalshiOrderRequest, quantity: Decimal, outcomePrice: Decimal): Promise<KalshiOrderReceipt> {
+  private async submit(request: PlaceKalshiOrderRequest, quantity: Decimal, outcomePrice: Decimal, exchangeIndex: number): Promise<KalshiOrderReceipt> {
     const credentials = await this.credentials.getCredentials()
     const { side, yesPrice } = outcomeToBook(request.direction, outcomePrice)
     const clientOrderId = `arbdesk-${randomUUID()}`
@@ -148,7 +135,7 @@ export class KalshiTradingService {
       post_only: false,
       reduce_only: false,
       subaccount: 0,
-      exchange_index: 0
+      exchange_index: exchangeIndex
     })
     const url = `${API}${ORDER_PATH}`
     assertKalshiTradingRequestAllowed('POST', url)

@@ -43,7 +43,7 @@ function cents(value: number | undefined): string {
   return Number.isFinite(value) ? (Number(value) / 100).toFixed(2) : '0.00'
 }
 
-function requestBody(window: { marketId: string; outcomes: Record<string, { bestAsk: string; askSize: string } | undefined> }): string {
+function requestBody(window: { marketId: string; outcomes: Record<string, { bestAsk: string; askSize: string } | undefined> }, exchangeIndex: number): string {
   const quote = window.outcomes.UP ?? window.outcomes.DOWN
   const direction = window.outcomes.UP ? 'UP' : 'DOWN'
   const count = Math.max(0.01, Math.min(1, Math.floor(Number(quote?.askSize ?? 0) * 100) / 100))
@@ -51,7 +51,7 @@ function requestBody(window: { marketId: string; outcomes: Record<string, { best
     ticker: window.marketId,
     client_order_id: `arbdesk-preview-${window.marketId}`,
     side: 'bid', count: count.toFixed(2), price: quote?.bestAsk ?? '0.01',
-    outcome: direction, time_in_force: 'fill_or_kill'
+    outcome: direction, time_in_force: 'fill_or_kill', exchange_index: exchangeIndex
   })
 }
 
@@ -159,9 +159,12 @@ export class KalshiPreparationService {
       marketDataReady = true
       const candidate = windows[0]
       marketId = candidate.marketId
+      const exchangeIndex = this.marketData.getExchangeIndex(marketId)
+      if (exchangeIndex === undefined) throw new Error('Kalshi 当前市场缺少 exchange_index；请刷新市场后重试完整联调')
 
-      const body = requestBody(candidate)
-      await record.run('offline-order-build', '本地构造 Kalshi 订单草稿', async () => body, () => `仅内存构造 ${marketId} 订单草稿；未提交`)
+      const body = requestBody(candidate, exchangeIndex)
+      await record.run('offline-order-build', '本地构造 Kalshi 订单草稿', async () => body,
+        () => `仅内存构造 ${marketId} 订单草稿（exchange_index ${exchangeIndex}）；未提交`)
       localOrderBuilt = true
       await record.run('offline-order-sign', '本地签名 Kalshi 订单草稿', async () => {
         const timestamp = String(Date.now())
