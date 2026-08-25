@@ -1,6 +1,11 @@
 import { constants, createPrivateKey, sign } from 'node:crypto'
 import type { KalshiCredentials } from './kalshi-credential-store'
 
+function fullKalshiPath(path: string): string {
+  const normalized = path.startsWith('/') ? path : `/${path}`
+  return normalized.startsWith('/trade-api/') ? normalized : `/trade-api/v2${normalized}`
+}
+
 export function kalshiRequestSignature(privateKeyPem: string, timestamp: string, method: string, path: string): string {
   const message = `${timestamp}${method.toUpperCase()}${path.split('?')[0]}`
   const key = createPrivateKey(privateKeyPem)
@@ -18,7 +23,7 @@ export function kalshiHeaders(credentials: KalshiCredentials, method: string, pa
     'content-type': 'application/json',
     'user-agent': 'ArbDesk/0.1',
     'KALSHI-ACCESS-KEY': credentials.apiKeyId,
-    'KALSHI-ACCESS-SIGNATURE': kalshiRequestSignature(credentials.privateKeyPem, timestamp, method, path),
+    'KALSHI-ACCESS-SIGNATURE': kalshiRequestSignature(credentials.privateKeyPem, timestamp, method, fullKalshiPath(path)),
     'KALSHI-ACCESS-TIMESTAMP': timestamp
   }
 }

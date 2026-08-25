@@ -9,6 +9,7 @@ const API = 'https://api.elections.kalshi.com/trade-api/v2'
 const ORDER_PATH = '/portfolio/events/orders'
 const REQUEST_TIMEOUT_MS = 10_000
 const MAX_QUOTE_AGE_MS = 8_000
+const AUTH_CHECK_TTL_MS = 15_000
 const ALLOWED_API_HOSTS = new Set(['api.elections.kalshi.com', 'external-api.kalshi.com'])
 
 type FetchLike = typeof fetch
@@ -58,6 +59,8 @@ function outcomeToBook(direction: Direction, outcomePrice: Decimal): { side: Kal
 
 export class KalshiTradingService {
   private readonly inFlight = new Map<string, Promise<KalshiOrderReceipt>>()
+  private authCheckedAt?: number
+  private authInFlight?: Promise<void>
 
   constructor(
     private readonly credentials: KalshiCredentialStore,
@@ -66,6 +69,25 @@ export class KalshiTradingService {
     private readonly liveExecutionEnabled: boolean,
     private readonly fetchImpl: FetchLike = fetch
   ) {}
+
+  async verifyTradingAccess(): Promise<void> {
+    if (this.authCheckedAt !== undefined && Date.now() - this.authCheckedAt < AUTH_CHECK_TTL_MS) return
+    if (this.authInFlight) return await this.authInFlight
+    const operation = (async () => {
+      const credentials = await this.credentials.getCredentials()
+      const path = '/portfolio/balance'
+      const response = await this.fetchImpl(`${API}${path}`, {
+        method: 'GET',
+        headers: kalshiHeaders(credentials, 'GET', path),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+      })
+      const body = await response.text()
+      if (!response.ok) throw new Error(`Kalshi 下单前鉴权预检失败：${messageForHttp(response.status, body)}`)
+      this.authCheckedAt = Date.now()
+    })()
+    this.authInFlight = operation
+    try { await operation } finally { this.authInFlight = undefined }
+  }
 
   async placeOrder(request: PlaceKalshiOrderRequest): Promise<KalshiOrderReceipt> {
     const settings = this.settingsProvider()

@@ -49,6 +49,16 @@ describe('Kalshi real order guard', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
+  it('preflights Kalshi authentication once within the short cache window', async () => {
+    const { credentials, marketData } = fixture()
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ balance: 100 }), { status: 200 }))
+    const service = new KalshiTradingService(credentials, marketData, () => settings(), true, fetchMock as typeof fetch)
+    await service.verifyTradingAccess()
+    await service.verifyTradingAccess()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ method: 'GET' }))
+  })
+
   it('never retries an ambiguous POST and rejects simulation/unchecked requests', async () => {
     const { credentials, marketData } = fixture()
     const fetchMock = vi.fn(async () => { throw Object.assign(new Error('fetch failed'), { cause: { code: 'ETIMEDOUT' } }) })

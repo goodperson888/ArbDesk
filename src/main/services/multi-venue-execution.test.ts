@@ -29,6 +29,7 @@ function deps() {
     hedge: vi.fn(async () => ({ venue: 'POLYMARKET' as const, direction: 'UP' as const, quantity: '2.00', averagePrice: '0.40', orderId: 'poly-fill', filledAt: Date.now() }))
   }
   const kalshi = {
+    verifyTradingAccess: vi.fn(async () => undefined),
     placeOrder: vi.fn(async () => ({ orderId: 'kalshi-order', clientOrderId: 'client', ticker: 'KXBTC15M-TEST', direction: 'DOWN' as const, side: 'ask' as const, quantity: '2.00', outcomePrice: '0.50', fillCount: '2.00', remainingCount: '0.00', status: 'EXECUTED' as const, submittedAt: Date.now(), message: 'filled' }))
   }
   const gate = {
@@ -47,6 +48,7 @@ describe('multi-venue Kalshi execution', () => {
     expect(receipt.status).toBe('HEDGED')
     expect(mocked.mexc.prepareOrder.mock.invocationCallOrder[0]).toBeLessThan(mocked.mexc.waitForFill.mock.invocationCallOrder[0])
     expect(mocked.kalshi.placeOrder).toHaveBeenCalledTimes(1)
+    expect(mocked.kalshi.verifyTradingAccess).toHaveBeenCalledTimes(1)
     expect((mocked.kalshi.placeOrder.mock.calls[0] as unknown as [Record<string, string>])[0]).toMatchObject({ quantity: '2.00', direction: 'DOWN' })
   })
 
@@ -79,5 +81,14 @@ describe('multi-venue Kalshi execution', () => {
     expect(mocked.gate.submit).toHaveBeenCalledTimes(1)
     expect(mocked.kalshi.placeOrder).toHaveBeenCalledTimes(1)
     expect((mocked.kalshi.placeOrder.mock.calls[0] as unknown as [Record<string, string>])[0]).toMatchObject({ quantity: '13.00' })
+  })
+
+  it('blocks the first leg when Kalshi authentication preflight fails', async () => {
+    const mocked = deps()
+    mocked.kalshi.verifyTradingAccess.mockRejectedValueOnce(new Error('Kalshi 下单前鉴权预检失败：HTTP 401'))
+    const service = new MultiVenueExecutionService({ ...mocked, settings: () => settings(), liveExecutionEnabled: true } as never)
+    await expect(service.execute(request())).rejects.toThrow('鉴权预检失败')
+    expect(mocked.mexc.prepareOrder).not.toHaveBeenCalled()
+    expect(mocked.kalshi.placeOrder).not.toHaveBeenCalled()
   })
 })
