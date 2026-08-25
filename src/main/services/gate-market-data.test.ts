@@ -429,6 +429,24 @@ describe('GateMarketData', () => {
     })
   })
 
+  it('refreshes stream observation time when Gate sends an unchanged heartbeat frame', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-25T04:45:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-5m?eventId=899860&outcome=Up'
+    const bookUrl = 'https://www.gate.com/apiw/v2/event-contract/book?event_id=899860&market_id=3831010&outcome='
+    source.ingest(JSON.stringify({ data: { asset_id: 'ge_899860_3831010', market: 'ge_899860_3831010', asks: [{ price: '0.40', size: '10' }] } }), Date.now(), 'REST', `${bookUrl}Up`, pageUrl)
+    source.ingest(JSON.stringify({ data: { asset_id: 'ge_899860_3831010', market: 'ge_899860_3831010', asks: [{ price: '0.60', size: '11' }] } }), Date.now(), 'REST', `${bookUrl}Down`, pageUrl)
+    const originalReceivedAt = source.getLatestWindows()[0].outcomes.UP!.receivedAt
+    vi.advanceTimersByTime(23_000)
+    capture.emitFrame({ channel: 'predict.poly.orderbook', event: 'heartbeat' }, { direction: 'RECEIVED', pageUrl })
+
+    expect(source.getLatestWindows()[0].outcomes.UP).toMatchObject({ receivedAt: originalReceivedAt, observedAt: Date.now() })
+    expect(source.getLatestWindows()[0].outcomes.DOWN?.observedAt).toBe(Date.now())
+  })
+
   it('maps Gate websocket market_id tokens and removes an expired round on refresh', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-23T12:32:00.000Z'))

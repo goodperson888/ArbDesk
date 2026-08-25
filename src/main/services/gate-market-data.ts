@@ -362,7 +362,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
     pageCapture.onResponse((event) => this.ingest(event.body, event.receivedAt, 'REST', event.url, event.pageUrl))
     pageCapture.onWebSocketFrame((event) => {
       if (event.direction === 'SENT') this.captureOrderbookSubscription(event.payload, event.pageUrl, event.receivedAt)
-      this.ingest(event.payload, event.receivedAt, 'WebSocket', event.url, event.pageUrl)
+      if (event.direction !== 'SENT') this.ingest(event.payload, event.receivedAt, 'WebSocket', event.url, event.pageUrl)
     })
     pageCapture.onStatus((captureStatus) => {
       this.status = {
@@ -427,7 +427,10 @@ export class GateMarketData implements ReadOnlyVenueSource {
       return
     }
     this.captureAccountCounts(parsed, sourceUrl, receivedAt)
-    let changed = false
+    const streamContext = transport === 'WebSocket' ? urlContext({ pageUrl, sourceUrl }) : {}
+    let changed = transport === 'WebSocket'
+      ? this.refreshObservedAt(streamContext.duration, streamContext.marketId, receivedAt)
+      : false
     let observedPipeline = false
     const frameDuration = transport === 'WebSocket' ? urlContext({ pageUrl, sourceUrl }).duration : undefined
     const restDuration = transport === 'REST' ? urlContext({ pageUrl, sourceUrl }).duration : undefined
@@ -639,6 +642,21 @@ export class GateMarketData implements ReadOnlyVenueSource {
   }
 
   private emit(): void { for (const listener of this.listeners) listener() }
+
+  private refreshObservedAt(duration: 5 | 15 | undefined, marketId: string | undefined, observedAt: number): boolean {
+    if (!duration) return false
+    let changed = false
+    for (const context of this.contexts.values()) {
+      if (context.durationMinutes !== duration || (marketId && context.marketId !== marketId)) continue
+      for (const direction of ['UP', 'DOWN'] as const) {
+        const quote = context.outcomes[direction]
+        if (!quote || (quote.observedAt ?? quote.receivedAt) >= observedAt) continue
+        context.outcomes[direction] = { ...quote, observedAt }
+        changed = true
+      }
+    }
+    return changed
+  }
 
   private pipelineStatusMessage(now: number): string {
     return ([5, 15] as const).map((duration) => {

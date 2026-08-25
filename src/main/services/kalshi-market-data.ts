@@ -295,6 +295,19 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
     if (!this.monitoringEnabled) return
     let parsed: unknown
     try { parsed = JSON.parse(payload) } catch { return }
+    if (transport === 'WebSocket') {
+      for (const [ticker, context] of this.pageContexts) {
+        const outcomes = { ...context.outcomes }
+        let observed = false
+        for (const direction of ['UP', 'DOWN'] as const) {
+          const outcome = outcomes[direction]
+          if (!outcome || (outcome.observedAt ?? outcome.receivedAt) >= receivedAt) continue
+          outcomes[direction] = { ...outcome, observedAt: receivedAt }
+          observed = true
+        }
+        if (observed) this.pageContexts.set(ticker, { ...context, outcomes })
+      }
+    }
     const queue: unknown[] = [parsed]
     let visited = 0
     while (queue.length && visited < 12_000) {
@@ -421,6 +434,10 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
     const current = this.snapshot.find((window) => window.marketId === ticker)
     if (!current) return
     const nextOutcomes = { ...current.outcomes }
+    for (const direction of ['UP', 'DOWN'] as const) {
+      const outcome = nextOutcomes[direction]
+      if (outcome) nextOutcomes[direction] = { ...outcome, observedAt: receivedAt }
+    }
     if (yesAsk !== undefined && yesAskSize > 0) nextOutcomes[yesDirection] = quote(yesDirection, `${ticker}:YES`, [{ price: yesAsk.toFixed(4), size: String(yesAskSize) }], receivedAt)
     if (yesBid !== undefined && yesBidSize > 0) nextOutcomes[noDirection] = quote(noDirection, `${ticker}:NO`, [{ price: (1 - yesBid).toFixed(4), size: String(yesBidSize) }], receivedAt)
     if (!nextOutcomes.UP || !nextOutcomes.DOWN) return

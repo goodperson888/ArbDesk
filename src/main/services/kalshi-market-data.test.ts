@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { parseKalshiCandidate } from './kalshi-market-data'
+import { describe, expect, it, vi } from 'vitest'
+import { KalshiMarketData, parseKalshiCandidate } from './kalshi-market-data'
 
 describe('Kalshi market normalization', () => {
   it('accepts only the live BTC 15m directional binary market', () => {
@@ -32,5 +32,23 @@ describe('Kalshi market normalization', () => {
       open_time: '2026-08-23T03:15:00.000Z', close_time: '2026-08-23T03:30:00.000Z'
     })
     expect(candidate).toMatchObject({ durationMinutes: 15, yesDirection: 'UP' })
+  })
+
+  it('keeps an unchanged quote fresh while the Kalshi page WebSocket remains active', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-25T04:50:00.000Z'))
+    const source = new KalshiMarketData()
+    source.ingest(JSON.stringify({
+      ticker: 'KXBTC15M-26AUG250450-30', market_ticker: 'KXBTC15M-26AUG250450-30', market_type: 'binary', status: 'open',
+      title: 'Bitcoin up or down in 15 minutes?',
+      open_time: '2026-08-25T04:45:00.000Z', close_time: '2026-08-25T05:00:00.000Z',
+      yes_ask_dollars: '0.40', yes_ask_size_fp: '10', no_ask_dollars: '0.60', no_ask_size_fp: '11'
+    }), Date.now(), 'REST')
+    const originalReceivedAt = source.getLatestWindows()[0].outcomes.UP!.receivedAt
+    vi.advanceTimersByTime(23_000)
+    source.ingest(JSON.stringify({ type: 'heartbeat' }), Date.now(), 'WebSocket')
+
+    expect(source.getLatestWindows()[0].outcomes.UP).toMatchObject({ receivedAt: originalReceivedAt, observedAt: Date.now() })
+    vi.useRealTimers()
   })
 })

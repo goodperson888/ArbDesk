@@ -9,6 +9,8 @@ export interface ReadOnlyOutcomeQuote {
   askSize: string
   levels: OrderBookLevel[]
   receivedAt: number
+  /** Latest stream/page observation, even when the price and depth are unchanged. */
+  observedAt?: number
 }
 
 export interface ReadOnlyWindowQuote {

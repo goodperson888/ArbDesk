@@ -1,7 +1,7 @@
 import Decimal from 'decimal.js'
 import type { MultiVenueComparison, MultiVenueLeg, MultiVenueMatchClass } from '../../shared/multi-venue'
 import type { Direction, RiskSettings } from '../../shared/types'
-import type { ReadOnlyWindowQuote } from '../platforms/read-only-types'
+import type { ReadOnlyOutcomeQuote, ReadOnlyWindowQuote } from '../platforms/read-only-types'
 import type { ResolutionFingerprint } from '../platforms/contracts'
 import { getVenueDescriptor } from '../platforms/registry'
 
@@ -19,6 +19,11 @@ export interface BidirectionalRoute {
   netEdgePerShare: string
   executableQuantity: string
   quoteAgeMs: number
+}
+
+function quoteAgeMs(quote: ReadOnlyOutcomeQuote, now: number): number {
+  const observedAt = Math.max(quote.receivedAt, quote.observedAt ?? 0)
+  return Math.max(0, now - observedAt)
 }
 
 function matchClass(left: ResolutionFingerprint, right: ResolutionFingerprint): MultiVenueMatchClass {
@@ -51,7 +56,7 @@ function makeRoute(left: ReadOnlyWindowQuote, right: ReadOnlyWindowQuote, direct
     direction, left, right, leftDirection, rightDirection,
     matchClass: matchClass(left.resolution, right.resolution),
     allInCostPerShare: cost.toFixed(6), netEdgePerShare: grossEdge.toFixed(6), executableQuantity: quantity.toFixed(2),
-    quoteAgeMs: Math.max(now - leftQuote.receivedAt, now - rightQuote.receivedAt)
+    quoteAgeMs: Math.max(quoteAgeMs(leftQuote, now), quoteAgeMs(rightQuote, now))
   }
 }
 
@@ -76,8 +81,8 @@ function legs(route: BidirectionalRoute, now: number): MultiVenueLeg[] {
   const leftQuote = route.left.outcomes[route.leftDirection]!
   const rightQuote = route.right.outcomes[route.rightDirection]!
   return [
-    { venueId: route.left.venueId, venueLabel: getVenueDescriptor(route.left.venueId).label, marketId: route.left.marketId, outcomeId: leftQuote.outcomeId, direction: route.leftDirection, price: leftQuote.bestAsk, availableQuantity: leftQuote.askSize, quoteAgeMs: Math.max(0, now - leftQuote.receivedAt) },
-    { venueId: route.right.venueId, venueLabel: getVenueDescriptor(route.right.venueId).label, marketId: route.right.marketId, outcomeId: rightQuote.outcomeId, direction: route.rightDirection, price: rightQuote.bestAsk, availableQuantity: rightQuote.askSize, quoteAgeMs: Math.max(0, now - rightQuote.receivedAt) }
+    { venueId: route.left.venueId, venueLabel: getVenueDescriptor(route.left.venueId).label, marketId: route.left.marketId, outcomeId: leftQuote.outcomeId, direction: route.leftDirection, price: leftQuote.bestAsk, availableQuantity: leftQuote.askSize, quoteAgeMs: quoteAgeMs(leftQuote, now) },
+    { venueId: route.right.venueId, venueLabel: getVenueDescriptor(route.right.venueId).label, marketId: route.right.marketId, outcomeId: rightQuote.outcomeId, direction: route.rightDirection, price: rightQuote.bestAsk, availableQuantity: rightQuote.askSize, quoteAgeMs: quoteAgeMs(rightQuote, now) }
   ]
 }
 
@@ -92,7 +97,7 @@ export function routeToComparison(route: BidirectionalRoute, settings: RiskSetti
     route.matchClass === 'EXACT'
       ? kalshiPairSupported ? '双腿没有跨平台原子事务；第二腿失败会进入恢复态' : '交易连接器尚未接入'
       : '结算源、取价方式或平价规则不完全一致',
-    maxAge > settings.maxQuoteAgeMs ? `行情过期：最慢一腿 ${Math.round(maxAge / 1_000)} 秒未更新（门槛 ${Math.round(settings.maxQuoteAgeMs / 1_000)} 秒）` : '',
+    maxAge > settings.maxQuoteAgeMs ? `行情过期：最慢一腿 ${Math.round(maxAge / 1_000)} 秒未收到价格或有效流观测（门槛 ${Math.round(settings.maxQuoteAgeMs / 1_000)} 秒）` : '',
     !depthReady ? '当前至少一腿没有可执行深度，无法确定安全下单份额' : '',
     !route.left.feeVerified || !route.right.feeVerified ? '手续费模型尚未完成实盘校验，当前仅显示毛边际' : ''
   ].filter(Boolean)

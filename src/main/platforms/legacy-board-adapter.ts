@@ -28,7 +28,7 @@ function cycleHealth(
   if (connectionState !== 'CONNECTED') return { durationMinutes, state: 'OFFLINE', marketCount: 0 }
   const candidates = windows.filter((window) => window.venueId === venueId && window.durationMinutes === durationMinutes)
   if (candidates.length === 0) return { durationMinutes, state: 'NO_MARKET', marketCount: 0 }
-  const receivedAt = candidates.flatMap((window) => Object.values(window.outcomes).map((quote) => quote?.receivedAt ?? 0))
+  const receivedAt = candidates.flatMap((window) => Object.values(window.outcomes).map((quote) => quote ? Math.max(quote.receivedAt, quote.observedAt ?? 0) : 0))
   const latestQuoteAt = Math.max(0, ...receivedAt) || undefined
   const hasPrices = candidates.some((window) => ['UP', 'DOWN'].every((direction) => Number(window.outcomes[direction as 'UP' | 'DOWN']?.bestAsk) > 0))
   const hasDepth = candidates.some((window) => ['UP', 'DOWN'].every((direction) => Number(window.outcomes[direction as 'UP' | 'DOWN']?.askSize) > 0))

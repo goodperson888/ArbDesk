@@ -64,6 +64,17 @@ describe('bidirectional route builder', () => {
     expect(routeToComparison(route, settings, 10_100).status).toBe('STALE')
   })
 
+  it('keeps an unchanged quote fresh when its stream was observed recently', () => {
+    const stableGate = { ...market('GATE'), outcomes: {
+      ...market('GATE').outcomes,
+      UP: { ...market('GATE').outcomes.UP!, receivedAt: 1_000, observedAt: 10_050 },
+      DOWN: { ...market('GATE').outcomes.DOWN!, receivedAt: 1_000, observedAt: 10_050 }
+    } }
+    const route = buildBidirectionalRoutes([stableGate, market('KALSHI')], settings, 10_100)[0]
+    expect(route.quoteAgeMs).toBe(100)
+    expect(routeToComparison(route, settings, 10_100).status).toBe('MANUAL_EXECUTABLE')
+  })
+
   it('does not expose a submit route when one leg has no executable depth', () => {
     const noDepth = { ...market('GATE'), outcomes: {
       ...market('GATE').outcomes,
