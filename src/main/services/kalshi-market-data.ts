@@ -18,6 +18,8 @@ const MAX_CANDIDATES = 4
 const BTC_SERIES = ['KXBTC15M'] as const
 const WS_URL = 'wss://api.elections.kalshi.com/trade-api/ws/v2'
 
+type KalshiStreamState = 'NOT_STARTED' | 'CONNECTING' | 'CONNECTED' | 'DISCONNECTED' | 'ERROR' | 'NO_CREDENTIALS'
+
 interface KalshiMarket {
   ticker?: string
   market_ticker?: string
@@ -135,6 +137,10 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
   private listeners = new Set<() => void>()
   private stream?: WebSocket
   private streamKey = ''
+  private streamState: KalshiStreamState = 'NOT_STARTED'
+  private streamLastActivityAt?: number
+  private streamMessageCount = 0
+  private streamLastError?: string
   private reconnectTimer?: NodeJS.Timeout
   private candidates = new Map<string, Candidate>()
   private pageContexts = new Map<string, { candidate: Candidate; outcomes: Partial<Record<Direction, ReadOnlyOutcomeQuote>> }>()
@@ -259,8 +265,8 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
       this.status = {
         connectionState: 'CONNECTED', marketCount: this.snapshot.length, updatedAt: this.lastRefreshAt,
         message: this.snapshot.length
-          ? `Kalshi 公共 API 已连接；发现 ${this.snapshot.length} 个 BTC 15m 双向盘口（只读）${failedSeries ? `；${failedSeries}个系列暂不可用` : ''}`
-          : 'Kalshi 公共 API 已连接，但当前没有可匹配的 BTC 15m 市场'
+          ? `Kalshi 公共 API 已连接；发现 ${this.snapshot.length} 个 BTC 15m 双向盘口（只读）${failedSeries ? `；${failedSeries}个系列暂不可用` : ''}；${this.streamSummary()}`
+          : `Kalshi 公共 API 已连接，但当前没有可匹配的 BTC 15m 市场；${this.streamSummary()}`
       }
       this.emit()
       return this.snapshot
@@ -290,6 +296,12 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
   }
 
   private emit(): void { for (const listener of this.listeners) listener() }
+
+  private streamSummary(now = Date.now()): string {
+    const age = this.streamLastActivityAt === undefined ? '无活动' : `最近活动 ${Math.max(0, Math.round((now - this.streamLastActivityAt) / 1_000))} 秒前`
+    const error = this.streamLastError ? `；原因 ${this.streamLastError.slice(0, 160)}` : ''
+    return `原生WS ${this.streamState}·${age}·消息 ${this.streamMessageCount}${error}`
+  }
 
   ingest(payload: string, receivedAt = Date.now(), transport = '页面'): void {
     if (!this.monitoringEnabled) return
@@ -397,7 +409,7 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
       .sort((left, right) => left.startTime - right.startTime || left.durationMinutes - right.durationMinutes)
     if (!this.snapshot.length) return
     this.lastRefreshAt = receivedAt
-    this.status = { connectionState: 'CONNECTED', marketCount: this.snapshot.length, updatedAt: receivedAt, message: `Kalshi ${transport} 被动行情已解析；${this.snapshot.length} 个 BTC 15m 双向盘口，未额外请求接口` }
+    this.status = { connectionState: 'CONNECTED', marketCount: this.snapshot.length, updatedAt: receivedAt, message: `Kalshi ${transport} 被动行情已解析；${this.snapshot.length} 个 BTC 15m 双向盘口，未额外请求接口；${this.streamSummary(receivedAt)}` }
     this.emit()
   }
 
@@ -408,24 +420,41 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
   }
 
   private async ensureStream(candidates: Candidate[]): Promise<void> {
-    if (!this.credentialsProvider || candidates.length === 0) return
+    if (!this.credentialsProvider || candidates.length === 0) {
+      this.streamState = candidates.length === 0 ? 'NOT_STARTED' : 'NO_CREDENTIALS'
+      return
+    }
     let credentials: KalshiCredentials | undefined
-    try { credentials = await this.credentialsProvider() } catch { return }
-    if (!credentials) return
+    try { credentials = await this.credentialsProvider() } catch (error) {
+      this.streamState = 'ERROR'
+      this.streamLastError = error instanceof Error ? error.message : String(error)
+      return
+    }
+    if (!credentials) {
+      this.streamState = 'NO_CREDENTIALS'
+      return
+    }
     const key = candidates.map((candidate) => candidate.ticker).join(',')
     if (this.stream && this.stream.readyState === WebSocket.OPEN && this.streamKey === key) return
     if (this.streamKey === key && this.stream && this.stream.readyState === WebSocket.CONNECTING) return
     this.closeStream(false)
     this.streamKey = key
+    this.streamState = 'CONNECTING'
+    this.streamLastError = undefined
     const socket = new WebSocket(WS_URL, { headers: kalshiHeaders(credentials, 'GET', '/trade-api/ws/v2') })
     this.stream = socket
     socket.once('open', () => {
       if (this.stream !== socket) return
+      this.streamState = 'CONNECTED'
+      this.streamLastActivityAt = Date.now()
       socket.send(JSON.stringify({ id: 1, cmd: 'subscribe', params: { channels: ['ticker'], market_tickers: candidates.map((candidate) => candidate.ticker) } }))
-      this.status = { ...this.status, message: `${this.status.message}；Kalshi ticker WebSocket 已连接` }
+      this.status = { ...this.status, message: `${this.status.message}；Kalshi ticker WebSocket 已连接；${this.streamSummary()}` }
       this.emit()
     })
     socket.on('message', (raw) => {
+      if (this.stream !== socket) return
+      this.streamLastActivityAt = Date.now()
+      this.streamMessageCount += 1
       try { this.applyTicker(JSON.parse(String(raw))) } catch { /* ignore malformed service frames */ }
     })
     socket.on('ping', () => {
@@ -434,6 +463,7 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
     socket.once('close', () => {
       if (this.stream !== socket) return
       this.stream = undefined
+      this.streamState = 'DISCONNECTED'
       this.status = { ...this.status, message: `${this.status.message}；WebSocket 已断开，保留 REST 盘口` }
       this.emit()
       if (!this.reconnectTimer) {
@@ -444,7 +474,13 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
         this.reconnectTimer.unref()
       }
     })
-    socket.once('error', () => { /* close handler records fallback state */ })
+    socket.once('error', (error) => {
+      if (this.stream !== socket) return
+      this.streamState = 'ERROR'
+      this.streamLastError = error instanceof Error ? error.message : String(error)
+      this.status = { ...this.status, message: `${this.status.message}；WebSocket 错误：${this.streamLastError.slice(0, 160)}` }
+      this.emit()
+    })
   }
 
   private applyTicker(event: unknown): void {

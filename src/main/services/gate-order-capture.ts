@@ -109,6 +109,8 @@ export interface GateOrderTraceEntry {
   bodyBytes?: number
   requestFields?: string[]
   responseFields?: string[]
+  /** Bounded JSON preview with credential-like values replaced; never a replayable body. */
+  bodyPreview?: string
   operationName?: string
   orderIds?: string[]
   pageUrl?: string
@@ -167,6 +169,33 @@ function parseBody(body: string | undefined): { parsed?: unknown; format: GateOr
     } catch {
       return { format: 'TEXT', fields: [], orderIds: [] }
     }
+  }
+}
+
+function isSensitiveTraceKey(key: string): boolean {
+  const normalized = key.replace(/[-_]/g, '').toLowerCase()
+  if (['tokenid', 'outcomeid', 'assetid', 'contracttokenid'].includes(normalized)) return false
+  return /^(?:authorization|cookie|setcookie|signature|sign|secret|privatekey|apikey|accesskey|accesssecret|password|passwd|csrf|xsrf|jwt|bearer|session|auth|credential|nonce)$/.test(normalized) ||
+    /(?:authorization|cookie|signature|secret|private|password|csrf|xsrf|jwt|bearer|session|credential|authtoken|apikey|accesskey)/.test(normalized)
+}
+
+function redactedTraceValue(value: unknown, key?: string): unknown {
+  if (key && isSensitiveTraceKey(key)) return '[REDACTED]'
+  if (Array.isArray(value)) return value.map((child) => redactedTraceValue(child))
+  if (!value || typeof value !== 'object') return value
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([childKey, child]) => [childKey, redactedTraceValue(child, childKey)]))
+}
+
+function traceBodyPreview(body: string | undefined): string | undefined {
+  if (!body) return undefined
+  try {
+    const parsed = JSON.parse(body) as unknown
+    const redacted = JSON.stringify(redactedTraceValue(parsed))
+    return redacted.length > 24_000 ? `${redacted.slice(0, 24_000)}…[TRUNCATED]` : redacted
+  } catch {
+    // Do not persist opaque form/text bodies: without field names there is no
+    // safe way to guarantee that cookies or signatures are not included.
+    return `[NON_JSON_BODY_OMITTED bytes=${body.length}]`
   }
 }
 
@@ -278,7 +307,7 @@ export class GateOrderCapture {
     this.pushTrace({
       kind: 'REQUEST', endpoint: traceEndpoint(event.url), method: event.method.toUpperCase(), resourceType: event.resourceType,
       bodyFormat: body.format, bodyBytes: event.body?.length ?? 0, requestFields: body.fields,
-      operationName: body.operationName, orderIds: body.orderIds, pageUrl: event.pageUrl ? traceEndpoint(event.pageUrl) : undefined, receivedAt: event.receivedAt
+      operationName: body.operationName, orderIds: body.orderIds, bodyPreview: traceBodyPreview(event.body), pageUrl: event.pageUrl ? traceEndpoint(event.pageUrl) : undefined, receivedAt: event.receivedAt
     })
   }
 
@@ -288,7 +317,7 @@ export class GateOrderCapture {
     this.pushTrace({
       kind: 'RESPONSE', endpoint: traceEndpoint(event.url), status: event.status, resourceType: event.resourceType,
       bodyFormat: body.format, bodyBytes: event.body.length, responseFields: body.fields,
-      operationName: body.operationName, orderIds: body.orderIds, pageUrl: event.pageUrl ? traceEndpoint(event.pageUrl) : undefined, receivedAt: event.receivedAt
+      operationName: body.operationName, orderIds: body.orderIds, bodyPreview: traceBodyPreview(event.body), pageUrl: event.pageUrl ? traceEndpoint(event.pageUrl) : undefined, receivedAt: event.receivedAt
     })
   }
 
@@ -298,7 +327,7 @@ export class GateOrderCapture {
     this.pushTrace({
       kind: 'WEBSOCKET', endpoint: traceEndpoint(event.url), direction: event.direction, bodyFormat: body.format,
       bodyBytes: event.payload.length, responseFields: body.fields, operationName: body.operationName,
-      orderIds: body.orderIds, pageUrl: event.pageUrl ? traceEndpoint(event.pageUrl) : undefined, receivedAt: event.receivedAt
+      orderIds: body.orderIds, bodyPreview: traceBodyPreview(event.payload), pageUrl: event.pageUrl ? traceEndpoint(event.pageUrl) : undefined, receivedAt: event.receivedAt
     })
   }
 
@@ -368,7 +397,8 @@ export class GateOrderCapture {
       ...entry,
       requestFields: entry.requestFields ? [...entry.requestFields] : undefined,
       responseFields: entry.responseFields ? [...entry.responseFields] : undefined,
-      orderIds: entry.orderIds ? [...entry.orderIds] : undefined
+      orderIds: entry.orderIds ? [...entry.orderIds] : undefined,
+      bodyPreview: entry.bodyPreview
     }))
   }
 

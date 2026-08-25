@@ -67,6 +67,7 @@ describe('Kalshi market normalization', () => {
     source.observeStreamActivity(Date.now())
 
     expect(source.getLatestWindows()[0].outcomes.UP).toMatchObject({ receivedAt: originalReceivedAt, observedAt: Date.now() })
+    expect(source.getStatus().message).toContain('保活在线')
     vi.useRealTimers()
   })
 })
