@@ -44,10 +44,9 @@ describe('Kalshi real order guard', () => {
       const body = JSON.parse(String(init?.body)) as Record<string, string>
       expect(body).toMatchObject({
         ticker: 'KXBTC15M-TEST', side: 'ask', count: '2.00', price: '0.4000',
-        time_in_force: 'fill_or_kill'
+        time_in_force: 'fill_or_kill', exchange_index: 2
       })
       expect(body).not.toHaveProperty('subaccount')
-      expect(body).not.toHaveProperty('exchange_index')
       return new Response(JSON.stringify({ order_id: 'order-1', client_order_id: body.client_order_id, fill_count: '2.00', remaining_count: '0.00', ts_ms: 123 }), { status: 201 })
     })
     const service = new KalshiTradingService(credentials, marketData, () => settings(), true, fetchMock as typeof fetch)
@@ -60,8 +59,7 @@ describe('Kalshi real order guard', () => {
     const { credentials, marketData } = fixture('0.0620')
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>
-      expect(body).toMatchObject({ ticker: 'KXBTC15M-TEST', side: 'bid', price: '0.0620' })
-      expect(body).not.toHaveProperty('exchange_index')
+      expect(body).toMatchObject({ ticker: 'KXBTC15M-TEST', side: 'bid', price: '0.0620', exchange_index: 2 })
       return new Response(JSON.stringify({ order_id: 'order-tolerated', client_order_id: body.client_order_id, fill_count: '2.00', remaining_count: '0.00' }), { status: 201 })
     })
     const service = new KalshiTradingService(credentials, marketData, () => settings(), true, fetchMock as typeof fetch)
@@ -106,6 +104,6 @@ describe('Kalshi real order guard', () => {
     }), { status: 404 }))
     const service = new KalshiTradingService(credentials, marketData, () => settings(), true, fetchMock as typeof fetch)
 
-    await expect(service.placeOrder(request())).rejects.toThrow('生产/Demo 环境或 API Key ID 与 RSA 私钥不匹配')
+    await expect(service.placeOrder(request())).rejects.toThrow('目标交易分片 2 账户未找到或尚未完成资金预分配')
   })
 })

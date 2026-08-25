@@ -41,7 +41,7 @@ export function assertKalshiTradingRequestAllowed(method: string, rawUrl: string
   }
 }
 
-function messageForHttp(status: number, body: string): string {
+function messageForHttp(status: number, body: string, exchangeIndex?: number): string {
   try {
     const parsed = JSON.parse(body) as {
       message?: string; code?: string; details?: unknown
@@ -53,6 +53,9 @@ function messageForHttp(status: number, body: string): string {
       : source.details === undefined ? undefined : JSON.stringify(source.details)
     if (typeof source.code === 'string' && source.code.startsWith('user_not_found')) {
       const evidence = [source.message, details].filter(Boolean).join(' · ')
+      if (exchangeIndex !== undefined) {
+        return `目标交易分片 ${exchangeIndex} 账户未找到或尚未完成资金预分配；请先在 Kalshi Exchange balances 中为该分片分配资金${evidence ? `（Kalshi: ${evidence}）` : ''}`.slice(0, 500)
+      }
       return `生产/Demo 环境或 API Key ID 与 RSA 私钥不匹配；请确认两者来自同一个 Kalshi 生产账户并重新保存${evidence ? `（Kalshi: ${evidence}）` : ''}`.slice(0, 500)
     }
     return [source.code, source.message, details].filter(Boolean).join(' · ').slice(0, 500) || `HTTP ${status}`
@@ -116,15 +119,18 @@ export class KalshiTradingService {
     if (estimatedCost.gt(decimal(settings.maxCapitalPerTrade, '单笔本金上限'))) {
       throw new Error(`Kalshi 预计本金 ${estimatedCost.toFixed(2)} USD 超过单笔上限 ${settings.maxCapitalPerTrade} USD`)
     }
+    const exchangeIndex = this.marketData.getExchangeIndex(ticker)
+    if (exchangeIndex === undefined) throw new Error('Kalshi 当前市场缺少 exchange_index，未发送订单；请先点击完整联调刷新市场元数据')
+
     const key = [ticker, request.direction, fixedCount(quantity), fixedPrice(effectiveOutcomePrice)].join('|')
     const existing = this.inFlight.get(key)
     if (existing) return await existing
-    const operation = this.submit({ ...request, ticker }, quantity, effectiveOutcomePrice)
+    const operation = this.submit({ ...request, ticker }, quantity, effectiveOutcomePrice, exchangeIndex)
     this.inFlight.set(key, operation)
     try { return await operation } finally { this.inFlight.delete(key) }
   }
 
-  private async submit(request: PlaceKalshiOrderRequest, quantity: Decimal, outcomePrice: Decimal): Promise<KalshiOrderReceipt> {
+  private async submit(request: PlaceKalshiOrderRequest, quantity: Decimal, outcomePrice: Decimal, exchangeIndex: number): Promise<KalshiOrderReceipt> {
     const credentials = await this.credentials.getCredentials()
     const { side, yesPrice } = outcomeToBook(request.direction, outcomePrice)
     const clientOrderId = `arbdesk-${randomUUID()}`
@@ -138,10 +144,7 @@ export class KalshiTradingService {
       self_trade_prevention_type: 'taker_at_cross',
       post_only: false,
       reduce_only: false,
-      // Let Kalshi route by ticker. Directly pinning a new crypto market to
-      // shard 2 can fail when the account has not yet been provisioned there.
-      // Omitting this field is the documented auto-routing form and remains a
-      // single POST; auto-routing only adds routing latency.
+      exchange_index: exchangeIndex
     })
     const url = `${API}${ORDER_PATH}`
     assertKalshiTradingRequestAllowed('POST', url)
@@ -161,7 +164,7 @@ export class KalshiTradingService {
       throw error
     }
     const responseBody = await response.text()
-    if (!response.ok) throw new Error(`Kalshi 下单失败：${messageForHttp(response.status, responseBody)}；未自动重试`)
+    if (!response.ok) throw new Error(`Kalshi 下单失败：${messageForHttp(response.status, responseBody, exchangeIndex)}；未自动重试`)
     let payload: CreateOrderResponse
     try { payload = JSON.parse(responseBody) as CreateOrderResponse } catch { throw new Error('Kalshi 下单返回无法解析；请到订单页核对，未自动重试') }
     if (!payload.order_id) throw new Error('Kalshi 下单返回缺少 order_id；结果需人工核对，未自动重试')
