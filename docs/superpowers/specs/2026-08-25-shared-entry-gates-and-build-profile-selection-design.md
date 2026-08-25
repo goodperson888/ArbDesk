@@ -1,108 +1,114 @@
-# Shared Entry Gates and Selectable Build Profiles
+# 共用入场门禁与可选打包 Profile 设计
 
-## Goal
+## 目标
 
-Make the existing MEXC/Polymarket entry controls reusable by every executable two-leg route while keeping venue-specific safety checks explicit. Let a GitHub Actions operator choose the packaged market profile without deleting or rewriting the existing full-platform build.
+让所有可执行的双腿路线复用现有 MEXC/Polymarket 入场控制，同时明确区分各平台专属的安全检查。GitHub Actions 打包时可以选择市场 Profile，不删除、也不覆盖现有全平台打包能力。
 
-The first target is the `GATE:KALSHI` BTC 15-minute route. This change does not enable automatic Gate/Kalshi order submission; it shares manual entry gates, the help popover, and opportunity alerts only.
+第一阶段目标是 `GATE:KALSHI` 的 BTC 15 分钟路线。本次不会为 Gate/Kalshi 开放自动下单，只共用手动入场门禁、问号条件弹窗和机会提示音。
 
-## Build profile selection
+## 打包 Profile 选择
 
-The Windows workflow will expose a `workflow_dispatch` choice named `market_profile`:
+Windows 工作流增加一个名为 `market_profile` 的 `workflow_dispatch` 下拉选项：
 
-- `btc-gate-kalshi` (default): Gate + Kalshi, BTC 15m, route `GATE:KALSHI`.
-- `btc-all`: the existing all-venue BTC 5m/15m profile.
+- `btc-gate-kalshi`（默认）：只启用 Gate、Kalshi、BTC 15m 和 `GATE:KALSHI` 路线。
+- `btc-all`：保留现有 BTC 5m/15m 全平台 Profile。
 
-Both choices call the same `scripts/package-profile.mjs`; the selected profile changes configuration, not application code. The output directory and uploaded artifact are derived from the selected profile. Installer filenames include the profile ID so two profiles from the same application version cannot overwrite one another in a GitHub Release.
+两个选项都调用同一个 `scripts/package-profile.mjs`。选择 Profile 只会改变配置，不会切换或复制业务代码。输出目录和上传产物名称根据所选 Profile 生成。安装包文件名包含 Profile ID，避免同一应用版本的两个 Profile 在 GitHub Release 中相互覆盖。
 
-Local `package:win`, `package:mac`, and `dist` commands keep `btc-gate-kalshi` as their default. A full build remains available with `npm run package:profile -- --profile=btc-all --target=<target>`.
+本地 `package:win`、`package:mac` 和 `dist` 命令继续默认使用 `btc-gate-kalshi`。需要全平台包时仍可执行：
 
-## Shared entry-gate model
+```bash
+npm run package:profile -- --profile=btc-all --target=<target>
+```
 
-Introduce one route-agnostic entry-gate report with ordered checks. Each check contains:
+## 共用入场门禁模型
 
-- stable ID and user-facing label;
-- pass/fail state;
-- `hard` or `configurable` policy;
-- optional key in `ManualExecutionConditions`;
-- applicability, so a venue-specific rule is not silently applied to an unrelated route;
-- a blocking reason suitable for the disabled action button.
+新增一个与具体平台无关的入场门禁报告，内部保存有固定顺序的检查项。每个检查项包括：
 
-The common evaluator receives normalized route data, requested quantity, current settings, current time, and execution readiness. It returns `allowed`, active/pass counts, the ordered checks, and the first blocking reason.
+- 稳定的 ID 和用户可读说明；
+- 是否通过；
+- `hard`（硬条件）或 `configurable`（手动可配置条件）策略；
+- 可选的 `ManualExecutionConditions` 配置键；
+- 是否适用于当前路线，避免把某个平台专属规则错误套用到其他路线；
+- 可直接显示在禁用按钮旁的阻塞原因。
 
-### Universal hard checks
+共用计算器接收标准化路线数据、用户输入份额、当前设置、当前时间和执行就绪状态，返回 `allowed`、启用项数量、通过数量、有序检查项以及第一条阻塞原因。
 
-- Quantity is positive.
-- Quantity satisfies every leg's minimum order requirement (including Gate's 5 USD minimum).
-- Quantity does not exceed the current executable depth.
-- Estimated capital does not exceed `maxCapitalPerTrade`.
-- Both market/outcome identities are present.
-- Required live execution switches and credentials are ready.
-- No conflicting execution is currently active.
+### 全路线硬条件
 
-These checks cannot be disabled from the question-mark popover.
+- 输入份额大于零。
+- 输入份额满足每条腿的最低委托要求，包括 Gate 最低 5 USD。
+- 输入份额不超过当前可执行深度。
+- 预计本金不超过 `maxCapitalPerTrade`。
+- 两条腿都具有有效的市场 ID 和结果 ID。
+- 所需实盘开关和凭据已经就绪。
+- 当前没有冲突的执行流程。
 
-### Configurable manual checks
+硬条件不能在问号弹窗中关闭。
 
-- `conditionalReturn`: conditional return meets `minConditionalReturnPct`.
-- `quoteFreshness`: every leg is within `maxQuoteAgeMs`.
-- `expiryCutoff`: remaining time exceeds `stopBeforeExpirySeconds`.
-- `settlementRisk`: MEXC/Polymarket keeps its oracle-distance check; a multi-venue route uses resolution `matchClass` and passes only when the rules are exact.
-- `feeVerification`: MEXC/Polymarket keeps its verified fee check; a gross-only multi-venue route reports the fee model as unverified. A human may explicitly ignore it for a manual order, while any future automatic strategy must require it.
+### 手动可配置条件
 
-The existing persisted `ManualExecutionConditions` remains the single source of manual overrides for all routes. Automatic execution continues to use all applicable checks regardless of manual overrides.
+- `conditionalReturn`：条件收益率达到 `minConditionalReturnPct`。
+- `quoteFreshness`：每条腿行情年龄不超过 `maxQuoteAgeMs`。
+- `expiryCutoff`：剩余时间大于 `stopBeforeExpirySeconds`。
+- `settlementRisk`：MEXC/Polymarket 继续使用预言机安全距离；多平台路线使用结算规则的 `matchClass`，只有规则完全一致时才通过。
+- `feeVerification`：MEXC/Polymarket 继续使用已验证手续费检查；只提供毛边际的多平台路线显示“手续费模型未验证”。手动下单时用户可以明确忽略，未来如果增加自动执行，则必须通过该检查。
 
-## Main-process enforcement
+现有持久化的 `ManualExecutionConditions` 继续作为所有路线手动条件开关的唯一数据源。自动执行始终使用全部适用条件，不接受手动忽略设置。
 
-The renderer must not be the authority for execution eligibility.
+## 主进程强制校验
 
-For Gate/Kalshi, the IPC handler resolves `comparisonId` against the controller's latest canonical comparison instead of trusting prices, depth, match class, or fee status supplied by the renderer. Immediately before sending the first leg, the main process builds the same entry-gate report with the latest comparison and rejects the request with the report's first blocking reason when it is not allowed.
+渲染页面不能作为是否允许执行的最终判断来源。
 
-The existing execution service retains its final transport-level validation (live switches, IDs, depth, capital, freshness, expiry) as defense in depth. No new remote preflight request is added to the click path.
+Gate/Kalshi 下单时，IPC 处理器根据 `comparisonId` 从控制器的最新标准化机会中重新查找路线，不信任页面提交的价格、深度、`matchClass` 或手续费状态。发送第一腿之前，主进程使用最新机会重新生成同一份入场门禁报告；如果未通过，则返回第一条阻塞原因并且不发送订单。
 
-## User interface
+现有执行服务继续保留实盘开关、市场 ID、深度、本金、行情时效和到期时间等传输层最终校验，形成双重保护。点击下单的热路径不会增加新的远程预检请求。
 
-The legacy MEXC/Polymarket ticket and the multi-venue ticket both render the same `ExecutionConditionsHelp` component from a shared report.
+## 页面交互
 
-For Gate/Kalshi:
+旧版 MEXC/Polymarket 下单面板和多平台下单面板都使用同一个 `ExecutionConditionsHelp` 组件展示共用门禁报告。
 
-- move the real two-leg action next to the quantity/plan section;
-- place the question-mark control beside the action button;
-- show the same passed/active/ignored count and switches;
-- show the first blocking reason directly below a disabled button;
-- keep route-specific labels, such as Gate's 5 USD minimum and exact/conditional settlement-rule match;
-- retain the explicit non-atomic and recovery warning.
+Gate/Kalshi 面板调整为：
 
-The button is enabled only when the shared report allows it. Manual switches change both tickets immediately because they update the same settings object.
+- 把真实双腿执行按钮移动到份额和执行计划区域；
+- 在执行按钮旁增加同款问号控件；
+- 显示相同的“通过/启用/忽略”数量和条件开关；
+- 按钮被禁用时，在下方直接显示第一条阻塞原因；
+- 保留 Gate 最低 5 USD、结算规则完全一致或存在差异等路线专属说明；
+- 保留“双腿非原子执行”和失败进入恢复态的明确提示。
 
-## Opportunity selection and sound
+只有共用门禁报告允许时按钮才可点击。两个下单面板操作的是同一份设置，因此手动条件开关修改后会同时生效。
 
-The ready-candidate selector will accept both:
+## 机会选择与提示音
 
-- executable legacy MEXC/Polymarket comparisons; and
-- manually executable multi-venue comparisons whose shared entry-gate report passes for the current planned quantity.
+可执行候选选择器同时接受：
 
-Fixed table ordering remains unchanged. The best eligible opportunity may be selected without reordering rows.
+- 可执行的 MEXC/Polymarket 旧路线；
+- 状态为手动可执行，并且按当前计划份额通过共用门禁的多平台路线。
 
-The existing sound settings (`opportunitySoundEnabled`, volume, and cooldown) become route-independent. A sound is played only when the best candidate transitions from ineligible to eligible, or a different best candidate becomes eligible after the global cooldown. Snapshot refreshes with unchanged eligibility do not replay the sound.
+机会表格继续保持固定顺序，不因收益变化跳动。系统可以自动选中当前最优的合格机会，但不会改变表格行顺序。
 
-## Automatic execution boundary
+现有提示音设置 `opportunitySoundEnabled`、音量和冷却时间改为与路线无关。只有当最优候选从“不合格”变成“合格”，或者冷却时间结束后出现了另一个新的最优合格候选时才播放声音。行情快照刷新但合格状态未变化时不会重复播放。
 
-This change deliberately does not include Gate/Kalshi in `autoOpenEnabled`. The existing automatic executor remains limited to its mature MEXC/Polymarket path. Gate/Kalshi can be added later only after its fill readback, partial-fill alignment, and recovery behavior have separate automatic-execution tests.
+## 自动执行边界
 
-## Error handling
+本次明确不让 Gate/Kalshi 参与 `autoOpenEnabled`。现有自动开单仍只服务已经成熟的 MEXC/Polymarket 路线。
 
-- Missing or unknown workflow profile fails the build before Electron packaging.
-- A comparison that disappears or changes identity between render and click is rejected before the first leg.
-- A stale or changed quote is reported as a normal entry-gate block, not a transport failure.
-- Disabled configurable checks are clearly marked as ignored; hard checks never present a switch.
-- Existing recovery behavior remains unchanged once the first leg has actually been submitted.
+只有在 Gate 成交回读、部分成交对齐和恢复流程具备独立的自动执行测试后，才单独设计并开放 Gate/Kalshi 自动开单。
 
-## Testing
+## 异常处理
 
-- Profile workflow/config tests cover both selectable profiles and profile-specific artifact paths.
-- Pure entry-gate tests cover universal hard checks, per-route applicability, manual overrides, and the rule that automatic evaluation ignores overrides.
-- Gate/Kalshi tests cover the 5 USD Gate minimum, depth, capital, freshness, expiry, gross-only fee warning, and conditional settlement mismatch.
-- IPC/service tests prove canonical comparison data is used and that a changed/stale comparison is rejected before an adapter is called.
-- Renderer tests cover the multi-venue question mark, disabled reason, shared switches, and eligibility transition used by the sound selector.
-- Full unit tests, TypeScript build, workflow YAML parsing, and `git diff --check` are required before completion.
+- Profile 文件缺失或名称未知时，在 Electron 打包前立即失败。
+- 页面展示后，如果机会消失或市场身份发生变化，在发送第一腿前拒绝执行。
+- 行情过期或价格变化按正常入场门禁阻塞处理，不归类为传输失败。
+- 被关闭的手动条件明确显示为“已忽略”；硬条件永远不显示关闭开关。
+- 第一腿已经实际提交后，继续沿用现有恢复流程，本次不改变恢复行为。
+
+## 测试范围
+
+- Profile 工作流与配置测试覆盖两个可选 Profile 和各自的产物路径。
+- 纯入场门禁测试覆盖全路线硬条件、不同路线适用性、手动忽略，以及自动模式不接受忽略设置。
+- Gate/Kalshi 测试覆盖 Gate 最低 5 USD、深度、本金、行情时效、到期截止、毛边际手续费警告和结算规则差异。
+- IPC 与执行服务测试证明下单使用主进程最新标准化机会，并且行情或身份变化时不会调用平台适配器。
+- 页面测试覆盖 Gate/Kalshi 问号弹窗、禁用原因、共用条件开关和提示音所依赖的合格状态变化。
+- 完成前必须通过全量单元测试、TypeScript 构建、GitHub Workflow YAML 解析和 `git diff --check`。
