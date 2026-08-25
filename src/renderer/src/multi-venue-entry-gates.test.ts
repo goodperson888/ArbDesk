@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { defaultManualExecutionConditions } from '../../shared/defaults'
 import type { MultiVenueComparison } from '../../shared/multi-venue'
 import type { RiskSettings } from '../../shared/types'
-import { buildMultiVenueEntryGateReport } from './multi-venue-entry-gates'
+import { buildMultiVenueEntryGateReport, gateDurationExecutionReady } from './multi-venue-entry-gates'
 
 function comparison(overrides: Partial<MultiVenueComparison> = {}): MultiVenueComparison {
   return {
@@ -34,6 +34,14 @@ function report(overrides: Partial<Parameters<typeof buildMultiVenueEntryGateRep
 }
 
 describe('multi venue entry gate adapter', () => {
+  it('只把目标周期已接管的 Gate 页面视为可执行', () => {
+    const summary = { captured: true, executionReady: true, executableDurations: [5] as Array<5 | 15>, message: 'ready' }
+
+    expect(gateDurationExecutionReady(summary, 5)).toBe(true)
+    expect(gateDurationExecutionReady(summary, 15)).toBe(false)
+    expect(gateDurationExecutionReady({ ...summary, executableDurations: undefined }, 5)).toBe(false)
+  })
+
   it('把全局设置和 Gate/Kalshi 路线转换成共用门禁报告', () => {
     const result = report()
     expect(result.checks.map((check) => check.id)).toEqual(expect.arrayContaining([

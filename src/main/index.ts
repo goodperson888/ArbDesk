@@ -137,7 +137,11 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     { pageCapture: predictFunPageCapture, autoStartPageCapture: profileAllowsVenue(marketProfile, 'PREDICT_FUN') }
   )
   const gatePageCapture = new GatePageCapture(fingerprintRuntime)
-  const gateOrderCapture = new GateOrderCapture(gatePageCapture, () => gatePageCapture.canExecuteOrders())
+  const gateOrderCapture = new GateOrderCapture(
+    gatePageCapture,
+    () => gatePageCapture.canExecuteOrders(),
+    () => gatePageCapture.getExecutableDurations()
+  )
   try {
     const persisted = JSON.parse(await readFile(join(dataDirectory, 'gate-order-capture-trace.json'), 'utf8')) as {
       summary?: { endpoint?: string; method?: string; requestFields?: string[]; pageUrl?: string; capturedAt?: number }
@@ -203,7 +207,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     settings: () => controller.getSnapshot().settings,
     comparisonProvider: (comparisonId) => controller.getSnapshot().multiVenueBoard.comparisons.find((comparison) => comparison.id === comparisonId),
     kalshiCredentialsReady: async () => (await kalshiCredentials.getSummary()).configured,
-    gateExecutionReady: () => gatePageCapture.canExecuteOrders(),
+    gateExecutionReady: (durationMinutes) => gatePageCapture.canExecuteOrders(durationMinutes),
     liveExecutionEnabled: app.isPackaged || process.env.ARB_ENABLE_LIVE_EXECUTION === 'true',
     executionSessionStore
   })

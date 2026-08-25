@@ -190,6 +190,21 @@ describe('multi-venue Kalshi execution', () => {
     expect(mocked.kalshi.placeOrder).not.toHaveBeenCalled()
   })
 
+  it('按机会周期检查 Gate 页面，5m 页面不能放行 15m 订单', async () => {
+    const mocked = deps()
+    const latest = comparison({ durationMinutes: 15 })
+    const gateExecutionReady = vi.fn((duration: number) => duration === 5)
+    const service = new MultiVenueExecutionService({
+      ...mocked, settings: () => settings(), liveExecutionEnabled: true,
+      comparisonProvider: () => latest,
+      gateExecutionReady
+    } as never)
+
+    await expect(service.execute({ comparisonId: latest.id, quantity: '13.00', confirmed: true })).rejects.toThrow('Gate 15m')
+    expect(gateExecutionReady).toHaveBeenCalledWith(15)
+    expect(mocked.gate.submit).not.toHaveBeenCalled()
+  })
+
   it('已有双腿执行进行中时拒绝并发提交，避免重复首腿订单', async () => {
     const mocked = deps()
     const latest = comparison()

@@ -70,7 +70,7 @@ import type {
 import type { MultiVenueComparison, MultiVenueComparisonStatus, MultiVenueExecutionCommand, MultiVenueExecutionReceipt, MultiVenueExecutionSession, VenueCycleDataState, VenueDescriptor } from '../../shared/multi-venue'
 import type { EntryGateCheck } from '../../shared/entry-gates'
 import { defaultSettlementDistanceRules } from '../../shared/defaults'
-import { buildMultiVenueEntryGateReport } from './multi-venue-entry-gates'
+import { buildMultiVenueEntryGateReport, gateDurationExecutionReady } from './multi-venue-entry-gates'
 import { selectReadyComparisons, shouldPlayOpportunityAlert } from './opportunity-alert'
 import { undismissedRecoverySessions } from './recovery-banner'
 import { routeDirectionLabel, stableRouteKey } from './route-display'
@@ -787,6 +787,27 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     () => selectedComparison?.legs.find((leg) => leg.venueId === 'GATE'),
     [selectedComparison]
   )
+  const selectedGateDuration = selectedGateLeg ? selectedComparison?.durationMinutes : undefined
+  useEffect(() => {
+    if (!snapshot?.settings.gateLiveEnabled && selectedGateDuration === undefined) return
+    let active = true
+    const refreshGateExecutionState = (): void => {
+      void window.arbApp.getGateOrderCaptureSummary().then((next) => {
+        if (!active) return
+        setGateOrderCapture((current) => {
+          const currentDurations = current?.executableDurations?.join(',') ?? ''
+          const nextDurations = next.executableDurations?.join(',') ?? ''
+          return current?.executionReady === next.executionReady && currentDurations === nextDurations ? current : next
+        })
+      })
+    }
+    refreshGateExecutionState()
+    const timer = window.setInterval(refreshGateExecutionState, 1_000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [selectedGateDuration, snapshot?.settings.gateLiveEnabled])
   // 待恢复会话不阻塞新开仓；真正执行中的旧路线仍保持互斥。
   const recoveryPending = snapshot?.activeSession?.state === 'RECOVERY_REQUIRED'
   const executionSessionIdle = !snapshot?.activeSession || ['HEDGED', 'CANCELLED', 'RECOVERY_REQUIRED'].includes(snapshot.activeSession.state)
@@ -827,11 +848,11 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
         now,
         executionIdle: executionSessionIdle,
         kalshiReady: kalshiCredentials?.configured === true,
-        gateReady: comparison.legs.some((leg) => leg.venueId === 'GATE') ? gateOrderCapture?.executionReady === true : true
+        gateReady: comparison.legs.some((leg) => leg.venueId === 'GATE') ? gateDurationExecutionReady(gateOrderCapture, comparison.durationMinutes) : true
       }))
     }
     return reports
-  }, [executionSessionIdle, gateOrderCapture?.executionReady, kalshiCredentials?.configured, multiVenueQuantity, now, snapshot, visibleComparisons])
+  }, [executionSessionIdle, gateOrderCapture, kalshiCredentials?.configured, multiVenueQuantity, now, snapshot, visibleComparisons])
   const readyComparisons = useMemo(() => {
     if (!snapshot) return []
     const legacyReadyIds = new Set(visibleComparisons
@@ -1002,7 +1023,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       now,
       executionIdle: executionSessionIdle && !busy,
       kalshiReady: kalshiCredentials?.configured === true,
-      gateReady: selectedGateLeg ? gateOrderCapture?.executionReady === true : true
+      gateReady: selectedGateLeg ? gateDurationExecutionReady(gateOrderCapture, selectedComparison.durationMinutes) : true
     })
     : undefined
 
@@ -1382,7 +1403,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       return
     }
     if (otherLeg.venueId === 'GATE' && !snapshot.settings.gateLiveEnabled) {
-      setMessage('Gate↔Kalshi 双腿执行需要开启 Gate 实盘下单，并先完成订单结构捕获')
+      setMessage('Gate↔Kalshi 双腿执行需要开启 Gate 实盘下单')
       return
     }
     const requestedQuantity = Number(multiVenueQuantity)

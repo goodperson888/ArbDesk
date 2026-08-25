@@ -269,6 +269,7 @@ export class GateOrderCapture {
   private orderTrace: GateOrderTraceEntry[] = []
   private traceSequence = 0
   private readonly executionReady?: () => boolean
+  private readonly executableDurations?: () => Array<5 | 15>
   private readonly source?: GateOrderCaptureSource
   private stopNetworkCapture?: () => void
   private unsubscribe?: () => void
@@ -297,9 +298,10 @@ export class GateOrderCapture {
     })
   }
 
-  constructor(source?: GateOrderCaptureSource, executionReady?: () => boolean) {
+  constructor(source?: GateOrderCaptureSource, executionReady?: () => boolean, executableDurations?: () => Array<5 | 15>) {
     this.source = source
     this.executionReady = executionReady
+    this.executableDurations = executableDurations
     if (source) {
       const stopRequest = source.onRequest((event) => this.observe(event))
       const stopResponse = source.onResponse((event) => this.observeResponse(event))
@@ -465,9 +467,14 @@ export class GateOrderCapture {
   getSummary(): GateOrderCaptureSummary {
     const schema = this.getSchema()
     const trace = this.getTrace()
+    const executionReady = this.executionReady?.() ?? false
+    const executableDurations = this.executableDurations?.() ?? []
+    const executablePageLabel = executableDurations.length > 0
+      ? `Gate ${executableDurations.map((duration) => `${duration}m`).join('/')} 下单页面`
+      : 'Gate 下单页面'
     return schema
-      ? { captured: true, capturing: this.capturing, executionReady: this.executionReady?.() ?? false, endpoint: schema.endpoint, method: schema.method, requestFields: schema.requestFields, pageUrl: schema.pageUrl, capturedAt: schema.capturedAt, traceEntryCount: trace.length, candidateCount: trace.filter((entry) => entry.kind === 'REQUEST').length, responseCount: trace.filter((entry) => entry.kind === 'RESPONSE').length, webSocketCount: trace.filter((entry) => entry.kind === 'WEBSOCKET').length, message: this.executionReady?.() ? '已捕获 Gate 订单候选；链路仍在内存采集，可停止后导出脱敏元数据' : '已捕获订单候选，但当前不是可执行的指纹浏览器页面' }
-      : { captured: false, capturing: this.capturing, executionReady: this.executionReady?.() ?? false, traceEntryCount: trace.length, candidateCount: trace.filter((entry) => entry.kind === 'REQUEST').length, responseCount: trace.filter((entry) => entry.kind === 'RESPONSE').length, webSocketCount: trace.filter((entry) => entry.kind === 'WEBSOCKET').length, message: this.capturing ? '正在采集 Gate 页面所有脱敏网络元数据；请手动完成一次最小订单' : this.executionReady?.() ? 'Gate 指纹页面已接管；实盘订单将通过后台控件点击，不需要 API Key 或保存请求体' : '尚未接管可执行的指纹浏览器页面' }
+      ? { captured: true, capturing: this.capturing, executionReady, executableDurations, endpoint: schema.endpoint, method: schema.method, requestFields: schema.requestFields, pageUrl: schema.pageUrl, capturedAt: schema.capturedAt, traceEntryCount: trace.length, candidateCount: trace.filter((entry) => entry.kind === 'REQUEST').length, responseCount: trace.filter((entry) => entry.kind === 'RESPONSE').length, webSocketCount: trace.filter((entry) => entry.kind === 'WEBSOCKET').length, message: executionReady ? `${executablePageLabel}已接管；链路仍在内存采集` : '已捕获订单候选，但当前没有可执行的指纹浏览器页面' }
+      : { captured: false, capturing: this.capturing, executionReady, executableDurations, traceEntryCount: trace.length, candidateCount: trace.filter((entry) => entry.kind === 'REQUEST').length, responseCount: trace.filter((entry) => entry.kind === 'RESPONSE').length, webSocketCount: trace.filter((entry) => entry.kind === 'WEBSOCKET').length, message: this.capturing ? '正在采集 Gate 页面所有脱敏网络元数据；请手动完成一次最小订单' : executionReady ? `${executablePageLabel}已接管；后台控件下单不需要捕获请求体` : '尚未接管可执行的指纹浏览器页面' }
   }
   getResult(orderId: string): GateCapturedOrderResult | undefined {
     const result = this.results.get(orderId)

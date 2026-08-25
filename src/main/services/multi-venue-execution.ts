@@ -27,7 +27,7 @@ interface PairExecutionDependencies {
   settings: () => RiskSettings
   comparisonProvider: (comparisonId: string) => MultiVenueComparison | undefined
   kalshiCredentialsReady: () => Promise<boolean>
-  gateExecutionReady: () => boolean
+  gateExecutionReady: (durationMinutes: 5 | 15) => boolean
   liveExecutionEnabled: boolean
   executionSessionStore?: ExecutionSessionStore
 }
@@ -79,7 +79,10 @@ export class MultiVenueExecutionService {
           ? settings.polymarketLiveEnabled
           : first.venueId === 'GATE' && settings.gateLiveEnabled
       const kalshiCredentialsReady = await this.dependencies.kalshiCredentialsReady()
-      const gateExecutionReady = first.venueId !== 'GATE' || this.dependencies.gateExecutionReady()
+      const gateDuration = comparison.durationMinutes === 5 || comparison.durationMinutes === 15
+        ? comparison.durationMinutes
+        : undefined
+      const gateExecutionReady = first.venueId !== 'GATE' || Boolean(gateDuration && this.dependencies.gateExecutionReady(gateDuration))
       const gateReport = evaluateEntryGates({
         mode: 'MANUAL', quantity: command.quantity, allInCostPerShare: comparison.allInCostPerShare,
         conditionalReturnPct: comparison.conditionalReturnPct, edgeKind: comparison.edgeKind,
@@ -90,7 +93,7 @@ export class MultiVenueExecutionService {
         readiness: [
           { id: 'kalshi-credentials', label: 'Kalshi 本地身份已配置', passed: kalshiCredentialsReady, blockReason: '请先配置 Kalshi API Key ID 与 RSA 私钥' },
           { id: 'kalshi-live', label: 'Kalshi 实盘开关已开启', passed: settings.kalshiLiveEnabled === true, blockReason: '请先开启 Kalshi 人工实盘下单开关' },
-          { id: 'gate-capture', label: 'Gate 下单结构已捕获', passed: gateExecutionReady, blockReason: '请先完成 Gate 订单结构捕获' },
+          { id: 'gate-capture', label: `Gate ${gateDuration ?? comparison.durationMinutes}m 下单页面${gateExecutionReady ? '已接管' : '未接管'}`, passed: gateExecutionReady, blockReason: `Gate ${gateDuration ?? comparison.durationMinutes}m 下单页面未接管` },
           { id: `${first.venueId.toLowerCase()}-live`, label: `${first.venueId} 首腿实盘已就绪`, passed: Boolean(otherLiveReady), blockReason: `${first.venueId} 首腿实盘尚未开启` }
         ],
         legs: requestLegs.map((leg) => ({

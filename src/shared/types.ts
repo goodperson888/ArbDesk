@@ -526,6 +526,7 @@ export interface GateOrderCaptureSummary {
   captured: boolean
   capturing?: boolean
   executionReady?: boolean
+  executableDurations?: Array<5 | 15>
   endpoint?: string
   method?: string
   requestFields?: string[]

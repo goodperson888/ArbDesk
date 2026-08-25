@@ -20,6 +20,15 @@ function request(overrides: Partial<GateCapturedRequest> = {}): GateCapturedRequ
 }
 
 describe('GateOrderCapture', () => {
+  it('reports the exact Gate page durations available for execution', () => {
+    const capture = new GateOrderCapture(undefined, () => true, () => [5])
+
+    expect(capture.getSummary()).toMatchObject({
+      executionReady: true,
+      executableDurations: [5]
+    })
+  })
+
   it('restores only the safe schema from an exported trace', () => {
     const capture = new GateOrderCapture()
     expect(capture.restoreSchema({

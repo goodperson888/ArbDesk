@@ -228,7 +228,18 @@ export class GatePageCapture implements GatePageCaptureSource {
   }
 
   getStatus(): GatePageCaptureStatus { return { ...this.status } }
-  canExecuteOrders(): boolean { return [...this.fingerprintPages.values()].some((page) => !page.isClosed()) || Boolean(this.fingerprintPage && !this.fingerprintPage.isClosed()) }
+  getExecutableDurations(): Array<5 | 15> {
+    return ([5, 15] as const).filter((duration) => {
+      const page = this.fingerprintPages.get(duration)
+      return Boolean(page && !page.isClosed())
+    })
+  }
+
+  canExecuteOrders(duration?: 5 | 15): boolean {
+    const executableDurations = this.getExecutableDurations()
+    if (duration !== undefined) return executableDurations.includes(duration)
+    return executableDurations.length > 0
+  }
 
   canExecutePageOrders(): boolean { return this.canExecuteOrders() }
 
