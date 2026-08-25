@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { gatePageDuration, gateRollDelayMs, gateWebSocketPayload, isGateBtcEventUrl, isGateEventResponse, isGateHost, selectGatePageDuration, selectGatePageUrl } from './gate-page-capture'
+import { gateOrderBlockedByRoll, gatePageDuration, gateRollDelayMs, gateWebSocketPayload, isGateBtcEventUrl, isGateEventResponse, isGateHost, selectGatePageDuration, selectGatePageUrl } from './gate-page-capture'
 
 describe('Gate page routing', () => {
   it('accepts only Gate-owned hosts and event-contract responses', () => {
@@ -31,10 +31,19 @@ describe('Gate page routing', () => {
     expect(selectGatePageDuration([15], undefined)).toBe(15)
   })
 
-  it('schedules the next passive page roll at the next five-minute boundary', () => {
+  it('schedules each passive page at its own market boundary', () => {
     const now = new Date('2026-08-25T00:02:30.000Z').getTime()
-    expect(gateRollDelayMs(now)).toBe(150_000)
-    expect(gateRollDelayMs(new Date('2026-08-25T00:04:59.000Z').getTime())).toBe(1_000)
+    expect(gateRollDelayMs(now, 5)).toBe(150_000)
+    expect(gateRollDelayMs(now, 15)).toBe(750_000)
+    expect(gateRollDelayMs(new Date('2026-08-25T00:04:59.000Z').getTime(), 5)).toBe(1_000)
+  })
+
+  it('does not block a 15m order while only the 5m page is rolling', () => {
+    const rolling = new Set<5 | 15>([5])
+
+    expect(gateOrderBlockedByRoll(rolling, 5)).toBe(true)
+    expect(gateOrderBlockedByRoll(rolling, 15)).toBe(false)
+    expect(gateOrderBlockedByRoll(rolling)).toBe(true)
   })
 
   it('prefers the newest same-duration Gate tab when duplicate old event tabs exist', () => {

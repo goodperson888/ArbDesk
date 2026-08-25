@@ -2,6 +2,7 @@ import { app, BrowserWindow, shell } from 'electron'
 import Decimal from 'decimal.js'
 import type { CDPSession, Page } from 'playwright-core'
 import type { GatePageCaptureStatus } from '../../shared/types'
+import { PreSubmitBlockedError } from '../domain/execution-errors'
 import type { FingerprintBrowserRuntime } from './fingerprint-browser-runtime'
 
 // Gate only subscribes the order book for the duration shown by a page. Keep
@@ -12,11 +13,19 @@ const GATE_PAGE_URLS = {
 } as const
 const GATE_PAGE_URL = GATE_PAGE_URLS[5]
 const PAGE_START_TIMEOUT_MS = 25_000
-const PAGE_ROLL_INTERVAL_MS = 5 * 60_000
+const PAGE_ROLL_INTERVAL_MS = {
+  5: 5 * 60_000,
+  15: 15 * 60_000
+} as const
 
-export function gateRollDelayMs(now = Date.now()): number {
-  const nextBoundary = (Math.floor(now / PAGE_ROLL_INTERVAL_MS) + 1) * PAGE_ROLL_INTERVAL_MS
+export function gateRollDelayMs(now = Date.now(), duration: 5 | 15 = 5): number {
+  const interval = PAGE_ROLL_INTERVAL_MS[duration]
+  const nextBoundary = (Math.floor(now / interval) + 1) * interval
   return Math.max(1_000, nextBoundary - now)
+}
+
+export function gateOrderBlockedByRoll(rollingDurations: ReadonlySet<5 | 15>, requestedDuration?: 5 | 15): boolean {
+  return requestedDuration === undefined ? rollingDurations.size > 0 : rollingDurations.has(requestedDuration)
 }
 
 export interface GateCapturedResponse {
@@ -209,9 +218,9 @@ export class GatePageCapture implements GatePageCaptureSource {
   private lastStatusNotifyAt = 0
   private loadedRollSlot?: number
   private rollPromise?: Promise<void>
-  private fingerprintRollTimer?: ReturnType<typeof setTimeout>
+  private fingerprintRollTimers = new Map<5 | 15, ReturnType<typeof setTimeout>>()
   private fingerprintOrderInFlight = 0
-  private fingerprintRollInFlight = false
+  private fingerprintRollInFlight = new Set<5 | 15>()
   private responseListeners = new Set<(event: GateCapturedResponse) => void>()
   private requestListeners = new Set<(event: GateCapturedRequest) => void>()
   private networkResponseListeners = new Set<(event: GateCapturedResponse) => void>()
@@ -231,7 +240,7 @@ export class GatePageCapture implements GatePageCaptureSource {
   getExecutableDurations(): Array<5 | 15> {
     return ([5, 15] as const).filter((duration) => {
       const page = this.fingerprintPages.get(duration)
-      return Boolean(page && !page.isClosed())
+      return Boolean(page && !page.isClosed() && !this.fingerprintRollInFlight.has(duration))
     })
   }
 
@@ -250,7 +259,10 @@ export class GatePageCapture implements GatePageCaptureSource {
    * request. The caller must reconcile an uncertain response before retrying.
    */
   async executePageOrder(intent: GatePageOrderIntent): Promise<GateCapturedHttpResponse> {
-    if (this.fingerprintRollInFlight) throw new Error('Gate 正在切换当前轮次，未操作订单；请稍后重试')
+    if (gateOrderBlockedByRoll(this.fingerprintRollInFlight, intent.durationMinutes)) {
+      const durationLabel = intent.durationMinutes ? ` ${intent.durationMinutes}m` : ''
+      throw new PreSubmitBlockedError(`Gate${durationLabel} 正在切换当前轮次，未操作订单；请稍后重试`)
+    }
     this.fingerprintOrderInFlight += 1
     try {
       return await this.executePageOrderInternal(intent)
@@ -314,7 +326,11 @@ export class GatePageCapture implements GatePageCaptureSource {
   }
 
   async executeCapturedOrder(request: GatePreparedOrderRequest): Promise<GateCapturedHttpResponse> {
-    if (this.fingerprintRollInFlight) throw new Error('Gate 正在切换当前轮次，未发送订单；请稍后重试')
+    const duration = gatePageDuration(request.pageUrl ?? '')
+    if (gateOrderBlockedByRoll(this.fingerprintRollInFlight, duration)) {
+      const durationLabel = duration ? ` ${duration}m` : ''
+      throw new PreSubmitBlockedError(`Gate${durationLabel} 正在切换当前轮次，未发送订单；请稍后重试`)
+    }
     this.fingerprintOrderInFlight += 1
     try {
       return await this.executeCapturedOrderInternal(request)
@@ -424,6 +440,7 @@ export class GatePageCapture implements GatePageCaptureSource {
       this.captureGeneration += 1
       this.destroying = true
       this.clearFingerprintRollTimer()
+      this.fingerprintRollInFlight.clear()
       for (const session of this.fingerprintNetworkSessions.values()) void session.detach().catch(() => undefined)
       this.fingerprintNetworkSessions.clear()
       this.fingerprintPages.clear()
@@ -508,6 +525,8 @@ export class GatePageCapture implements GatePageCaptureSource {
       if (this.fingerprintPages.get(duration) !== page) return
       this.fingerprintPages.delete(duration)
       this.fingerprintNetworkSessions.delete(duration)
+      this.clearFingerprintRollTimer(duration)
+      this.fingerprintRollInFlight.delete(duration)
       if (this.fingerprintPage === page) this.fingerprintPage = this.fingerprintPages.get(duration === 5 ? 15 : 5)
       const remaining = [...this.fingerprintPages.values()].some((candidate) => !candidate.isClosed())
       if (!remaining) this.clearFingerprintRollTimer()
@@ -552,53 +571,53 @@ export class GatePageCapture implements GatePageCaptureSource {
     }
   }
 
-  private scheduleFingerprintRoll(generation = this.captureGeneration): void {
-    this.clearFingerprintRollTimer()
-    if (this.stopping || generation !== this.captureGeneration || this.fingerprintPages.size === 0) return
-    this.fingerprintRollTimer = setTimeout(() => {
-      this.fingerprintRollTimer = undefined
-      if (this.stopping || generation !== this.captureGeneration) return
-      void this.refreshFingerprintPages(generation).finally(() => this.scheduleFingerprintRoll(generation))
-    }, gateRollDelayMs())
-    this.fingerprintRollTimer.unref?.()
+  private scheduleFingerprintRoll(generation = this.captureGeneration, onlyDuration?: 5 | 15): void {
+    const durations = onlyDuration === undefined ? ([5, 15] as const) : ([onlyDuration] as const)
+    for (const duration of durations) {
+      this.clearFingerprintRollTimer(duration)
+      if (this.stopping || generation !== this.captureGeneration) continue
+      const page = this.fingerprintPages.get(duration)
+      if (!page || page.isClosed()) continue
+      const timer = setTimeout(() => {
+        this.fingerprintRollTimers.delete(duration)
+        if (this.stopping || generation !== this.captureGeneration) return
+        void this.refreshFingerprintPage(duration, generation)
+          .finally(() => this.scheduleFingerprintRoll(generation, duration))
+      }, gateRollDelayMs(Date.now(), duration))
+      this.fingerprintRollTimers.set(duration, timer)
+      timer.unref?.()
+    }
   }
 
-  private clearFingerprintRollTimer(): void {
-    if (!this.fingerprintRollTimer) return
-    clearTimeout(this.fingerprintRollTimer)
-    this.fingerprintRollTimer = undefined
+  private clearFingerprintRollTimer(duration?: 5 | 15): void {
+    if (duration !== undefined) {
+      const timer = this.fingerprintRollTimers.get(duration)
+      if (timer) clearTimeout(timer)
+      this.fingerprintRollTimers.delete(duration)
+      return
+    }
+    for (const timer of this.fingerprintRollTimers.values()) clearTimeout(timer)
+    this.fingerprintRollTimers.clear()
   }
 
-  private async refreshFingerprintPages(generation: number): Promise<void> {
+  private async refreshFingerprintPage(duration: 5 | 15, generation: number): Promise<void> {
     if (generation !== this.captureGeneration) return
     // A page.goto() can invalidate a pending click and move it to another
     // eventId. Let the current order finish, then retry the next boundary.
     if (this.fingerprintOrderInFlight > 0) return
-    this.fingerprintRollInFlight = true
-    let refreshed = 0
-    let failed = 0
+    const page = this.fingerprintPages.get(duration)
+    if (!page || page.isClosed()) return
+    this.fingerprintRollInFlight.add(duration)
     try {
-      this.setStatus('STARTING', 'Gate 5m/15m 正在切换到当前轮次；继续监听页面自身请求')
-      for (const duration of [5, 15] as const) {
-        if (generation !== this.captureGeneration) return
-        const page = this.fingerprintPages.get(duration)
-        if (!page || page.isClosed()) continue
-        try {
-          // Do not reload the old eventId URL. Gate can keep that event pinned;
-          // the duration entry URL resolves to the currently active round.
-          await page.goto(GATE_PAGE_URLS[duration], { waitUntil: 'domcontentloaded', timeout: PAGE_START_TIMEOUT_MS })
-          refreshed += 1
-        } catch {
-          failed += 1
-        }
-      }
-      if (refreshed > 0) {
-        this.setStatus('CONNECTED', `Gate 5m/15m 当前轮次已刷新；${failed ? `${failed} 个页面待重连` : '继续监听最新盘口'}`)
-      } else if (failed > 0) {
-        this.setStatus('DISCONNECTED', 'Gate 5m/15m 当前轮次刷新失败；等待下一次自动重试')
-      }
+      this.setStatus('STARTING', `Gate ${duration}m 正在切换到当前轮次；另一周期不受影响`)
+      // Do not reload the old eventId URL. Gate can keep that event pinned;
+      // the duration entry URL resolves to the currently active round.
+      await page.goto(GATE_PAGE_URLS[duration], { waitUntil: 'domcontentloaded', timeout: PAGE_START_TIMEOUT_MS })
+      this.setStatus('CONNECTED', `Gate ${duration}m 当前轮次已刷新；继续监听最新盘口`)
+    } catch {
+      this.setStatus('DISCONNECTED', `Gate ${duration}m 当前轮次刷新失败；等待下一次自动重试`)
     } finally {
-      this.fingerprintRollInFlight = false
+      this.fingerprintRollInFlight.delete(duration)
     }
   }
 
@@ -658,7 +677,7 @@ export class GatePageCapture implements GatePageCaptureSource {
       this.setStatus('DISCONNECTED', `Gate 页面加载失败（${errorCode}）：${errorDescription} · ${validatedUrl}`)
     })
     this.attachDebugger(window, !show)
-    const initialRollSlot = Math.floor(Date.now() / PAGE_ROLL_INTERVAL_MS)
+    const initialRollSlot = Math.floor(Date.now() / PAGE_ROLL_INTERVAL_MS[5])
     void window.loadURL(GATE_PAGE_URL)
       .then(() => { this.loadedRollSlot = initialRollSlot })
       .catch((error) => {
@@ -668,7 +687,7 @@ export class GatePageCapture implements GatePageCaptureSource {
   }
 
   private async refreshForCurrentRoll(window: BrowserWindow): Promise<void> {
-    const rollSlot = Math.floor(Date.now() / PAGE_ROLL_INTERVAL_MS)
+    const rollSlot = Math.floor(Date.now() / PAGE_ROLL_INTERVAL_MS[5])
     if (this.loadedRollSlot === rollSlot) return
     if (this.rollPromise) return await this.rollPromise
     this.rollPromise = window.loadURL(GATE_PAGE_URL)

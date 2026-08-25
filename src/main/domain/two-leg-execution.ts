@@ -6,6 +6,7 @@ import type {
   MultiVenueExecutionRequest
 } from '../../shared/multi-venue'
 import type { VenueAdapter, VenueExecutionRequest, VenueFill, VenueOrderReceipt } from '../platforms/venue-adapter'
+import { PreSubmitBlockedError } from './execution-errors'
 
 const MAX_QUOTE_AGE_MS = 8_000
 
@@ -129,11 +130,12 @@ export class TwoLegExecutionMachine {
       return { sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt, secondLeg: secondReceipt, message: `第一腿已成交，但 ${secondAdapter.venueId} 仅成交 ${secondReceipt.filledQuantity} / ${secondQuantity.toFixed(2)} 份；已进入恢复态，未自动重试` }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      const status = isUnknownError(error) ? 'RECONCILE_REQUIRED' : 'RECOVERY_REQUIRED'
+      const preSubmitBlocked = !firstSubmissionConfirmed && error instanceof PreSubmitBlockedError
+      const status = preSubmitBlocked ? 'CANCELED' : isUnknownError(error) ? 'RECONCILE_REQUIRED' : 'RECOVERY_REQUIRED'
       secondReceipt ??= setVenue(legReceipt(executionRequest(request, secondIndex, quantity, sessionId), quantity), secondAdapter.venueId)
       return {
         sessionId, comparisonId: request.comparisonId, status, firstLeg: firstReceipt, secondLeg: firstSubmissionConfirmed ? secondReceipt : undefined,
-        message: `${firstSubmissionConfirmed ? '首腿已提交但第二腿未完成' : '首腿未确认提交'}：${message}`
+        message: `${firstSubmissionConfirmed ? '首腿已提交但第二腿未完成' : preSubmitBlocked ? '首腿未提交' : '首腿未确认提交'}：${message}`
       }
     }
   }

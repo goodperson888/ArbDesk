@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { MultiVenueExecutionRequest } from '../../shared/multi-venue'
 import type { VenueAdapter, VenueFill, VenueOrderReceipt } from '../platforms/venue-adapter'
 import { TwoLegExecutionMachine } from './two-leg-execution'
+import { PreSubmitBlockedError } from './execution-errors'
 
 function request(): MultiVenueExecutionRequest {
   return {
@@ -54,6 +55,20 @@ describe('two-leg execution machine', () => {
     const second = adapter('B')
     const receipt = await new TwoLegExecutionMachine().execute(request(), new Map([['A', first], ['B', second]]))
     expect(receipt.status).toBe('RECONCILE_REQUIRED')
+    expect(second.submitOrder).not.toHaveBeenCalled()
+  })
+
+  it('cancels a known pre-submit block without creating a recovery exposure', async () => {
+    const first = adapter('A')
+    first.submitOrder = vi.fn(async () => { throw new PreSubmitBlockedError('Gate 15m 正在切换当前轮次，未操作订单') })
+    const second = adapter('B')
+
+    const receipt = await new TwoLegExecutionMachine().execute(request(), new Map([['A', first], ['B', second]]))
+
+    expect(receipt.status).toBe('CANCELED')
+    expect(receipt.message).toContain('首腿未提交')
+    expect(receipt.message).not.toContain('需要恢复')
+    expect(receipt.secondLeg).toBeUndefined()
     expect(second.submitOrder).not.toHaveBeenCalled()
   })
 
