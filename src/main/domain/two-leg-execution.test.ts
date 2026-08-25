@@ -37,12 +37,15 @@ describe('two-leg execution machine', () => {
     expect(vi.mocked(second.submitOrder).mock.calls[0][0].quantity).toBe('2.00')
   })
 
-  it('stops before the second leg when the first leg is partial', async () => {
+  it('aligns the second leg to the actual first-leg fill when the first leg is partial', async () => {
     const first = adapter('A', '1')
-    const second = adapter('B')
+    const second = adapter('B', '1')
     const receipt = await new TwoLegExecutionMachine().execute(request(), new Map([['A', first], ['B', second]]))
-    expect(receipt.status).toBe('RECOVERY_REQUIRED')
-    expect(second.submitOrder).not.toHaveBeenCalled()
+    expect(receipt.status).toBe('HEDGED')
+    expect(second.submitOrder).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(second.submitOrder).mock.calls[0][0].quantity).toBe('1.00')
+    expect(receipt.firstLeg.status).toBe('PARTIAL')
+    expect(receipt.secondLeg?.filledQuantity).toBe('1')
   })
 
   it('returns reconcile required for an unknown first-leg submit', async () => {

@@ -50,14 +50,16 @@ describe('multi-venue Kalshi execution', () => {
     expect((mocked.kalshi.placeOrder.mock.calls[0] as unknown as [Record<string, string>])[0]).toMatchObject({ quantity: '2.00', direction: 'DOWN' })
   })
 
-  it('supports Polymarket first and does not send Kalshi after a partial first fill', async () => {
+  it('aligns Kalshi to the actual Polymarket fill after a partial first fill', async () => {
     const mocked = deps()
     mocked.polymarket.hedge.mockResolvedValueOnce({ venue: 'POLYMARKET', direction: 'UP', quantity: '1.00', averagePrice: '0.40', orderId: 'poly-partial', filledAt: Date.now() })
+    mocked.kalshi.placeOrder.mockResolvedValueOnce({ orderId: 'kalshi-partial', clientOrderId: 'client', ticker: 'KXBTC15M-TEST', direction: 'DOWN' as const, side: 'ask' as const, quantity: '1.00', outcomePrice: '0.50', fillCount: '1.00', remainingCount: '0.00', status: 'EXECUTED' as const, submittedAt: Date.now(), message: 'filled' })
     const service = new MultiVenueExecutionService({ ...mocked, settings: () => settings(), liveExecutionEnabled: true } as never)
     const receipt = await service.execute(request(['POLYMARKET', 'KALSHI']))
-    expect(receipt.status).toBe('RECOVERY_REQUIRED')
-    expect(mocked.kalshi.placeOrder).not.toHaveBeenCalled()
-    expect(receipt.message).toContain('未发送 Kalshi')
+    expect(receipt.status).toBe('HEDGED')
+    expect(mocked.kalshi.placeOrder).toHaveBeenCalledTimes(1)
+    expect((mocked.kalshi.placeOrder.mock.calls[0] as unknown as [Record<string, string>])[0]).toMatchObject({ quantity: '1.00', direction: 'DOWN' })
+    expect(receipt.message).toContain('双腿已对齐')
   })
 
   it('executes Gate first and then sends the exact fill to Kalshi', async () => {

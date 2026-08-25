@@ -94,9 +94,9 @@ export class TwoLegExecutionMachine {
       if (filledQuantity.gt(quantity.add('0.000001'))) {
         return { sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt, message: `${firstAdapter.venueId} 出现超额成交，未发送第二腿；请人工核对` }
       }
-      if (filledQuantity.lt(quantity)) {
+      if (filledQuantity.lte(0)) {
         const secondLabel = secondAdapter.venueId === 'KALSHI' ? 'Kalshi' : secondAdapter.venueId
-        return { sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt, message: `${firstAdapter.venueId} 仅成交 ${filledQuantity.toFixed(2)} / ${quantity.toFixed(2)} 份，未发送 ${secondLabel}；请人工处理剩余单腿敞口` }
+        return { sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt, message: `${firstAdapter.venueId} 未产生有效成交，未发送 ${secondLabel}；请人工核对订单` }
       }
 
       const secondQuantity = filledQuantity
@@ -113,7 +113,8 @@ export class TwoLegExecutionMachine {
       if (!secondFill) throw new Error(`${secondAdapter.venueId} 第二腿已提交但未读取到真实成交`)
       secondReceipt = setVenue(legReceipt(secondRequest, secondQuantity, new Decimal(secondFill.quantity).gte(secondQuantity) ? 'FILLED' : 'PARTIAL', secondFill), secondAdapter.venueId)
       if (new Decimal(secondFill.quantity).gte(secondQuantity)) {
-        return { sessionId, comparisonId: request.comparisonId, status: 'HEDGED', firstLeg: firstReceipt, secondLeg: secondReceipt, message: `双腿已完成：${firstAdapter.venueId} ${secondQuantity.toFixed(2)} 份 → ${secondAdapter.venueId} ${secondReceipt.filledQuantity} 份` }
+        const partialNote = filledQuantity.lt(quantity) ? `（首腿原计划${quantity.toFixed(2)}份，实际成交${filledQuantity.toFixed(2)}份）` : ''
+        return { sessionId, comparisonId: request.comparisonId, status: 'HEDGED', firstLeg: firstReceipt, secondLeg: secondReceipt, message: `双腿已对齐：${firstAdapter.venueId} ${secondQuantity.toFixed(2)} 份 → ${secondAdapter.venueId} ${secondReceipt.filledQuantity} 份${partialNote}` }
       }
       return { sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt, secondLeg: secondReceipt, message: `第一腿已成交，但 ${secondAdapter.venueId} 仅成交 ${secondReceipt.filledQuantity} / ${secondQuantity.toFixed(2)} 份；已进入恢复态，未自动重试` }
     } catch (error) {
