@@ -72,6 +72,7 @@ import type { EntryGateCheck } from '../../shared/entry-gates'
 import { defaultSettlementDistanceRules } from '../../shared/defaults'
 import { buildMultiVenueEntryGateReport } from './multi-venue-entry-gates'
 import { selectReadyComparisons, shouldPlayOpportunityAlert } from './opportunity-alert'
+import { undismissedRecoverySessions } from './recovery-banner'
 import { routeDirectionLabel, stableRouteKey } from './route-display'
 
 interface SettlementRuleDraft {
@@ -671,6 +672,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [closeIntent, setCloseIntent] = useState<{ order: ArbitrageOrderRecord; target: CloseTarget }>()
   const [dismissedExecutionNoticeKey, setDismissedExecutionNoticeKey] = useState<string>()
   const [dismissedRecoveryIds, setDismissedRecoveryIds] = useState<Set<string>>(new Set())
+  const [dismissedMultiVenueRecoveryIds, setDismissedMultiVenueRecoveryIds] = useState<Set<string>>(new Set())
   const [maxCapitalDraft, setMaxCapitalDraft] = useState('100.00')
   const [minConditionalReturnDraft, setMinConditionalReturnDraft] = useState('0.00')
   const [quoteValidityDraft, setQuoteValidityDraft] = useState('8')
@@ -1786,6 +1788,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   }
 
   const active = snapshot.activeSession
+  const visibleMultiVenueRecoverySessions = undismissedRecoverySessions(
+    snapshot.multiVenueExecutionSessions,
+    dismissedMultiVenueRecoveryIds
+  )
   const executionNoticeKey = active ? `${active.id}:${active.state}:${active.error ?? ''}` : undefined
   const automaticLiveFlow = snapshot.settings.mexcAutomationEnabled && snapshot.settings.polymarketLiveEnabled
   const needsMexcConfirmation = active &&
@@ -1831,9 +1837,16 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       </button>
 
       <main className="workspace">
-        {snapshot.multiVenueExecutionSessions.length > 0 && <section className="recovery-sessions-banner" role="alert">
+        {visibleMultiVenueRecoverySessions.length > 0 && <section className="recovery-sessions-banner" role="alert">
           <ShieldAlert aria-hidden="true" />
-          <span><strong>{snapshot.multiVenueExecutionSessions.length} 条跨平台执行会话需要恢复核对</strong><small>软件不会自动重发未知订单；请打开执行日志核对两边实际成交后再标记已恢复。</small></span>
+          <span><strong>{visibleMultiVenueRecoverySessions.length} 条跨平台执行会话需要恢复核对</strong><small>软件不会自动重发未知订单；请打开执行日志核对两边实际成交后再标记已恢复。</small></span>
+          <button className="recovery-banner-close" type="button" aria-label="关闭跨平台恢复提示" onClick={() => {
+            setDismissedMultiVenueRecoveryIds((current) => {
+              const next = new Set(current)
+              snapshot.multiVenueExecutionSessions.forEach((session) => next.add(session.sessionId))
+              return next
+            })
+          }}><X aria-hidden="true" /></button>
         </section>}
         <section className="main-column">
           <section className="panel opportunities-panel">
@@ -1939,7 +1952,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   </div>)}
                 </div>
                 {selectedKalshiLeg && <div className="kalshi-live-ticket">
-                  <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>这是双腿执行入口：先提交 {selectedComparison.legs.find((leg) => leg.venueId !== 'KALSHI')?.venueLabel ?? '第一平台'}，读取实际成交后再提交 Kalshi FOK。两边没有原子交易，第二腿失败会进入恢复态，不会自动重复下单。</span></div>
                   {multiVenueReceipt && multiVenueReceipt.comparisonId === selectedComparison.id && <div className="browser-status-detail"><span>双腿</span><p>{multiVenueReceipt.message} · 状态 {multiVenueReceipt.status}</p></div>}
                 </div>}
               </section>
