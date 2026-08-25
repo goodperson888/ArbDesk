@@ -344,6 +344,8 @@ export class GateMarketData implements ReadOnlyVenueSource {
   private status: ReadOnlyVenueStatus = { connectionState: 'NOT_CONFIGURED', message: '等待 Gate 单页面被动行情', marketCount: 0 }
   private contexts = new Map<string, GateMarketContext>()
   private outcomeToMarket = new Map<string, { marketId: string; direction: Direction }>()
+  /** REST /book asset IDs are the same compact `aid` used by Gate's WS. */
+  private assetIdToMarket = new Map<string, GateBookHashBinding | null>()
   private bookHashToMarket = new Map<string, GateBookHashBinding>()
   /** A market key is usable only when it has been observed for one side. */
   private marketKeyToMarket = new Map<string, GateBookHashBinding | null>()
@@ -391,6 +393,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
     this.pageCapture.stop()
     this.contexts.clear()
     this.outcomeToMarket.clear()
+    this.assetIdToMarket.clear()
     this.bookHashToMarket.clear()
     this.marketKeyToMarket.clear()
     this.subscriptionTokensByMarket.clear()
@@ -475,6 +478,24 @@ export class GateMarketData implements ReadOnlyVenueSource {
             else break
           }
         }
+        const restAssetId = isBookRest ? stringValue(firstValue(item, ['asset_id', 'assetId'])) : undefined
+        if (restAssetId && requestDirection) {
+          const binding = { marketId: market.marketId, direction: requestDirection, endTime: market.endTime }
+          const existing = this.assetIdToMarket.get(restAssetId)
+          // A single asset ID is normally one outcome. If Gate returns the
+          // same ID for both sides, mark it ambiguous and let hash/mk mapping
+          // win instead of guessing a direction.
+          if (existing && existing.marketId === binding.marketId && existing.direction !== binding.direction) {
+            this.assetIdToMarket.set(restAssetId, null)
+          } else {
+            this.assetIdToMarket.set(restAssetId, binding)
+          }
+          while (this.assetIdToMarket.size > 128) {
+            const oldest = this.assetIdToMarket.keys().next().value
+            if (oldest) this.assetIdToMarket.delete(oldest)
+            else break
+          }
+        }
         const previous = this.contexts.get(market.marketId)
         this.contexts.set(market.marketId, previous ? {
           ...previous,
@@ -511,10 +532,11 @@ export class GateMarketData implements ReadOnlyVenueSource {
       const hashContext = bookHash ? this.bookHashToMarket.get(bookHash) : undefined
       const marketKey = stringValue(firstValue(item, ['mk', 'market', 'market_id', 'marketId']))
       const marketKeyContext = marketKey ? this.marketKeyToMarket.get(marketKey) ?? undefined : undefined
+      const assetIdContext = explicitTokenId ? this.assetIdToMarket.get(explicitTokenId) ?? undefined : undefined
       // The hash belongs to this exact book update and is authoritative when
       // present; an aid cache can survive a round rotation or be recycled by
       // Gate, so it is only a fallback when the frame has no hash.
-      const resolvedTokenContext = hashContext ?? tokenContext ?? marketKeyContext
+      const resolvedTokenContext = hashContext ?? tokenContext ?? assetIdContext ?? marketKeyContext
       if (explicitTokenId && hashContext) {
         this.outcomeToMarket.set(explicitTokenId, { marketId: hashContext.marketId, direction: hashContext.direction })
       }
@@ -528,7 +550,11 @@ export class GateMarketData implements ReadOnlyVenueSource {
           if (hashContext) stats.websocketHashMatches += 1
         }
         stats.websocketAids += 1
-        if (tokenContext || stats.restAssetIds.has(explicitTokenId)) stats.websocketAidMatches += 1
+        // Count only a real outcome binding. `restAssetIds` is kept for
+        // diagnostics, but membership alone does not tell us the market or
+        // direction and used to make this counter look healthy while frames
+        // were still being dropped as unmapped.
+        if (tokenContext || assetIdContext) stats.websocketAidMatches += 1
         if (marketKey) {
           stats.websocketMarketKeys += 1
           if (marketKeyContext) stats.websocketMarketKeyMatches += 1
@@ -622,6 +648,9 @@ export class GateMarketData implements ReadOnlyVenueSource {
       }
       for (const [bookHash, binding] of this.bookHashToMarket) {
         if (binding.marketId === marketId) this.bookHashToMarket.delete(bookHash)
+      }
+      for (const [assetId, binding] of this.assetIdToMarket) {
+        if (binding?.marketId === marketId) this.assetIdToMarket.delete(assetId)
       }
       for (const [marketKey, binding] of this.marketKeyToMarket) {
         if (binding?.marketId === marketId) this.marketKeyToMarket.delete(marketKey)
