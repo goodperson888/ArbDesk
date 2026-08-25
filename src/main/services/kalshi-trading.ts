@@ -5,7 +5,7 @@ import type { KalshiCredentialStore } from './kalshi-credential-store'
 import { kalshiHeaders } from './kalshi-auth'
 import type { KalshiMarketData } from './kalshi-market-data'
 
-const API = 'https://api.elections.kalshi.com/trade-api/v2'
+const API = 'https://external-api.kalshi.com/trade-api/v2'
 const ORDER_PATH = '/portfolio/events/orders'
 const REQUEST_TIMEOUT_MS = 10_000
 const MAX_QUOTE_AGE_MS = 8_000

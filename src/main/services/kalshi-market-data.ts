@@ -10,7 +10,7 @@ import type { KalshiPageCaptureSource } from './kalshi-page-capture'
 // The shared production host is the most reliable public market-data route in
 // regions where external-api.kalshi.com is filtered. Kalshi documents both
 // hosts as equivalent production Trade API endpoints.
-const API = 'https://api.elections.kalshi.com/trade-api/v2'
+const API = 'https://external-api.kalshi.com/trade-api/v2'
 const REFRESH_CACHE_MS = 15_000
 const REQUEST_TIMEOUT_MS = 6_000
 // Keep the public REST fan-out bounded: query the two known BTC series once,

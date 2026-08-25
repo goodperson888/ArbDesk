@@ -38,7 +38,8 @@ describe('Kalshi real order guard', () => {
 
   it('submits one FOK order and maps DOWN to the YES ask at 1-price', async () => {
     const { credentials, marketData } = fixture()
-    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toBe('https://external-api.kalshi.com/trade-api/v2/portfolio/events/orders')
       const body = JSON.parse(String(init?.body)) as Record<string, string>
       expect(body).toMatchObject({ ticker: 'KXBTC15M-TEST', side: 'ask', count: '2.00', price: '0.4000', time_in_force: 'fill_or_kill' })
       return new Response(JSON.stringify({ order_id: 'order-1', client_order_id: body.client_order_id, fill_count: '2.00', remaining_count: '0.00', ts_ms: 123 }), { status: 201 })

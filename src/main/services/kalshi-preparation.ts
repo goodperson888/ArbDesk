@@ -4,7 +4,7 @@ import type { KalshiCredentialStore, KalshiCredentials } from './kalshi-credenti
 import { kalshiHeaders, kalshiRequestSignature } from './kalshi-auth'
 import type { KalshiMarketData } from './kalshi-market-data'
 
-const API = 'https://api.elections.kalshi.com/trade-api/v2'
+const API = 'https://external-api.kalshi.com/trade-api/v2'
 const REQUEST_TIMEOUT_MS = 12_000
 const REPORT_CACHE_MS = 15_000
 const ALLOWED_API_HOSTS = new Set(['api.elections.kalshi.com', 'external-api.kalshi.com'])
