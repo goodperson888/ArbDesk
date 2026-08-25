@@ -116,18 +116,15 @@ export class KalshiTradingService {
     if (estimatedCost.gt(decimal(settings.maxCapitalPerTrade, '单笔本金上限'))) {
       throw new Error(`Kalshi 预计本金 ${estimatedCost.toFixed(2)} USD 超过单笔上限 ${settings.maxCapitalPerTrade} USD`)
     }
-    const exchangeIndex = this.marketData.getExchangeIndex(ticker)
-    if (exchangeIndex === undefined) throw new Error('Kalshi 当前市场缺少 exchange_index，未发送订单；请先点击完整联调刷新市场元数据')
-
     const key = [ticker, request.direction, fixedCount(quantity), fixedPrice(effectiveOutcomePrice)].join('|')
     const existing = this.inFlight.get(key)
     if (existing) return await existing
-    const operation = this.submit({ ...request, ticker }, quantity, effectiveOutcomePrice, exchangeIndex)
+    const operation = this.submit({ ...request, ticker }, quantity, effectiveOutcomePrice)
     this.inFlight.set(key, operation)
     try { return await operation } finally { this.inFlight.delete(key) }
   }
 
-  private async submit(request: PlaceKalshiOrderRequest, quantity: Decimal, outcomePrice: Decimal, exchangeIndex: number): Promise<KalshiOrderReceipt> {
+  private async submit(request: PlaceKalshiOrderRequest, quantity: Decimal, outcomePrice: Decimal): Promise<KalshiOrderReceipt> {
     const credentials = await this.credentials.getCredentials()
     const { side, yesPrice } = outcomeToBook(request.direction, outcomePrice)
     const clientOrderId = `arbdesk-${randomUUID()}`
@@ -141,7 +138,10 @@ export class KalshiTradingService {
       self_trade_prevention_type: 'taker_at_cross',
       post_only: false,
       reduce_only: false,
-      exchange_index: exchangeIndex
+      // Let Kalshi route by ticker. Directly pinning a new crypto market to
+      // shard 2 can fail when the account has not yet been provisioned there.
+      // This is still a single POST; auto-routing only adds routing latency.
+      exchange_index: -1
     })
     const url = `${API}${ORDER_PATH}`
     assertKalshiTradingRequestAllowed('POST', url)
