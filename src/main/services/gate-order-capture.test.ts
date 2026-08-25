@@ -132,6 +132,21 @@ describe('GateOrderCapture', () => {
     expect(capture.getResult('biz-1')).toMatchObject({ orderId: 'biz-1', status: 'FILLED', filledQuantity: '5.629', averagePrice: '0.92' })
   })
 
+  it('does not downgrade a matched websocket fill when the processing response arrives later', () => {
+    const capture = new GateOrderCapture()
+    capture.observeResponse({
+      url: 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web',
+      body: JSON.stringify({ channel: 'predict.poly.order', result: { i: 'biz-race-1', u: 'MATCHED', qf: '15', ap: '0.34' } }),
+      receivedAt: Date.now()
+    })
+    capture.observeResponse({
+      url: 'https://www.gate.com/apiw/v2/event-contract/place-order', status: 200,
+      body: JSON.stringify({ code: 0, data: { biz_order_id: 'biz-race-1', ui_status: 'PROCESSING' } }),
+      receivedAt: Date.now() + 1
+    })
+    expect(capture.getResult('biz-race-1')).toMatchObject({ status: 'FILLED', filledQuantity: '15', averagePrice: '0.34' })
+  })
+
   it('updates fill readback from the network-response capture path', () => {
     const capture = new GateOrderCapture()
     capture.startCapture()

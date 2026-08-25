@@ -53,11 +53,15 @@ export class GateBrowserOrderTransport {
   }
 
   async reconcile(orderId: string): Promise<GateCapturedOrderResult | undefined> {
-    const deadline = Date.now() + 2_000
+    const deadline = Date.now() + 5_000
+    let lastResult: GateCapturedOrderResult | undefined
     while (true) {
       const result = this.capture.getResult(orderId)
-      if (result) return result
-      if (Date.now() >= deadline) return undefined
+      if (result) {
+        lastResult = result
+        if (result.status !== 'ACCEPTED' && result.status !== 'UNKNOWN') return result
+      }
+      if (Date.now() >= deadline) return lastResult
       await new Promise<void>((resolve) => setTimeout(resolve, 100))
     }
   }

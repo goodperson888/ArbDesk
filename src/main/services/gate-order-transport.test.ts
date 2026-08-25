@@ -65,4 +65,20 @@ describe('GateBrowserOrderTransport', () => {
     }), 25)
     await expect(pending).resolves.toMatchObject({ orderId: 'gate-delayed-1', status: 'FILLED', filledQuantity: '1', averagePrice: '0.51' })
   })
+
+  it('keeps waiting when the submit response is only processing', async () => {
+    const capture = new GateOrderCapture()
+    capture.observeResponse({
+      url: 'https://www.gate.com/apiw/v2/event-contract/place-order', status: 200,
+      body: JSON.stringify({ data: { biz_order_id: 'gate-processing-1', ui_status: 'PROCESSING' } }), receivedAt: Date.now()
+    })
+    const transport = new GateBrowserOrderTransport(capture, { executeCapturedOrder: vi.fn() })
+    const pending = transport.reconcile('gate-processing-1')
+    setTimeout(() => capture.observeResponse({
+      url: 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web',
+      body: JSON.stringify({ channel: 'predict.poly.order', result: { i: 'gate-processing-1', u: 'MATCHED', qf: '15', ap: '0.34' } }),
+      receivedAt: Date.now()
+    }), 25)
+    await expect(pending).resolves.toMatchObject({ orderId: 'gate-processing-1', status: 'FILLED', filledQuantity: '15', averagePrice: '0.34' })
+  })
 })

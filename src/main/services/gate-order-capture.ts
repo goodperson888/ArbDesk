@@ -27,6 +27,15 @@ export interface GateCapturedOrderResult {
   message?: string
 }
 
+const ORDER_STATUS_RANK: Record<GateCapturedOrderResult['status'], number> = {
+  UNKNOWN: 0,
+  ACCEPTED: 1,
+  PARTIAL: 2,
+  CANCELED: 3,
+  REJECTED: 3,
+  FILLED: 4
+}
+
 const ORDER_ID_KEYS = ['order_id', 'orderId', 'order_no', 'orderNo', 'orderID', 'client_order_id', 'clientOrderId', 'biz_order_id', 'bizOrderId', 'id'] as const
 const STATUS_KEYS = ['status', 'order_status', 'orderStatus', 'state', 'order_state', 'orderState', 'ui_status'] as const
 const FILLED_QUANTITY_KEYS = [
@@ -264,6 +273,30 @@ export class GateOrderCapture {
   private stopNetworkCapture?: () => void
   private unsubscribe?: () => void
 
+  private recordResult(next: GateCapturedOrderResult): void {
+    const previous = this.results.get(next.orderId)
+    if (!previous) {
+      this.results.set(next.orderId, next)
+      return
+    }
+    const preferNext = ORDER_STATUS_RANK[next.status] >= ORDER_STATUS_RANK[previous.status]
+    const primary = preferNext ? next : previous
+    const secondary = preferNext ? previous : next
+    let filledQuantity = primary.filledQuantity
+    try {
+      if (new Decimal(secondary.filledQuantity || 0).gt(filledQuantity || 0)) filledQuantity = secondary.filledQuantity
+    } catch {
+      // Keep the higher-ranked record when Gate emits a malformed quantity.
+    }
+    this.results.set(next.orderId, {
+      ...secondary,
+      ...primary,
+      filledQuantity,
+      averagePrice: primary.averagePrice && new Decimal(primary.averagePrice).gt(0) ? primary.averagePrice : secondary.averagePrice,
+      message: primary.message ?? secondary.message
+    })
+  }
+
   constructor(source?: GateOrderCaptureSource, executionReady?: () => boolean) {
     this.source = source
     this.executionReady = executionReady
@@ -337,7 +370,7 @@ export class GateOrderCapture {
 
   observeNetworkResponse(event: GateCapturedResponse): void {
     if (!this.capturing || !isGateHost(event.url)) return
-    for (const result of parseGateOrderResults(event.body, event.status ?? 200)) this.results.set(result.orderId, result)
+    for (const result of parseGateOrderResults(event.body, event.status ?? 200)) this.recordResult(result)
     const body = parseBody(event.body)
     this.pushTrace({
       kind: 'RESPONSE', endpoint: traceEndpoint(event.url), status: event.status, resourceType: event.resourceType,
@@ -357,7 +390,7 @@ export class GateOrderCapture {
   }
 
   observeResponse(event: GateCapturedResponse): void {
-    for (const result of parseGateOrderResults(event.body, event.status ?? 200)) this.results.set(result.orderId, result)
+    for (const result of parseGateOrderResults(event.body, event.status ?? 200)) this.recordResult(result)
   }
 
   buildRequest(request: VenueExecutionRequest): GatePreparedRequest {
