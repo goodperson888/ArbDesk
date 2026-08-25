@@ -58,6 +58,8 @@ export class GateVenueAdapter implements VenueAdapter {
     const price = new Decimal(request.limitPrice)
     if (!quantity.isFinite() || quantity.lte(0)) throw new Error('Gate 下单数量无效')
     if (!price.isFinite() || price.lte(0) || price.gte(1)) throw new Error('Gate 下单价格无效')
+    const notional = quantity.mul(price)
+    if (notional.lt(5)) throw new Error(`Gate 最小下单金额为 5 USDT；当前计划仅 ${notional.toFixed(2)} USDT，请增加份额`)
     if (request.endTime <= Date.now()) throw new Error('Gate 市场已过期')
   }
 

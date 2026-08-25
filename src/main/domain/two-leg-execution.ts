@@ -11,7 +11,7 @@ const MAX_QUOTE_AGE_MS = 8_000
 
 function isUnknownError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
-  return /未知|unknown|indeterminate|timeout|timed out|aborted/i.test(message)
+  return /未知|unknown|indeterminate|timeout|timed out|aborted|未确认|无法确认|未返回订单号|状态不明/i.test(message)
 }
 
 function legReceipt(request: VenueExecutionRequest, quantity: Decimal, status: MultiVenueExecutionLegReceipt['status'] = 'NOT_SUBMITTED', fill?: VenueFill): MultiVenueExecutionLegReceipt {
@@ -76,9 +76,16 @@ export class TwoLegExecutionMachine {
     const firstRequest = executionRequest(request, firstIndex, quantity, sessionId)
     let firstReceipt = setVenue(legReceipt(firstRequest, quantity), firstAdapter.venueId)
     let firstOrder: VenueOrderReceipt | undefined
+    let firstSubmissionConfirmed = false
+    let secondReceipt: MultiVenueExecutionLegReceipt | undefined
     try {
       await firstAdapter.preflightOrder(firstRequest)
       firstOrder = await firstAdapter.submitOrder(firstRequest)
+      if (!firstOrder.orderId) {
+        firstReceipt = setVenue({ ...firstReceipt, status: 'UNKNOWN', orderId: undefined }, firstAdapter.venueId)
+        throw new Error(`${firstAdapter.venueId} 下单响应未返回订单号，无法确认是否提交；请先在平台核对，未自动重试`)
+      }
+      firstSubmissionConfirmed = true
       firstReceipt = setVenue({ ...firstReceipt, orderId: firstOrder.orderId, status: firstOrder.status === 'UNKNOWN' ? 'UNKNOWN' : 'SUBMITTED' }, firstAdapter.venueId)
       const firstFill = await firstAdapter.waitForFill(firstOrder, firstRequest)
       if (!firstFill) throw new Error(`${firstAdapter.venueId} 首腿已提交但未读取到真实成交`)
@@ -94,9 +101,13 @@ export class TwoLegExecutionMachine {
 
       const secondQuantity = filledQuantity
       const secondRequest = executionRequest(request, secondIndex, secondQuantity, sessionId)
-      let secondReceipt = setVenue(legReceipt(secondRequest, secondQuantity), secondAdapter.venueId)
+      secondReceipt = setVenue(legReceipt(secondRequest, secondQuantity), secondAdapter.venueId)
       await secondAdapter.preflightOrder(secondRequest)
       const secondOrder = await secondAdapter.submitOrder(secondRequest)
+      if (!secondOrder.orderId) {
+        secondReceipt = setVenue({ ...secondReceipt, status: 'UNKNOWN', orderId: undefined }, secondAdapter.venueId)
+        throw new Error(`${secondAdapter.venueId} 第二腿下单响应未返回订单号，无法确认是否提交；未自动重试`)
+      }
       secondReceipt = setVenue({ ...secondReceipt, orderId: secondOrder.orderId, status: secondOrder.status === 'UNKNOWN' ? 'UNKNOWN' : 'SUBMITTED' }, secondAdapter.venueId)
       const secondFill = await secondAdapter.waitForFill(secondOrder, secondRequest)
       if (!secondFill) throw new Error(`${secondAdapter.venueId} 第二腿已提交但未读取到真实成交`)
@@ -108,10 +119,10 @@ export class TwoLegExecutionMachine {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const status = isUnknownError(error) ? 'RECONCILE_REQUIRED' : 'RECOVERY_REQUIRED'
-      const secondReceipt = setVenue(legReceipt(executionRequest(request, secondIndex, quantity, sessionId), quantity), secondAdapter.venueId)
+      secondReceipt ??= setVenue(legReceipt(executionRequest(request, secondIndex, quantity, sessionId), quantity), secondAdapter.venueId)
       return {
-        sessionId, comparisonId: request.comparisonId, status, firstLeg: firstReceipt, secondLeg: firstOrder ? secondReceipt : undefined,
-        message: `${firstOrder ? '首腿已提交但第二腿未完成' : '首腿未完成'}：${message}`
+        sessionId, comparisonId: request.comparisonId, status, firstLeg: firstReceipt, secondLeg: firstSubmissionConfirmed ? secondReceipt : undefined,
+        message: `${firstSubmissionConfirmed ? '首腿已提交但第二腿未完成' : '首腿未确认提交'}：${message}`
       }
     }
   }

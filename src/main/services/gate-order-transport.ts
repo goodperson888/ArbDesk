@@ -11,7 +11,14 @@ export interface GatePageOrderExecutor {
 }
 
 function parseResult(body: string, httpStatus: number): GateCapturedOrderResult {
-  return parseGateOrderResults(body, httpStatus)[0] ?? { orderId: '', status: httpStatus >= 400 ? 'REJECTED' : httpStatus >= 200 && httpStatus < 300 ? 'ACCEPTED' : 'UNKNOWN', filledQuantity: '0' }
+  return parseGateOrderResults(body, httpStatus)[0] ?? {
+    orderId: '',
+    status: httpStatus >= 400 ? 'REJECTED' : 'UNKNOWN',
+    filledQuantity: '0',
+    message: httpStatus >= 200 && httpStatus < 300
+      ? 'Gate 下单响应未返回 biz_order_id/order_id，无法确认是否提交；未自动重试'
+      : `Gate 下单响应未解析（HTTP ${httpStatus}）`
+  }
 }
 
 export class GateBrowserOrderTransport {

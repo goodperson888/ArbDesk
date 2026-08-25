@@ -711,6 +711,11 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     }
   }, [])
 
+  // 执行面板不需要先打开设置；启动后立即读取一次 Kalshi 凭据摘要，避免把未加载误报成未配置。
+  useEffect(() => {
+    void window.arbApp.getKalshiCredentialSummary().then(setKalshiCredentials)
+  }, [])
+
   useEffect(() => {
     if (!settingsOpen) return
     setHubstudioCode(snapshot?.settings.hubstudioContainerCode ?? '')
@@ -778,6 +783,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     () => selectedComparison?.legs.find((leg) => leg.venueId !== 'KALSHI'),
     [selectedComparison]
   )
+  const selectedGateLeg = useMemo(
+    () => selectedComparison?.legs.find((leg) => leg.venueId === 'GATE'),
+    [selectedComparison]
+  )
   const multiVenueMaxQuantity = selectedComparison && selectedKalshiLeg && selectedOtherVenueLeg
     ? Math.floor(Math.min(
       Number(selectedComparison.executableQuantity),
@@ -786,6 +795,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     ) * 100) / 100
     : 0
   const multiVenueRequestedQuantity = Number(multiVenueQuantity)
+  const multiVenueGateMinimumQuantity = selectedGateLeg && Number(selectedGateLeg.price) > 0
+    ? Math.ceil((5 / Number(selectedGateLeg.price)) * 100) / 100
+    : 0
+  const multiVenueMinimumQuantity = selectedGateLeg ? Math.max(1, multiVenueGateMinimumQuantity) : 1
   const multiVenueRequestedCapital = selectedComparison && Number.isFinite(multiVenueRequestedQuantity)
     ? Number(selectedComparison.allInCostPerShare) * multiVenueRequestedQuantity
     : 0
@@ -1311,7 +1324,11 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       setMessage('当前机会没有可真实执行的第二平台；仍是观察机会')
       return
     }
-    if (!kalshiCredentials?.configured) {
+    if (!kalshiCredentials) {
+      setMessage('正在读取 Kalshi 凭据状态，请稍后再试；本次未发送订单')
+      return
+    }
+    if (!kalshiCredentials.configured) {
       setMessage('请先在设置中保存 Kalshi API Key ID 与 RSA 私钥')
       return
     }
@@ -1341,6 +1358,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       setMessage('请输入至少 1 份的双腿执行数量，未发送订单')
       return
     }
+    if (selectedGateLeg && requestedQuantity < multiVenueMinimumQuantity) {
+      setMessage(`Gate 最小下单金额为 5 USDT；按当前价格至少需要 ${multiVenueMinimumQuantity.toFixed(2)} 份，未发送订单`)
+      return
+    }
     if (!Number.isFinite(maxQuantity) || maxQuantity < 1) {
       setMessage('两边盘口不足 1 份，未发送双腿订单')
       return
@@ -1351,7 +1372,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       return
     }
     const confirmation = window.confirm(
-      `即将执行双腿真实订单（不是原子交易）：\n\n${otherLeg.venueLabel} ${otherLeg.direction} ${orderQuantity.toFixed(2)}份 @ ${Number(otherLeg.price).toFixed(4)}\n→ 成交回读后再发送\nKalshi ${selectedKalshiLeg.direction} ${orderQuantity.toFixed(2)}份 @ ${Number(selectedKalshiLeg.price).toFixed(4)}\n\n如果第一腿成交、第二腿失败，会进入恢复态，不会自动重复下单。确认继续？`
+      `即将执行双腿真实订单（不是原子交易）：\n\n${otherLeg.venueLabel} ${otherLeg.direction} ${orderQuantity.toFixed(2)}份 @ ${Number(otherLeg.price).toFixed(4)}（约 $${(orderQuantity * Number(otherLeg.price)).toFixed(2)}）\n→ 成交回读后再发送\nKalshi ${selectedKalshiLeg.direction} ${orderQuantity.toFixed(2)}份 @ ${Number(selectedKalshiLeg.price).toFixed(4)}（约 $${(orderQuantity * Number(selectedKalshiLeg.price)).toFixed(2)}）\n\n如果第一腿成交、第二腿失败，会进入恢复态，不会自动重复下单。确认继续？`
     )
     if (!confirmation) return
     const request: MultiVenueExecutionRequest = {
@@ -1880,11 +1901,12 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                     <span><strong>{index + 1}. {leg.venueLabel}</strong><Direction direction={leg.direction} /></span>
                     <b className="mono">{Number(leg.price) > 0 ? money(leg.price, 4) : '—'}</b>
                     <small>{Number(leg.availableQuantity) > 0 ? `深度 ${money(leg.availableQuantity, 2)}份` : '仅有价格 · 深度待捕获'} · {quoteAgeLabel(leg.quoteAgeMs)}</small>
+                    <small>计划 {Number.isFinite(multiVenueRequestedQuantity) ? multiVenueRequestedQuantity.toFixed(2) : '—'} 份 · 预计 ${Number.isFinite(multiVenueRequestedQuantity) && Number(leg.price) > 0 ? (multiVenueRequestedQuantity * Number(leg.price)).toFixed(2) : '—'}</small>
                   </div>)}
                 </div>
                 {selectedKalshiLeg && <div className="kalshi-live-ticket">
                   <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>这是双腿执行入口：先提交 {selectedComparison.legs.find((leg) => leg.venueId !== 'KALSHI')?.venueLabel ?? '第一平台'}，读取实际成交后再提交 Kalshi FOK。两边没有原子交易，第二腿失败会进入恢复态，不会自动重复下单。</span></div>
-                  <button className="wide-secondary" onClick={() => void executeSelectedMultiVenue()} disabled={busy || selectedComparison.status !== 'MANUAL_EXECUTABLE' || !snapshot.settings.kalshiLiveEnabled || snapshot.settings.mode !== 'ASSISTED' || !selectedKalshiLeg.marketId}>
+                  <button className="wide-secondary" onClick={() => void executeSelectedMultiVenue()} disabled={busy || selectedComparison.status !== 'MANUAL_EXECUTABLE' || !snapshot.settings.kalshiLiveEnabled || snapshot.settings.mode !== 'ASSISTED' || !selectedKalshiLeg.marketId || (Boolean(selectedGateLeg) && multiVenueRequestedQuantity < multiVenueMinimumQuantity)}>
                     <Zap aria-hidden="true" />执行双腿（{selectedKalshiLeg.direction} → Kalshi）
                   </button>
                   {multiVenueReceipt && multiVenueReceipt.comparisonId === selectedComparison.id && <div className="browser-status-detail"><span>双腿</span><p>{multiVenueReceipt.message} · 状态 {multiVenueReceipt.status}</p></div>}
@@ -1977,6 +1999,13 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <div className="capacity-summary">
                   <span>当前可执行上限 <strong>{multiVenueMaxQuantity.toFixed(2)}</strong>份</span>
                   <span>预计两腿本金 <strong>${Number.isFinite(multiVenueRequestedCapital) ? multiVenueRequestedCapital.toFixed(2) : '—'}</strong></span>
+                </div>
+                {selectedGateLeg && <div className="capacity-summary">
+                  <span>Gate 最低金额 <strong>$5.00</strong></span>
+                  <span>当前价最低 <strong>{multiVenueMinimumQuantity.toFixed(2)}</strong>份</span>
+                </div>}
+                <div className="multi-venue-plan-summary">
+                  {selectedComparison.legs.map((leg) => <div key={`plan-${leg.venueId}`}><span>{leg.venueLabel} {leg.direction}</span><strong>{Number.isFinite(multiVenueRequestedQuantity) ? `${multiVenueRequestedQuantity.toFixed(2)}份` : '—'}</strong><small>{Number.isFinite(multiVenueRequestedQuantity) && Number(leg.price) > 0 ? `$${(multiVenueRequestedQuantity * Number(leg.price)).toFixed(2)}` : '金额待报价'}</small></div>)}
                 </div>
                 <div className="read-only-notice"><Info aria-hidden="true" /><span>{grossComparisonNotice(selectedComparison.status)}</span></div>
                 {selectedComparison.blockReasons.length > 0 && <ul className="read-only-reasons">{selectedComparison.blockReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}

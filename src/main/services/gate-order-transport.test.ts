@@ -47,6 +47,14 @@ describe('GateBrowserOrderTransport', () => {
     expect(result).toMatchObject({ orderId: 'gate-submit-1', status: 'ACCEPTED', filledQuantity: '0' })
   })
 
+  it('marks a successful HTTP response without an order id as unknown', async () => {
+    const capture = new GateOrderCapture()
+    const executePageOrder = vi.fn(async () => ({ status: 200, body: '' }))
+    const transport = new GateBrowserOrderTransport(capture, { executeCapturedOrder: vi.fn(), executePageOrder, canExecutePageOrders: () => true })
+    await expect(transport.submit({ marketId: 'event-1', outcomeId: 'token-up', direction: 'UP', quantity: '2', limitPrice: '0.5', startTime: Date.now(), endTime: Date.now() + 300_000, quoteReceivedAt: Date.now(), timeInForce: 'FOK', clientOrderId: 'client-empty-response' }))
+      .resolves.toMatchObject({ orderId: '', status: 'UNKNOWN', message: expect.stringContaining('biz_order_id') })
+  })
+
   it('waits briefly for a passive fill response without sending another request', async () => {
     const capture = new GateOrderCapture()
     const transport = new GateBrowserOrderTransport(capture, { executeCapturedOrder: vi.fn() })

@@ -4,7 +4,7 @@ import { GateVenueAdapter, type GateOrderTransport } from './gate-adapter'
 import type { VenueExecutionRequest } from '../venue-adapter'
 
 const baseRequest: VenueExecutionRequest = {
-  marketId: 'event-1', outcomeId: 'token-up', direction: 'UP', quantity: '2', limitPrice: '0.51',
+  marketId: 'event-1', outcomeId: 'token-up', direction: 'UP', quantity: '10', limitPrice: '0.51',
   startTime: Date.now() - 60_000, endTime: Date.now() + 300_000, quoteReceivedAt: Date.now(),
   timeInForce: 'FOK', clientOrderId: 'gate-test-1', confirmed: true
 }
@@ -57,5 +57,11 @@ describe('GateVenueAdapter', () => {
     const fill = await adapter.waitForFill(receipt, baseRequest)
     expect(fill).toMatchObject({ orderId: 'gate-order-3', quantity: '2', averagePrice: '0.52' })
     expect(reconcile).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects a Gate order whose notional is below 5 USDT', async () => {
+    const adapter = new GateVenueAdapter(transport(), { liveEnabled: true })
+    await expect(adapter.preflightOrder({ ...baseRequest, quantity: '2', limitPrice: '0.51' }))
+      .rejects.toThrow('Gate 最小下单金额为 5 USDT')
   })
 })

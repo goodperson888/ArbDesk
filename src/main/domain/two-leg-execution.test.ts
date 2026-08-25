@@ -53,4 +53,19 @@ describe('two-leg execution machine', () => {
     expect(receipt.status).toBe('RECONCILE_REQUIRED')
     expect(second.submitOrder).not.toHaveBeenCalled()
   })
+
+  it('does not claim the first leg was submitted when the venue returns no order id', async () => {
+    const first = adapter('A')
+    first.submitOrder = vi.fn(async () => ({
+      venueId: 'A', orderId: undefined, clientOrderId: 'client-a', status: 'UNKNOWN' as const,
+      filledQuantity: '0', receivedAt: Date.now()
+    }))
+    const second = adapter('B')
+    const receipt = await new TwoLegExecutionMachine().execute(request(), new Map([['A', first], ['B', second]]))
+    expect(receipt.status).toBe('RECONCILE_REQUIRED')
+    expect(receipt.firstLeg.status).toBe('UNKNOWN')
+    expect(receipt.message).toContain('未返回订单号')
+    expect(receipt.message).not.toContain('首腿已提交')
+    expect(second.submitOrder).not.toHaveBeenCalled()
+  })
 })
