@@ -2,6 +2,7 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join, resolve, sep } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { packageProfileCommands } from './package-profile-commands.mjs'
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const args = process.argv.slice(2)
@@ -43,7 +44,6 @@ const builderConfig = {
 }
 await writeFile(builderConfigPath, JSON.stringify(builderConfig, null, 2), 'utf8')
 
-const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 function run(command, commandArgs) {
   const result = spawnSync(command, commandArgs, { cwd: root, stdio: 'inherit' })
   if (result.error) throw result.error
@@ -51,10 +51,8 @@ function run(command, commandArgs) {
 }
 
 console.log(`Building market profile: ${profileId}`)
-if (!skipChecks) {
-  run(npm, ['run', 'test'])
-  run(npm, ['run', 'build'])
+const commands = packageProfileCommands({ root, builderConfigPath, target, skipChecks })
+for (const command of commands) {
+  run(command.command, command.args)
 }
-const electronBuilderArgs = ['--config', builderConfigPath, target === 'dir' ? '--dir' : `--${target}`, '--publish', 'never']
-run(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['electron-builder', ...electronBuilderArgs])
 console.log(`Package written to ${outputDirectory}`)
