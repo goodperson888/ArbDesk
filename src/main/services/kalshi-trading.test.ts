@@ -46,6 +46,7 @@ describe('Kalshi real order guard', () => {
         ticker: 'KXBTC15M-TEST', side: 'ask', count: '2.00', price: '0.4000',
         time_in_force: 'fill_or_kill', exchange_index: 2
       })
+      expect(body).not.toHaveProperty('subaccount')
       return new Response(JSON.stringify({ order_id: 'order-1', client_order_id: body.client_order_id, fill_count: '2.00', remaining_count: '0.00', ts_ms: 123 }), { status: 201 })
     })
     const service = new KalshiTradingService(credentials, marketData, () => settings(), true, fetchMock as typeof fetch)
@@ -94,5 +95,15 @@ describe('Kalshi real order guard', () => {
 
     await expect(service.placeOrder(request())).rejects.toThrow('market_not_found · market not found on exchange index')
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('explains a Kalshi user_not_found as an environment or credential identity mismatch', async () => {
+    const { credentials, marketData } = fixture()
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      error: { code: 'user_not_found', details: '_d313aac4-936e-443f-93ec-d984b174a844', message: 'user not found: d313aac4-936e-443f-93ec-d984b174a844' }
+    }), { status: 404 }))
+    const service = new KalshiTradingService(credentials, marketData, () => settings(), true, fetchMock as typeof fetch)
+
+    await expect(service.placeOrder(request())).rejects.toThrow('生产/Demo 环境或 API Key ID 与 RSA 私钥不匹配')
   })
 })

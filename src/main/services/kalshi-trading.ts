@@ -51,6 +51,10 @@ function messageForHttp(status: number, body: string): string {
     const details = typeof source.details === 'string'
       ? source.details
       : source.details === undefined ? undefined : JSON.stringify(source.details)
+    if (source.code === 'user_not_found') {
+      const evidence = [source.message, details].filter(Boolean).join(' · ')
+      return `生产/Demo 环境或 API Key ID 与 RSA 私钥不匹配；请确认两者来自同一个 Kalshi 生产账户并重新保存${evidence ? `（Kalshi: ${evidence}）` : ''}`.slice(0, 500)
+    }
     return [source.code, source.message, details].filter(Boolean).join(' · ').slice(0, 500) || `HTTP ${status}`
   } catch { return `HTTP ${status}` }
 }
@@ -137,7 +141,6 @@ export class KalshiTradingService {
       self_trade_prevention_type: 'taker_at_cross',
       post_only: false,
       reduce_only: false,
-      subaccount: 0,
       exchange_index: exchangeIndex
     })
     const url = `${API}${ORDER_PATH}`
