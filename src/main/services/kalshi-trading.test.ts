@@ -44,9 +44,10 @@ describe('Kalshi real order guard', () => {
       const body = JSON.parse(String(init?.body)) as Record<string, string>
       expect(body).toMatchObject({
         ticker: 'KXBTC15M-TEST', side: 'ask', count: '2.00', price: '0.4000',
-        time_in_force: 'fill_or_kill', exchange_index: -1
+        time_in_force: 'fill_or_kill'
       })
       expect(body).not.toHaveProperty('subaccount')
+      expect(body).not.toHaveProperty('exchange_index')
       return new Response(JSON.stringify({ order_id: 'order-1', client_order_id: body.client_order_id, fill_count: '2.00', remaining_count: '0.00', ts_ms: 123 }), { status: 201 })
     })
     const service = new KalshiTradingService(credentials, marketData, () => settings(), true, fetchMock as typeof fetch)
@@ -59,7 +60,8 @@ describe('Kalshi real order guard', () => {
     const { credentials, marketData } = fixture('0.0620')
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>
-      expect(body).toMatchObject({ ticker: 'KXBTC15M-TEST', side: 'bid', price: '0.0620', exchange_index: -1 })
+      expect(body).toMatchObject({ ticker: 'KXBTC15M-TEST', side: 'bid', price: '0.0620' })
+      expect(body).not.toHaveProperty('exchange_index')
       return new Response(JSON.stringify({ order_id: 'order-tolerated', client_order_id: body.client_order_id, fill_count: '2.00', remaining_count: '0.00' }), { status: 201 })
     })
     const service = new KalshiTradingService(credentials, marketData, () => settings(), true, fetchMock as typeof fetch)
@@ -100,7 +102,7 @@ describe('Kalshi real order guard', () => {
   it('explains a Kalshi user_not_found as an environment or credential identity mismatch', async () => {
     const { credentials, marketData } = fixture()
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
-      error: { code: 'user_not_found', details: '_d313aac4-936e-443f-93ec-d984b174a844', message: 'user not found: d313aac4-936e-443f-93ec-d984b174a844' }
+      error: { code: 'user_not_found:_d313aac4-936e-443f-93ec-d984b174a844', message: 'user not found: d313aac4-936e-443f-93ec-d984b174a844' }
     }), { status: 404 }))
     const service = new KalshiTradingService(credentials, marketData, () => settings(), true, fetchMock as typeof fetch)
 

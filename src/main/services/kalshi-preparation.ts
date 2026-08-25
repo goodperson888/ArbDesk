@@ -10,7 +10,11 @@ const REPORT_CACHE_MS = 15_000
 const ALLOWED_API_HOSTS = new Set(['api.elections.kalshi.com', 'external-api.kalshi.com'])
 
 type FetchLike = typeof fetch
-interface BalanceResponse { balance?: number; portfolio_value?: number }
+interface BalanceResponse {
+  balance?: number
+  portfolio_value?: number
+  balance_breakdown?: Array<{ exchange_index?: number; balance?: number | string }>
+}
 interface PositionsResponse { market_positions?: unknown[] }
 interface OrdersResponse { orders?: unknown[] }
 
@@ -161,6 +165,17 @@ export class KalshiPreparationService {
       marketId = candidate.marketId
       const exchangeIndex = this.marketData.getExchangeIndex(marketId)
       if (exchangeIndex === undefined) throw new Error('Kalshi 当前市场缺少 exchange_index；请刷新市场后重试完整联调')
+
+      const shardBalance = balance.balance_breakdown?.find((item) => Number(item.exchange_index) === exchangeIndex)
+      const shardBalanceValue = Number(shardBalance?.balance)
+      record.add(
+        'exchange-shard-balance',
+        '检查订单目标交易分片余额',
+        shardBalance && Number.isFinite(shardBalanceValue) && shardBalanceValue > 0 ? 'PASS' : 'WARN',
+        shardBalance && Number.isFinite(shardBalanceValue)
+          ? `目标交易分片 ${exchangeIndex} 可用余额 ${shardBalanceValue.toFixed(4)} USD`
+          : `未返回目标交易分片 ${exchangeIndex} 的余额明细；订单将按 ticker 自动路由，需在 Kalshi 账户中确认该分片已预分配资金`
+      )
 
       const body = requestBody(candidate, exchangeIndex)
       await record.run('offline-order-build', '本地构造 Kalshi 订单草稿', async () => body,

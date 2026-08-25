@@ -59,7 +59,10 @@ describe('Kalshi preparation safety', () => {
     } as unknown as KalshiMarketData
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const path = new URL(String(input)).pathname
-      if (path.endsWith('/balance')) return new Response(JSON.stringify({ balance: 0, portfolio_value: 0 }), { status: 200 })
+      if (path.endsWith('/balance')) return new Response(JSON.stringify({
+        balance: 0, portfolio_value: 0,
+        balance_breakdown: [{ exchange_index: 2, balance: '0.0000' }]
+      }), { status: 200 })
       if (path.endsWith('/positions')) return new Response(JSON.stringify({ market_positions: [] }), { status: 200 })
       return new Response(JSON.stringify({ orders: [] }), { status: 200 })
     })
@@ -68,6 +71,9 @@ describe('Kalshi preparation safety', () => {
     expect(left).toBe(right)
     expect(left).toMatchObject({ venueId: 'KALSHI', orderSubmissionBlocked: true, readyExceptFunding: true, fundingReady: false, localOrderBuilt: true, localOrderSigned: true, requestCount: 3 })
     expect(left.stages.find((stage) => stage.id === 'offline-order-build')?.detail).toContain('exchange_index 2')
+    expect(left.stages.find((stage) => stage.id === 'exchange-shard-balance')).toMatchObject({
+      status: 'WARN', detail: '目标交易分片 2 可用余额 0.0000 USD'
+    })
     expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(fetchMock.mock.calls.some((call) => String(call[0]).includes('/events/orders'))).toBe(false)
   })

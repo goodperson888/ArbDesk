@@ -51,7 +51,7 @@ function messageForHttp(status: number, body: string): string {
     const details = typeof source.details === 'string'
       ? source.details
       : source.details === undefined ? undefined : JSON.stringify(source.details)
-    if (source.code === 'user_not_found') {
+    if (typeof source.code === 'string' && source.code.startsWith('user_not_found')) {
       const evidence = [source.message, details].filter(Boolean).join(' · ')
       return `生产/Demo 环境或 API Key ID 与 RSA 私钥不匹配；请确认两者来自同一个 Kalshi 生产账户并重新保存${evidence ? `（Kalshi: ${evidence}）` : ''}`.slice(0, 500)
     }
@@ -140,8 +140,8 @@ export class KalshiTradingService {
       reduce_only: false,
       // Let Kalshi route by ticker. Directly pinning a new crypto market to
       // shard 2 can fail when the account has not yet been provisioned there.
-      // This is still a single POST; auto-routing only adds routing latency.
-      exchange_index: -1
+      // Omitting this field is the documented auto-routing form and remains a
+      // single POST; auto-routing only adds routing latency.
     })
     const url = `${API}${ORDER_PATH}`
     assertKalshiTradingRequestAllowed('POST', url)
