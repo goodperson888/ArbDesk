@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { gatePageDuration, gateRollDelayMs, isGateBtcEventUrl, isGateEventResponse, isGateHost, selectGatePageDuration, selectGatePageUrl } from './gate-page-capture'
+import { gatePageDuration, gateRollDelayMs, gateWebSocketPayload, isGateBtcEventUrl, isGateEventResponse, isGateHost, selectGatePageDuration, selectGatePageUrl } from './gate-page-capture'
 
 describe('Gate page routing', () => {
   it('accepts only Gate-owned hosts and event-contract responses', () => {
@@ -43,5 +43,10 @@ describe('Gate page routing', () => {
       'https://www.gate.com/zh/trade-events/btc-updown-5m?eventId=896245&outcome=Up',
       'https://www.gate.com/zh/trade-events/btc-updown-15m?eventId=896282&outcome=Up'
     ], 15)).toContain('eventId=896282')
+  })
+
+  it('reads CDP sent websocket frames from the response property', () => {
+    expect(gateWebSocketPayload({ response: { opcode: 1, payloadData: '{"channel":"predict.poly.orderbook"}' } }, 'SENT'))
+      .toBe('{"channel":"predict.poly.orderbook"}')
   })
 })

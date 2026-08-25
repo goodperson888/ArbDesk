@@ -110,6 +110,14 @@ interface CdpWebSocketFrame {
   request?: { opcode?: number; payloadData?: string }
 }
 
+export function gateWebSocketPayload(event: CdpWebSocketFrame, _direction: 'SENT' | 'RECEIVED'): string | undefined {
+  // CDP names the WebSocketFrame field `response` for both
+  // Network.webSocketFrameReceived and Network.webSocketFrameSent.
+  // Keep `request` only as a compatibility fallback for older wrappers.
+  const frame = event.response ?? event.request
+  return frame?.opcode === 1 && typeof frame.payloadData === 'string' ? frame.payloadData : undefined
+}
+
 export function isGateHost(rawUrl: string): boolean {
   try {
     const hostname = new URL(rawUrl).hostname.toLowerCase()
@@ -753,9 +761,8 @@ export class GatePageCapture implements GatePageCaptureSource {
     if (!event.requestId) return
     const url = knownSocketUrl ?? this.socketUrls.get(event.requestId)
     if (!url) return
-    const frame = direction === 'SENT' ? event.request : event.response
-    if (frame?.opcode !== 1 || typeof frame.payloadData !== 'string') return
-    const payload = frame.payloadData
+    const payload = gateWebSocketPayload(event, direction)
+    if (payload === undefined) return
     if (payload.length > 2_000_000) return
     const captured = { url, payload, requestId: event.requestId, direction, receivedAt: Date.now(), pageUrl }
     for (const listener of this.rawFrameListeners) listener(captured)

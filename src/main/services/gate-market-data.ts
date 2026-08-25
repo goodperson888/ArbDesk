@@ -38,6 +38,13 @@ interface GateBookHashBinding {
   endTime: number
 }
 
+interface GateSubscriptionPair {
+  tokens: string[]
+  bestAsks: Map<string, number>
+  books: Map<string, { levels: OrderBookLevel[]; receivedAt: number }>
+  updatedAt: number
+}
+
 type JsonRecord = Record<string, unknown>
 
 const MAX_WALK_OBJECTS = 12_000
@@ -337,6 +344,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
   private bookHashToMarket = new Map<string, GateBookHashBinding>()
   /** A market key is usable only when it has been observed for one side. */
   private marketKeyToMarket = new Map<string, GateBookHashBinding | null>()
+  private subscriptionTokensByMarket = new Map<string, GateSubscriptionPair>()
   private snapshot: ReadOnlyWindowQuote[] = []
   private startPromise?: Promise<void>
   private capturedAccount: { openOrderCount?: number; positionCount?: number; updatedAt?: number } = {}
@@ -349,7 +357,10 @@ export class GateMarketData implements ReadOnlyVenueSource {
     private readonly options: { autoStartPageCapture?: boolean } = {}
   ) {
     pageCapture.onResponse((event) => this.ingest(event.body, event.receivedAt, 'REST', event.url, event.pageUrl))
-    pageCapture.onWebSocketFrame((event) => this.ingest(event.payload, event.receivedAt, 'WebSocket', event.url, event.pageUrl))
+    pageCapture.onWebSocketFrame((event) => {
+      if (event.direction === 'SENT') this.captureOrderbookSubscription(event.payload, event.pageUrl, event.receivedAt)
+      this.ingest(event.payload, event.receivedAt, 'WebSocket', event.url, event.pageUrl)
+    })
     pageCapture.onStatus((captureStatus) => {
       this.status = {
         connectionState: captureStatus.state === 'CONNECTED' ? 'CONNECTED' : captureStatus.state === 'IDLE' ? 'NOT_CONFIGURED' : 'DISCONNECTED',
@@ -379,6 +390,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
     this.outcomeToMarket.clear()
     this.bookHashToMarket.clear()
     this.marketKeyToMarket.clear()
+    this.subscriptionTokensByMarket.clear()
     this.pipelineStats.clear()
     this.snapshot = []
     this.emit()
@@ -486,7 +498,9 @@ export class GateMarketData implements ReadOnlyVenueSource {
       // with an outcome id.
       const possibleMarketTokenId = stringValue(firstValue(item, ['marketId', 'market_id', 'id']))
       const tokenId = explicitTokenId ?? (possibleMarketTokenId && this.outcomeToMarket.has(possibleMarketTokenId) ? possibleMarketTokenId : undefined)
-      const tokenContext = tokenId ? this.outcomeToMarket.get(tokenId) : undefined
+      const tokenContext = tokenId
+        ? this.outcomeToMarket.get(tokenId) ?? this.inferSubscribedTokenContext(tokenId, pageUrl, item, receivedAt)
+        : undefined
       const bookHash = stringValue(firstValue(item, ['h', 'hash', 'book_hash', 'orderbook_hash']))
       const hashContext = bookHash ? this.bookHashToMarket.get(bookHash) : undefined
       const marketKey = stringValue(firstValue(item, ['mk', 'market', 'market_id', 'marketId']))
@@ -606,6 +620,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
       for (const [marketKey, binding] of this.marketKeyToMarket) {
         if (binding?.marketId === marketId) this.marketKeyToMarket.delete(marketKey)
       }
+      this.subscriptionTokensByMarket.delete(marketId)
       changed = true
     }
     if (!changed) return
@@ -648,6 +663,106 @@ export class GateMarketData implements ReadOnlyVenueSource {
       restAssetIds: new Set<string>(), websocketAids: 0, websocketAidMatches: 0,
       websocketMarketKeys: 0, websocketMarketKeyMatches: 0
     }
+  }
+
+  private captureOrderbookSubscription(payload: string, pageUrl: string | undefined, receivedAt: number): void {
+    let message: JsonRecord | undefined
+    try { message = record(JSON.parse(payload)) } catch { return }
+    if (!message || !/orderbook/i.test(String(message.channel ?? ''))) return
+    const event = String(message.event ?? '').toLowerCase()
+    if (event !== 'subscribe' && event !== 'unsubscribe') return
+    const tokens = Array.isArray(message.payload) ? message.payload.map(stringValue).filter((value): value is string => Boolean(value)) : []
+    if (!tokens.length) return
+    if (event === 'unsubscribe') {
+      for (const token of tokens) {
+        for (const [marketId, pair] of this.subscriptionTokensByMarket) {
+          if (!pair.tokens.includes(token)) continue
+          pair.tokens = pair.tokens.filter((candidate) => candidate !== token)
+          if (!pair.tokens.length) this.subscriptionTokensByMarket.delete(marketId)
+          const mapping = this.outcomeToMarket.get(token)
+          if (mapping?.marketId === marketId) this.outcomeToMarket.delete(token)
+        }
+      }
+      return
+    }
+    const marketId = urlContext({ pageUrl }).marketId
+    if (!marketId) return
+    const pair = this.subscriptionTokensByMarket.get(marketId) ?? {
+      tokens: [], bestAsks: new Map<string, number>(), books: new Map<string, { levels: OrderBookLevel[]; receivedAt: number }>(), updatedAt: receivedAt
+    }
+    for (const token of tokens) if (!pair.tokens.includes(token)) pair.tokens.push(token)
+    pair.tokens = pair.tokens.slice(-2)
+    pair.updatedAt = receivedAt
+    this.subscriptionTokensByMarket.set(marketId, pair)
+    while (this.subscriptionTokensByMarket.size > 32) {
+      const oldest = this.subscriptionTokensByMarket.keys().next().value
+      if (oldest) this.subscriptionTokensByMarket.delete(oldest)
+      else break
+    }
+  }
+
+  private inferSubscribedTokenContext(tokenId: string, pageUrl: string, item: JsonRecord, receivedAt: number): { marketId: string; direction: Direction } | undefined {
+    const marketId = urlContext({ pageUrl }).marketId
+    if (!marketId) return undefined
+    const pair = this.subscriptionTokensByMarket.get(marketId)
+    if (!pair?.tokens.includes(tokenId)) return undefined
+    const currentLevels = askLevels(item)
+    const bestAsk = Number(currentLevels[0]?.price)
+    if (Number.isFinite(bestAsk)) {
+      pair.bestAsks.set(tokenId, bestAsk)
+      pair.books.set(tokenId, { levels: currentLevels, receivedAt })
+    }
+    for (const sibling of pair.tokens) {
+      if (sibling === tokenId) continue
+      const siblingContext = this.outcomeToMarket.get(sibling)
+      if (siblingContext?.marketId !== marketId) continue
+      const inferred = { marketId, direction: siblingContext.direction === 'UP' ? 'DOWN' as const : 'UP' as const }
+      this.outcomeToMarket.set(tokenId, inferred)
+      return inferred
+    }
+    const context = this.contexts.get(marketId)
+    const upAsk = Number(context?.outcomes.UP?.bestAsk)
+    const downAsk = Number(context?.outcomes.DOWN?.bestAsk)
+    if (!Number.isFinite(bestAsk) || !Number.isFinite(upAsk) || !Number.isFinite(downAsk)) return undefined
+    if (pair.tokens.length === 2) {
+      const [firstToken, secondToken] = pair.tokens
+      const firstAsk = pair.bestAsks.get(firstToken)
+      const secondAsk = pair.bestAsks.get(secondToken)
+      if (firstAsk !== undefined && secondAsk !== undefined) {
+        const directDistances = [Math.abs(firstAsk - upAsk), Math.abs(secondAsk - downAsk)]
+        const swappedDistances = [Math.abs(firstAsk - downAsk), Math.abs(secondAsk - upAsk)]
+        const directTotal = directDistances[0] + directDistances[1]
+        const swappedTotal = swappedDistances[0] + swappedDistances[1]
+        const direct = directTotal < swappedTotal
+        const winningDistances = direct ? directDistances : swappedDistances
+        if (Math.max(...winningDistances) <= 0.05 && Math.abs(directTotal - swappedTotal) >= 0.005) {
+          const firstMapping = { marketId, direction: direct ? 'UP' as const : 'DOWN' as const }
+          const secondMapping = { marketId, direction: direct ? 'DOWN' as const : 'UP' as const }
+          this.outcomeToMarket.set(firstToken, firstMapping)
+          this.outcomeToMarket.set(secondToken, secondMapping)
+          for (const [mappedToken, mapping] of [[firstToken, firstMapping], [secondToken, secondMapping]] as const) {
+            const book = pair.books.get(mappedToken)
+            if (!book?.levels.length) continue
+            context!.outcomes[mapping.direction] = {
+              direction: mapping.direction, outcomeId: mappedToken,
+              bestAsk: book.levels[0].price, askSize: book.levels[0].size,
+              levels: book.levels, receivedAt: book.receivedAt
+            }
+          }
+          return tokenId === firstToken ? firstMapping : secondMapping
+        }
+      }
+    }
+    const upDistance = Math.abs(bestAsk - upAsk)
+    const downDistance = Math.abs(bestAsk - downAsk)
+    const closest = Math.min(upDistance, downDistance)
+    // Gate REST and the forwarded CLOB socket are not sampled atomically.
+    // Accept at most five ticks of drift and require a clear two-tick lead;
+    // otherwise wait for another frame instead of guessing the outcome.
+    if (closest > 0.05 || Math.abs(upDistance - downDistance) < 0.02) return undefined
+    const inferred = { marketId, direction: upDistance < downDistance ? 'UP' as const : 'DOWN' as const }
+    this.outcomeToMarket.set(tokenId, inferred)
+    return inferred
   }
 
   private captureAccountCounts(payload: unknown, sourceUrl: string, receivedAt: number): void {

@@ -20,7 +20,11 @@ class FakeGateCapture implements GatePageCaptureSource {
   onWebSocketFrame(listener: (event: GateCapturedWebSocketFrame) => void): () => void { this.frames.push(listener); return () => undefined }
   onStatus(listener: (status: GatePageCaptureStatus) => void): () => void { this.statuses.push(listener); return () => undefined }
   emitResponse(value: unknown): void { for (const listener of this.responses) listener({ url: 'https://api.gateio.ws/event/markets', body: JSON.stringify(value), receivedAt: Date.now() }) }
-  emitFrame(value: unknown): void { for (const listener of this.frames) listener({ url: 'wss://fx-ws.gateio.ws/ws', payload: JSON.stringify(value), receivedAt: Date.now() }) }
+  emitFrame(value: unknown, options: Partial<GateCapturedWebSocketFrame> = {}): void {
+    for (const listener of this.frames) listener({
+      url: 'wss://fx-ws.gateio.ws/ws', payload: JSON.stringify(value), receivedAt: Date.now(), ...options
+    })
+  }
 }
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
@@ -349,6 +353,59 @@ describe('GateMarketData', () => {
     })
     expect(source.getStatus().message).toContain('aid 2·命中0')
     expect(source.getStatus().message).toContain('mk 2·命中2')
+  })
+
+  it('maps subscribed websocket tokens to Gate directions by matching the REST book prices', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-25T04:30:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-5m?eventId=899715&outcome=Up'
+    const bookUrl = 'https://www.gate.com/apiw/v2/event-contract/book?event_id=899715&market_id=3830934&outcome='
+    source.ingest(JSON.stringify({ code: 0, data: {
+      hash: '1787632286.505', asset_id: 'ge_899715_3830934', market: 'ge_899715_3830934', asks: [{ price: '0.17', size: '14.236' }]
+    } }), Date.now(), 'REST', `${bookUrl}Up`, pageUrl)
+    source.ingest(JSON.stringify({ code: 0, data: {
+      hash: '1787632286.514', asset_id: 'ge_899715_3830934', market: 'ge_899715_3830934', asks: [{ price: '0.84', size: '36.53' }]
+    } }), Date.now(), 'REST', `${bookUrl}Down`, pageUrl)
+    capture.emitFrame({ channel: 'predict.poly.orderbook', event: 'subscribe', id: 4, payload: ['poly-up-token'] }, { direction: 'SENT', pageUrl })
+    capture.emitFrame({ channel: 'predict.poly.orderbook', event: 'subscribe', id: 5, payload: ['poly-down-token'] }, { direction: 'SENT', pageUrl })
+    capture.emitFrame({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      aid: 'poly-up-token', mk: '0xcondition', h: 'book-digest-up', a: [['0.18', '20']], b: []
+    } }, { direction: 'RECEIVED', pageUrl })
+    capture.emitFrame({ channel: 'predict.poly.orderbook', event: 'update', result: {
+      aid: 'poly-down-token', mk: '0xcondition', h: 'book-digest-down', a: [['0.83', '30']], b: []
+    } }, { direction: 'RECEIVED', pageUrl })
+
+    expect(source.getLatestWindows()[0]).toMatchObject({
+      marketId: '899715',
+      outcomes: {
+        UP: { outcomeId: 'poly-up-token', bestAsk: '0.18', askSize: '20' },
+        DOWN: { outcomeId: 'poly-down-token', bestAsk: '0.83', askSize: '30' }
+      }
+    })
+  })
+
+  it('matches both subscribed tokens jointly when Gate prices are close to fifty cents', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-25T04:35:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-5m?eventId=899735&outcome=Up'
+    const bookUrl = 'https://www.gate.com/apiw/v2/event-contract/book?event_id=899735&market_id=3830986&outcome='
+    source.ingest(JSON.stringify({ data: { asset_id: 'ge_899735_3830986', market: 'ge_899735_3830986', asks: [{ price: '0.52', size: '100' }] } }), Date.now(), 'REST', `${bookUrl}Up`, pageUrl)
+    source.ingest(JSON.stringify({ data: { asset_id: 'ge_899735_3830986', market: 'ge_899735_3830986', asks: [{ price: '0.51', size: '90' }] } }), Date.now(), 'REST', `${bookUrl}Down`, pageUrl)
+    capture.emitFrame({ channel: 'predict.poly.orderbook', event: 'subscribe', payload: ['close-token-a'] }, { direction: 'SENT', pageUrl })
+    capture.emitFrame({ channel: 'predict.poly.orderbook', event: 'subscribe', payload: ['close-token-b'] }, { direction: 'SENT', pageUrl })
+    capture.emitFrame({ result: { aid: 'close-token-a', a: [['0.52', '80']], b: [] } }, { direction: 'RECEIVED', pageUrl })
+    capture.emitFrame({ result: { aid: 'close-token-b', a: [['0.51', '70']], b: [] } }, { direction: 'RECEIVED', pageUrl })
+
+    expect(source.getLatestWindows()[0].outcomes).toMatchObject({
+      UP: { outcomeId: 'close-token-a', bestAsk: '0.52' },
+      DOWN: { outcomeId: 'close-token-b', bestAsk: '0.51' }
+    })
   })
 
   it('maps Gate websocket market_id tokens and removes an expired round on refresh', async () => {
