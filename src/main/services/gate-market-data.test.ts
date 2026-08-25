@@ -408,6 +408,27 @@ describe('GateMarketData', () => {
     })
   })
 
+  it('keeps the page subscription directions when prices move beyond the REST correlation tolerance', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-25T04:40:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-5m?eventId=899852&outcome=Up'
+    const bookUrl = 'https://www.gate.com/apiw/v2/event-contract/book?event_id=899852&market_id=3831000&outcome='
+    source.ingest(JSON.stringify({ data: { asset_id: 'ge_899852_3831000', market: 'ge_899852_3831000', asks: [{ price: '0.28', size: '100' }] } }), Date.now(), 'REST', `${bookUrl}Up`, pageUrl)
+    source.ingest(JSON.stringify({ data: { asset_id: 'ge_899852_3831000', market: 'ge_899852_3831000', asks: [{ price: '0.73', size: '90' }] } }), Date.now(), 'REST', `${bookUrl}Down`, pageUrl)
+    capture.emitFrame({ channel: 'predict.poly.orderbook', event: 'subscribe', payload: ['moving-up-token'] }, { direction: 'SENT', pageUrl })
+    capture.emitFrame({ channel: 'predict.poly.orderbook', event: 'subscribe', payload: ['moving-down-token'] }, { direction: 'SENT', pageUrl })
+    capture.emitFrame({ result: { aid: 'moving-up-token', a: [['0.42', '80']], b: [] } }, { direction: 'RECEIVED', pageUrl })
+    capture.emitFrame({ result: { aid: 'moving-down-token', a: [['0.59', '70']], b: [] } }, { direction: 'RECEIVED', pageUrl })
+
+    expect(source.getLatestWindows()[0].outcomes).toMatchObject({
+      UP: { outcomeId: 'moving-up-token', bestAsk: '0.42' },
+      DOWN: { outcomeId: 'moving-down-token', bestAsk: '0.59' }
+    })
+  })
+
   it('maps Gate websocket market_id tokens and removes an expired round on refresh', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-23T12:32:00.000Z'))

@@ -217,7 +217,7 @@ interface GateParseContext {
   sourceUrl?: string
 }
 
-function urlContext(context: GateParseContext): { duration?: 5 | 15; marketId?: string; isBtc?: boolean; outcomeDirection?: Direction } {
+function urlContext(context: GateParseContext): { duration?: 5 | 15; marketId?: string; isBtc?: boolean; outcomeDirection?: Direction; pageOutcomeDirection?: Direction } {
   const raw = `${context.pageUrl ?? ''}\n${context.sourceUrl ?? ''}`
   const durationMatch = raw.match(/btc(?:[-_]?up[-_]?down)?[-_](5|15)m/i)
   const duration = durationMatch ? Number(durationMatch[1]) as 5 | 15 : undefined
@@ -235,7 +235,10 @@ function urlContext(context: GateParseContext): { duration?: 5 | 15; marketId?: 
   const rawOutcome = source?.searchParams.get('outcome') ?? source?.searchParams.get('side') ??
     source?.searchParams.get('direction') ?? source?.searchParams.get('result') ?? undefined
   const outcomeDirection = rawOutcome ? direction({}, rawOutcome) : undefined
-  return { duration, marketId, isBtc, outcomeDirection }
+  const rawPageOutcome = page?.searchParams.get('outcome') ?? page?.searchParams.get('side') ??
+    page?.searchParams.get('direction') ?? page?.searchParams.get('result') ?? undefined
+  const pageOutcomeDirection = rawPageOutcome ? direction({}, rawPageOutcome) : undefined
+  return { duration, marketId, isBtc, outcomeDirection, pageOutcomeDirection }
 }
 
 export function parseGateMarketObject(source: JsonRecord, receivedAt: number, context: GateParseContext = {}): GateMarketContext | undefined {
@@ -694,6 +697,12 @@ export class GateMarketData implements ReadOnlyVenueSource {
     pair.tokens = pair.tokens.slice(-2)
     pair.updatedAt = receivedAt
     this.subscriptionTokensByMarket.set(marketId, pair)
+    const selectedDirection = urlContext({ pageUrl }).pageOutcomeDirection
+    if (selectedDirection) {
+      const oppositeDirection: Direction = selectedDirection === 'UP' ? 'DOWN' : 'UP'
+      if (pair.tokens[0]) this.outcomeToMarket.set(pair.tokens[0], { marketId, direction: selectedDirection })
+      if (pair.tokens[1]) this.outcomeToMarket.set(pair.tokens[1], { marketId, direction: oppositeDirection })
+    }
     while (this.subscriptionTokensByMarket.size > 32) {
       const oldest = this.subscriptionTokensByMarket.keys().next().value
       if (oldest) this.subscriptionTokensByMarket.delete(oldest)
