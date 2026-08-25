@@ -51,4 +51,22 @@ describe('Kalshi market normalization', () => {
     expect(source.getLatestWindows()[0].outcomes.UP).toMatchObject({ receivedAt: originalReceivedAt, observedAt: Date.now() })
     vi.useRealTimers()
   })
+
+  it('keeps an unchanged quote fresh when the authenticated stream sends a control ping', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-25T04:50:00.000Z'))
+    const source = new KalshiMarketData()
+    source.ingest(JSON.stringify({
+      ticker: 'KXBTC15M-26AUG250450-30', market_ticker: 'KXBTC15M-26AUG250450-30', market_type: 'binary', status: 'open',
+      title: 'Bitcoin up or down in 15 minutes?',
+      open_time: '2026-08-25T04:45:00.000Z', close_time: '2026-08-25T05:00:00.000Z',
+      yes_ask_dollars: '0.40', yes_ask_size_fp: '10', no_ask_dollars: '0.60', no_ask_size_fp: '11'
+    }), Date.now(), 'REST')
+    const originalReceivedAt = source.getLatestWindows()[0].outcomes.UP!.receivedAt
+    vi.advanceTimersByTime(23_000)
+    source.observeStreamActivity(Date.now())
+
+    expect(source.getLatestWindows()[0].outcomes.UP).toMatchObject({ receivedAt: originalReceivedAt, observedAt: Date.now() })
+    vi.useRealTimers()
+  })
 })

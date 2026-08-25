@@ -358,6 +358,33 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
     this.rebuildPageSnapshot(transport, receivedAt)
   }
 
+  /**
+   * Kalshi's authenticated WebSocket sends control-layer ping frames even
+   * when a ticker value is unchanged. They are valid evidence that the stream
+   * is alive, but do not carry a JSON ticker payload for `ingest()` to parse.
+   */
+  observeStreamActivity(receivedAt = Date.now()): void {
+    if (!this.monitoringEnabled) return
+    let changed = false
+    const refresh = (outcomes: Partial<Record<Direction, ReadOnlyOutcomeQuote>>): Partial<Record<Direction, ReadOnlyOutcomeQuote>> => {
+      const next = { ...outcomes }
+      for (const direction of ['UP', 'DOWN'] as const) {
+        const outcome = next[direction]
+        if (!outcome || (outcome.observedAt ?? outcome.receivedAt) >= receivedAt) continue
+        next[direction] = { ...outcome, observedAt: receivedAt }
+        changed = true
+      }
+      return next
+    }
+    this.snapshot = this.snapshot.map((window) => ({ ...window, outcomes: refresh(window.outcomes) }))
+    for (const [ticker, context] of this.pageContexts) {
+      this.pageContexts.set(ticker, { ...context, outcomes: refresh(context.outcomes) })
+    }
+    if (!changed) return
+    this.status = { ...this.status, connectionState: 'CONNECTED', updatedAt: receivedAt, message: `Kalshi ticker WebSocket 保活在线；最近流观测 ${new Date(receivedAt).toLocaleTimeString('zh-CN', { hour12: false })}` }
+    this.emit()
+  }
+
   private rebuildPageSnapshot(transport: string, receivedAt: number): void {
     const now = Date.now()
     this.snapshot = [...this.pageContexts.values()]
@@ -400,6 +427,9 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
     })
     socket.on('message', (raw) => {
       try { this.applyTicker(JSON.parse(String(raw))) } catch { /* ignore malformed service frames */ }
+    })
+    socket.on('ping', () => {
+      if (this.stream === socket) this.observeStreamActivity(Date.now())
     })
     socket.once('close', () => {
       if (this.stream !== socket) return
