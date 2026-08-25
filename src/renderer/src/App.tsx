@@ -2517,7 +2517,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
               </fieldset>
               <div><ShieldAlert /><div><h3>第二腿恢复保护</h3><p>首轮按正常利润保护价FAK；剩余敞口可在整组最终亏损不超过设置值时自动补单。仍无法成交时可从执行条重试，或在订单历史平掉MEXC。</p></div></div>
               <div className="decision-field-grid">
-                <label className="settings-field" htmlFor="hedge-max-slippage">Polymarket最大加价
+                <label className="settings-field" htmlFor="hedge-max-slippage">普通对冲最大加价（Polymarket / Kalshi）
                   <input id="hedge-max-slippage" type="number" min="0" max="0.5" step="0.01" value={maxHedgeSlippageDraft} onChange={(event) => setMaxHedgeSlippageDraft(event.target.value)} inputMode="decimal" />
                   <small>例如填0.03：当前最优价0.50时，最高只买到0.53；不是允许亏损比例。</small>
                 </label>

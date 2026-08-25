@@ -349,6 +349,10 @@ export class GateMarketData implements ReadOnlyVenueSource {
   private bookHashToMarket = new Map<string, GateBookHashBinding>()
   /** A market key is usable only when it has been observed for one side. */
   private marketKeyToMarket = new Map<string, GateBookHashBinding | null>()
+  /** Gate's live WS uses one shared `mk` for both outcomes. Keep its market
+   * binding separate from the older directional market-key map. */
+  private websocketMarketToMarket = new Map<string, { marketId: string; endTime: number }>()
+  private websocketMarketTokens = new Map<string, Partial<Record<Direction, string>>>()
   private subscriptionTokensByMarket = new Map<string, GateSubscriptionPair>()
   private snapshot: ReadOnlyWindowQuote[] = []
   private startPromise?: Promise<void>
@@ -396,6 +400,8 @@ export class GateMarketData implements ReadOnlyVenueSource {
     this.assetIdToMarket.clear()
     this.bookHashToMarket.clear()
     this.marketKeyToMarket.clear()
+    this.websocketMarketToMarket.clear()
+    this.websocketMarketTokens.clear()
     this.subscriptionTokensByMarket.clear()
     this.pipelineStats.clear()
     this.snapshot = []
@@ -533,14 +539,17 @@ export class GateMarketData implements ReadOnlyVenueSource {
       const marketKey = stringValue(firstValue(item, ['mk', 'market', 'market_id', 'marketId']))
       const marketKeyContext = marketKey ? this.marketKeyToMarket.get(marketKey) ?? undefined : undefined
       const assetIdContext = explicitTokenId ? this.assetIdToMarket.get(explicitTokenId) ?? undefined : undefined
+      const hasBookFields = item.a !== undefined || item.b !== undefined || item.asks !== undefined || item.bids !== undefined
       // The hash belongs to this exact book update and is authoritative when
       // present; an aid cache can survive a round rotation or be recycled by
       // Gate, so it is only a fallback when the frame has no hash.
-      const resolvedTokenContext = hashContext ?? tokenContext ?? assetIdContext ?? marketKeyContext
+      let resolvedTokenContext = hashContext ?? tokenContext ?? assetIdContext ?? marketKeyContext
+      if (!resolvedTokenContext && marketKey && explicitTokenId && hasBookFields) {
+        resolvedTokenContext = this.inferWebsocketMarketTokenContext(marketKey, explicitTokenId, item)
+      }
       if (explicitTokenId && hashContext) {
         this.outcomeToMarket.set(explicitTokenId, { marketId: hashContext.marketId, direction: hashContext.direction })
       }
-      const hasBookFields = item.a !== undefined || item.b !== undefined || item.asks !== undefined || item.bids !== undefined
       if (frameDuration && explicitTokenId && hasBookFields) {
         const stats = this.pipelineStats.get(frameDuration) ?? this.newPipelineStats()
         stats.rawBookFrames += 1
@@ -558,6 +567,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
         if (marketKey) {
           stats.websocketMarketKeys += 1
           if (marketKeyContext) stats.websocketMarketKeyMatches += 1
+          else if (this.websocketMarketToMarket.has(marketKey)) stats.websocketMarketKeyMatches += 1
         }
         if (resolvedTokenContext) {
           stats.mappedBookFrames += 1
@@ -570,6 +580,15 @@ export class GateMarketData implements ReadOnlyVenueSource {
       }
       if (resolvedTokenContext) {
         const context = this.contexts.get(resolvedTokenContext.marketId)
+        if (marketKey && context) {
+          this.websocketMarketToMarket.set(marketKey, { marketId: context.marketId, endTime: context.endTime })
+          const token = tokenId ?? explicitTokenId
+          if (token) {
+            const tokens = this.websocketMarketTokens.get(marketKey) ?? {}
+            tokens[resolvedTokenContext.direction] = token
+            this.websocketMarketTokens.set(marketKey, tokens)
+          }
+        }
         const levels = askLevels(item)
         if (context && levels.length) {
           context.outcomes[resolvedTokenContext.direction] = {
@@ -655,6 +674,12 @@ export class GateMarketData implements ReadOnlyVenueSource {
       for (const [marketKey, binding] of this.marketKeyToMarket) {
         if (binding?.marketId === marketId) this.marketKeyToMarket.delete(marketKey)
       }
+      for (const [marketKey, binding] of this.websocketMarketToMarket) {
+        if (binding.marketId === marketId) {
+          this.websocketMarketToMarket.delete(marketKey)
+          this.websocketMarketTokens.delete(marketKey)
+        }
+      }
       this.subscriptionTokensByMarket.delete(marketId)
       changed = true
     }
@@ -713,6 +738,35 @@ export class GateMarketData implements ReadOnlyVenueSource {
       restAssetIds: new Set<string>(), websocketAids: 0, websocketAidMatches: 0,
       websocketMarketKeys: 0, websocketMarketKeyMatches: 0
     }
+  }
+
+  private inferWebsocketMarketTokenContext(marketKey: string, tokenId: string, item: JsonRecord): { marketId: string; direction: Direction } | undefined {
+    const binding = this.websocketMarketToMarket.get(marketKey)
+    const context = binding ? this.contexts.get(binding.marketId) : undefined
+    if (!binding || !context || context.endTime <= Date.now()) return undefined
+    const knownTokens = this.websocketMarketTokens.get(marketKey) ?? {}
+    if (knownTokens.UP === tokenId) return { marketId: binding.marketId, direction: 'UP' }
+    if (knownTokens.DOWN === tokenId) return { marketId: binding.marketId, direction: 'DOWN' }
+    const knownDirection = (Object.entries(knownTokens) as Array<[Direction, string | undefined]>).find(([, knownToken]) => Boolean(knownToken && knownToken !== tokenId))?.[0]
+    const levels = askLevels(item)
+    const bestAsk = Number(levels[0]?.price)
+    const upAsk = Number(context.outcomes.UP?.bestAsk)
+    const downAsk = Number(context.outcomes.DOWN?.bestAsk)
+    let inferredDirection: Direction | undefined
+    if (Number.isFinite(bestAsk) && Number.isFinite(upAsk) && Number.isFinite(downAsk)) {
+      const upDistance = Math.abs(bestAsk - upAsk)
+      const downDistance = Math.abs(bestAsk - downAsk)
+      if (Math.min(upDistance, downDistance) <= 0.05 && Math.abs(upDistance - downDistance) >= 0.02) {
+        inferredDirection = upDistance < downDistance ? 'UP' : 'DOWN'
+      }
+    }
+    if (!inferredDirection && knownDirection) inferredDirection = knownDirection === 'UP' ? 'DOWN' : 'UP'
+    if (!inferredDirection) return undefined
+    this.outcomeToMarket.set(tokenId, { marketId: binding.marketId, direction: inferredDirection })
+    const tokens = this.websocketMarketTokens.get(marketKey) ?? {}
+    tokens[inferredDirection] = tokenId
+    this.websocketMarketTokens.set(marketKey, tokens)
+    return { marketId: binding.marketId, direction: inferredDirection }
   }
 
   private captureOrderbookSubscription(payload: string, pageUrl: string | undefined, receivedAt: number): void {

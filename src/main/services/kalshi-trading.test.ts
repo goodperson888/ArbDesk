@@ -6,7 +6,7 @@ import { KalshiTradingService, assertKalshiTradingRequestAllowed } from './kalsh
 import type { PlaceKalshiOrderRequest, RiskSettings } from '../../shared/types'
 
 function settings(overrides: Partial<RiskSettings> = {}): RiskSettings {
-  return { mode: 'ASSISTED', kalshiLiveEnabled: true, maxCapitalPerTrade: '100', ...overrides } as RiskSettings
+  return { mode: 'ASSISTED', kalshiLiveEnabled: true, maxCapitalPerTrade: '100', maxHedgeSlippage: '0.0300', ...overrides } as RiskSettings
 }
 
 function request(overrides: Partial<PlaceKalshiOrderRequest> = {}): PlaceKalshiOrderRequest {
@@ -16,7 +16,7 @@ function request(overrides: Partial<PlaceKalshiOrderRequest> = {}): PlaceKalshiO
   }
 }
 
-function fixture() {
+function fixture(currentUp = '0.40') {
   const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
   const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()
   const credentials = { getCredentials: async () => ({ apiKeyId: 'kalshi_test_key_id', privateKeyPem }) } as KalshiCredentialStore
@@ -24,7 +24,7 @@ function fixture() {
     getExchangeIndex: () => 2,
     getLatestWindows: () => [{
       marketId: 'KXBTC15M-TEST', endTime: Date.now() + 60_000,
-      outcomes: { UP: { bestAsk: '0.40', askSize: '3', receivedAt: Date.now() }, DOWN: { bestAsk: '0.60', askSize: '3', receivedAt: Date.now() } }
+      outcomes: { UP: { bestAsk: currentUp, askSize: '3', receivedAt: Date.now() }, DOWN: { bestAsk: '0.60', askSize: '3', receivedAt: Date.now() } }
     }]
   } as unknown as KalshiMarketData
   return { credentials, marketData }
@@ -52,6 +52,27 @@ describe('Kalshi real order guard', () => {
     const receipt = await service.placeOrder(request({ direction: 'DOWN', outcomePrice: '0.60' }))
     expect(receipt).toMatchObject({ orderId: 'order-1', direction: 'DOWN', side: 'ask', status: 'EXECUTED', fillCount: '2.00' })
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('reprices to the current Kalshi ask when it moves within configured hedge slippage', async () => {
+    const { credentials, marketData } = fixture('0.0620')
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      expect(body).toMatchObject({ ticker: 'KXBTC15M-TEST', side: 'bid', price: '0.0620', exchange_index: 2 })
+      return new Response(JSON.stringify({ order_id: 'order-tolerated', client_order_id: body.client_order_id, fill_count: '2.00', remaining_count: '0.00' }), { status: 201 })
+    })
+    const service = new KalshiTradingService(credentials, marketData, () => settings(), true, fetchMock as typeof fetch)
+
+    await expect(service.placeOrder(request({ outcomePrice: '0.0320' }))).resolves.toMatchObject({ orderId: 'order-tolerated', outcomePrice: '0.0620' })
+  })
+
+  it('still rejects a Kalshi ask beyond the configured hedge slippage', async () => {
+    const { credentials, marketData } = fixture('0.0630')
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 500 }))
+    const service = new KalshiTradingService(credentials, marketData, () => settings(), true, fetchMock as typeof fetch)
+
+    await expect(service.placeOrder(request({ outcomePrice: '0.0320' }))).rejects.toThrow('最高接受价 0.0620')
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it('never retries an ambiguous POST and rejects simulation/unchecked requests', async () => {

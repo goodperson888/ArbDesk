@@ -100,22 +100,25 @@ export class KalshiTradingService {
     if (!current || !currentQuote) throw new Error('Kalshi 当前市场或对应方向盘口已消失，请刷新后重试')
     if (Date.now() - currentQuote.receivedAt > MAX_QUOTE_AGE_MS) throw new Error('Kalshi 当前盘口已过期，已拒绝下单')
     if (current.endTime - Date.now() < 20_000) throw new Error('Kalshi 当前市场即将结算，已拒绝下单')
-    if (currentQuote.bestAsk !== request.outcomePrice && new Decimal(currentQuote.bestAsk).gt(outcomePrice)) {
-      throw new Error(`Kalshi 价格保护已触发：当前卖一 ${currentQuote.bestAsk} 高于确认价格 ${request.outcomePrice}`)
+    const liveOutcomePrice = decimal(currentQuote.bestAsk, '当前盘口价格')
+    const maximumAcceptedPrice = outcomePrice.add(decimal(settings.maxHedgeSlippage || '0', '最大对冲滑点'))
+    const effectiveOutcomePrice = liveOutcomePrice.gt(outcomePrice) ? liveOutcomePrice : outcomePrice
+    if (liveOutcomePrice.gt(maximumAcceptedPrice)) {
+      throw new Error(`Kalshi 价格保护已触发：当前卖一 ${liveOutcomePrice.toFixed(4)} 高于最高接受价 ${maximumAcceptedPrice.toFixed(4)}（确认价 ${outcomePrice.toFixed(4)}，允许滑点 ${decimal(settings.maxHedgeSlippage || '0', '最大对冲滑点').toFixed(4)}）`)
     }
     const available = decimal(currentQuote.askSize, '盘口深度')
     if (available.lt(quantity)) throw new Error(`Kalshi 盘口深度不足：当前 ${available.toFixed(2)} 份，计划 ${quantity.toFixed(2)} 份`)
-    const estimatedCost = quantity.mul(outcomePrice)
+    const estimatedCost = quantity.mul(effectiveOutcomePrice)
     if (estimatedCost.gt(decimal(settings.maxCapitalPerTrade, '单笔本金上限'))) {
       throw new Error(`Kalshi 预计本金 ${estimatedCost.toFixed(2)} USD 超过单笔上限 ${settings.maxCapitalPerTrade} USD`)
     }
     const exchangeIndex = this.marketData.getExchangeIndex(ticker)
     if (exchangeIndex === undefined) throw new Error('Kalshi 当前市场缺少 exchange_index，未发送订单；请先点击完整联调刷新市场元数据')
 
-    const key = [ticker, request.direction, fixedCount(quantity), fixedPrice(outcomePrice)].join('|')
+    const key = [ticker, request.direction, fixedCount(quantity), fixedPrice(effectiveOutcomePrice)].join('|')
     const existing = this.inFlight.get(key)
     if (existing) return await existing
-    const operation = this.submit({ ...request, ticker }, quantity, outcomePrice, exchangeIndex)
+    const operation = this.submit({ ...request, ticker }, quantity, effectiveOutcomePrice, exchangeIndex)
     this.inFlight.set(key, operation)
     try { return await operation } finally { this.inFlight.delete(key) }
   }

@@ -321,6 +321,35 @@ describe('GateMarketData', () => {
     expect(source.getStatus().message).toContain('REST hash 2/2·方向2')
     expect(source.getStatus().message).toContain('WS h 2·命中0')
     expect(source.getStatus().message).toContain('aid 2·命中2')
+    expect(source.getStatus().message).toContain('mk 2·命中2')
+  })
+
+  it('learns the shared websocket market key and maps a rotated aid on the same 15m page', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-24T15:42:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-15m'
+    const wsUrl = 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web'
+    source.ingest(JSON.stringify({ data: {
+      hash: 'rest-hash-up-rotated', asset_id: 'rest-up-rotated', market: 'ge_896007_3810000', asks: [['0.41', '10']], bids: []
+    } }), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/book?event_id=896007&outcome=Up', pageUrl)
+    source.ingest(JSON.stringify({ data: {
+      hash: 'rest-hash-down-rotated', asset_id: 'rest-down-rotated', market: 'ge_896007_3810000', asks: [['0.59', '11']], bids: []
+    } }), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/book?event_id=896007&outcome=Down', pageUrl)
+    source.ingest(JSON.stringify({ result: {
+      mk: '0xshared-rotated', aid: 'rest-up-rotated', a: [['0.41', '10']], b: []
+    } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+    source.ingest(JSON.stringify({ result: {
+      mk: '0xshared-rotated', aid: 'rest-down-rotated', a: [['0.59', '11']], b: []
+    } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+    source.ingest(JSON.stringify({ result: {
+      mk: '0xshared-rotated', aid: 'new-up-rotated', a: [['0.42', '15']], b: []
+    } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+
+    expect(source.getLatestWindows()[0].outcomes.UP).toMatchObject({ outcomeId: 'new-up-rotated', bestAsk: '0.42', askSize: '15' })
+    expect(source.getStatus().message).toContain('未映射0')
   })
 
   it('maps websocket aid directly from the REST asset id when market key and hash are absent', async () => {
