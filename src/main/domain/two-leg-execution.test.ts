@@ -49,6 +49,56 @@ describe('two-leg execution machine', () => {
     expect(receipt.secondLeg?.filledQuantity).toBe('1')
   })
 
+  it('starts both unprotected submissions before either response resolves and keeps equal target quantities', async () => {
+    const first = adapter('A')
+    const second = adapter('B')
+    let resolveFirst!: (receipt: VenueOrderReceipt) => void
+    let resolveSecond!: (receipt: VenueOrderReceipt) => void
+    first.submitOrder = vi.fn(() => new Promise<VenueOrderReceipt>((resolve) => { resolveFirst = resolve }))
+    second.submitOrder = vi.fn(() => new Promise<VenueOrderReceipt>((resolve) => { resolveSecond = resolve }))
+    first.waitForFill = vi.fn(async () => { throw new Error('unprotected mode must not wait for first fill') })
+    second.waitForFill = vi.fn(async () => { throw new Error('unprotected mode must not wait for second fill') })
+
+    const execution = new TwoLegExecutionMachine().execute({
+      ...request(),
+      executionPolicy: 'PARALLEL_UNPROTECTED' as never
+    }, new Map([['A', first], ['B', second]]))
+
+    await vi.waitFor(() => expect(first.submitOrder).toHaveBeenCalledTimes(1))
+    const secondStartedBeforeFirstResolved = vi.mocked(second.submitOrder).mock.calls.length === 1
+    resolveFirst({ venueId: 'A', orderId: 'A-parallel', clientOrderId: 'a-client', status: 'ACCEPTED', filledQuantity: '0', receivedAt: Date.now() })
+    if (secondStartedBeforeFirstResolved) {
+      resolveSecond({ venueId: 'B', orderId: 'B-parallel', clientOrderId: 'b-client', status: 'ACCEPTED', filledQuantity: '0', receivedAt: Date.now() })
+    }
+    const receipt = await execution
+
+    expect(secondStartedBeforeFirstResolved).toBe(true)
+    expect(receipt.status).toBe('UNPROTECTED_SUBMITTED')
+    expect(vi.mocked(first.submitOrder).mock.calls[0][0].quantity).toBe('2.00')
+    expect(vi.mocked(second.submitOrder).mock.calls[0][0].quantity).toBe('2.00')
+    expect(first.waitForFill).not.toHaveBeenCalled()
+    expect(second.waitForFill).not.toHaveBeenCalled()
+  })
+
+  it('records both unprotected legs without retry when one submission fails', async () => {
+    const first = adapter('A')
+    const second = adapter('B')
+    first.submitOrder = vi.fn(async () => { throw new Error('Gate rejected') })
+
+    const receipt = await new TwoLegExecutionMachine().execute({
+      ...request(),
+      executionPolicy: 'PARALLEL_UNPROTECTED' as never
+    }, new Map([['A', first], ['B', second]]))
+
+    expect(receipt.status).toBe('RECOVERY_REQUIRED')
+    expect(first.submitOrder).toHaveBeenCalledTimes(1)
+    expect(second.submitOrder).toHaveBeenCalledTimes(1)
+    expect(receipt.firstLeg.status).toBe('NOT_SUBMITTED')
+    expect(receipt.secondLeg?.orderId).toBe('B-order')
+    expect(first.waitForFill).not.toHaveBeenCalled()
+    expect(second.waitForFill).not.toHaveBeenCalled()
+  })
+
   it('returns reconcile required for an unknown first-leg submit', async () => {
     const first = adapter('A')
     first.submitOrder = vi.fn(async () => { throw new Error('订单提交结果未知，禁止重试') })

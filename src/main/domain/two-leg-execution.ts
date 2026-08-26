@@ -31,6 +31,29 @@ function setVenue(receipt: MultiVenueExecutionLegReceipt, venueId: string): Mult
   return { ...receipt, venueId }
 }
 
+function submittedLegReceipt(
+  request: VenueExecutionRequest,
+  quantity: Decimal,
+  adapter: VenueAdapter,
+  order: VenueOrderReceipt
+): MultiVenueExecutionLegReceipt {
+  const status: MultiVenueExecutionLegReceipt['status'] = order.status === 'FILLED'
+    ? 'FILLED'
+    : order.status === 'PARTIAL'
+      ? 'PARTIAL'
+      : order.status === 'UNKNOWN' || !order.orderId
+        ? 'UNKNOWN'
+        : order.status === 'REJECTED' || order.status === 'CANCELED'
+          ? 'NOT_SUBMITTED'
+          : 'SUBMITTED'
+  return setVenue({
+    ...legReceipt(request, quantity, status),
+    orderId: order.orderId,
+    filledQuantity: order.filledQuantity,
+    averagePrice: order.averagePrice
+  }, adapter.venueId)
+}
+
 function executionRequest(
   request: MultiVenueExecutionRequest,
   legIndex: number,
@@ -55,6 +78,81 @@ function executionRequest(
 }
 
 export class TwoLegExecutionMachine {
+  private async executeParallelUnprotected(
+    request: MultiVenueExecutionRequest,
+    firstIndex: number,
+    secondIndex: number,
+    quantity: Decimal,
+    sessionId: string,
+    firstAdapter: VenueAdapter,
+    secondAdapter: VenueAdapter
+  ): Promise<MultiVenueExecutionReceipt> {
+    const firstRequest = executionRequest(request, firstIndex, quantity, sessionId)
+    const secondRequest = executionRequest(request, secondIndex, quantity, sessionId)
+    let firstReceipt = setVenue(legReceipt(firstRequest, quantity), firstAdapter.venueId)
+    let secondReceipt = setVenue(legReceipt(secondRequest, quantity), secondAdapter.venueId)
+
+    try {
+      await Promise.all([
+        firstAdapter.preflightOrder(firstRequest),
+        secondAdapter.preflightOrder(secondRequest)
+      ])
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        sessionId,
+        comparisonId: request.comparisonId,
+        status: error instanceof PreSubmitBlockedError ? 'CANCELED' : 'RECOVERY_REQUIRED',
+        firstLeg: firstReceipt,
+        secondLeg: secondReceipt,
+        message: `无保护双边均未提交：${message}`
+      }
+    }
+
+    const firstSubmission = firstAdapter.submitOrder(firstRequest)
+    const secondSubmission = secondAdapter.submitOrder(secondRequest)
+    const [firstResult, secondResult] = await Promise.allSettled([firstSubmission, secondSubmission])
+
+    if (firstResult.status === 'fulfilled') firstReceipt = submittedLegReceipt(firstRequest, quantity, firstAdapter, firstResult.value)
+    else if (isUnknownError(firstResult.reason)) firstReceipt = { ...firstReceipt, status: 'UNKNOWN' }
+    if (secondResult.status === 'fulfilled') secondReceipt = submittedLegReceipt(secondRequest, quantity, secondAdapter, secondResult.value)
+    else if (isUnknownError(secondResult.reason)) secondReceipt = { ...secondReceipt, status: 'UNKNOWN' }
+
+    const firstOrder = firstResult.status === 'fulfilled' ? firstResult.value : undefined
+    const secondOrder = secondResult.status === 'fulfilled' ? secondResult.value : undefined
+    const bothSubmitted = Boolean(
+      firstOrder?.orderId && secondOrder?.orderId &&
+      !['UNKNOWN', 'REJECTED', 'CANCELED'].includes(firstOrder.status) &&
+      !['UNKNOWN', 'REJECTED', 'CANCELED'].includes(secondOrder.status)
+    )
+    if (bothSubmitted) {
+      return {
+        sessionId,
+        comparisonId: request.comparisonId,
+        status: 'UNPROTECTED_SUBMITTED',
+        firstLeg: firstReceipt,
+        secondLeg: secondReceipt,
+        message: `无保护双边已提交：${firstAdapter.venueId} 与 ${secondAdapter.venueId} 各 ${quantity.toFixed(2)} 份；成交待核对，不自动补单`
+      }
+    }
+
+    const reasons = [firstResult, secondResult].flatMap((result, index) => {
+      if (result.status === 'rejected') return [`${index === 0 ? firstAdapter.venueId : secondAdapter.venueId}：${result.reason instanceof Error ? result.reason.message : String(result.reason)}`]
+      if (!result.value.orderId) return [`${result.value.venueId}：未返回订单号`]
+      if (['UNKNOWN', 'REJECTED', 'CANCELED'].includes(result.value.status)) return [`${result.value.venueId}：${result.value.status}`]
+      return []
+    })
+    const unknown = firstReceipt.status === 'UNKNOWN' || secondReceipt.status === 'UNKNOWN'
+    return {
+      sessionId,
+      comparisonId: request.comparisonId,
+      status: unknown ? 'RECONCILE_REQUIRED' : 'RECOVERY_REQUIRED',
+      firstLeg: firstReceipt,
+      secondLeg: secondReceipt,
+      message: `无保护双边未完整提交：${reasons.join('；') || '返回状态未通过'}；未自动重试`
+    }
+  }
+
   async execute(request: MultiVenueExecutionRequest, adapters: Map<string, VenueAdapter>): Promise<MultiVenueExecutionReceipt> {
     const sessionId = request.sessionId ?? randomUUID()
     if (!request.confirmed) throw new Error('未完成双腿真实下单二次确认')
@@ -75,6 +173,10 @@ export class TwoLegExecutionMachine {
     const firstAdapter = adapters.get(firstLeg.venueId)
     const secondAdapter = adapters.get(secondLeg.venueId)
     if (!firstAdapter || !secondAdapter) throw new Error(`路线缺少平台适配器：${!firstAdapter ? firstLeg.venueId : secondLeg.venueId}`)
+
+    if (request.executionPolicy === 'PARALLEL_UNPROTECTED') {
+      return await this.executeParallelUnprotected(request, firstIndex, secondIndex, quantity, sessionId, firstAdapter, secondAdapter)
+    }
 
     const firstRequest = executionRequest(request, firstIndex, quantity, sessionId)
     let firstReceipt = setVenue(legReceipt(firstRequest, quantity), firstAdapter.venueId)

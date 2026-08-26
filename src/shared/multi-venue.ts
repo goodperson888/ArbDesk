@@ -43,6 +43,7 @@ export type ExecutionPolicy =
   | 'OBSERVE_ONLY'
   | 'MANUAL_TWO_LEG'
   | 'SEQUENTIAL_FILL_THEN_HEDGE'
+  | 'PARALLEL_UNPROTECTED'
   | 'PARALLEL_FOK'
   | 'AUTO_WITH_RECOVERY'
 
@@ -177,13 +178,13 @@ export interface MultiVenueExecutionLegReceipt {
 export interface MultiVenueExecutionReceipt {
   sessionId: string
   comparisonId: string
-  status: 'HEDGED' | 'RECOVERY_REQUIRED' | 'RECONCILE_REQUIRED' | 'CANCELED'
+  status: 'HEDGED' | 'UNPROTECTED_SUBMITTED' | 'RECOVERY_REQUIRED' | 'RECONCILE_REQUIRED' | 'CANCELED'
   firstLeg: MultiVenueExecutionLegReceipt
   secondLeg?: MultiVenueExecutionLegReceipt
   message: string
 }
 
-export type MultiVenueExecutionSessionStatus = 'STARTED' | 'HEDGED' | 'RECOVERY_REQUIRED' | 'RECONCILE_REQUIRED' | 'CANCELED' | 'RECOVERED'
+export type MultiVenueExecutionSessionStatus = 'STARTED' | 'HEDGED' | 'UNPROTECTED_SUBMITTED' | 'RECOVERY_REQUIRED' | 'RECONCILE_REQUIRED' | 'CANCELED' | 'RECOVERED'
 
 export interface MultiVenueExecutionSession {
   sessionId: string
