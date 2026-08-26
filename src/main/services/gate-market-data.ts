@@ -91,12 +91,15 @@ function asset(source: JsonRecord): 'BTC/USD' | undefined {
 }
 
 function direction(source: JsonRecord, fallback?: string): Direction | undefined {
-  const index = Number(firstValue(source, ['index', 'outcomeIndex', 'outcome_index']))
-  if (index === 1) return 'UP'
-  if (index === 2) return 'DOWN'
   const raw = String(firstValue(source, ['direction', 'outcome', 'side', 'type', 'name', 'label', 'title']) ?? fallback ?? '').toUpperCase()
   if (/\b(?:UP|CALL|RISE|HIGHER|BULL|LONG)\b|涨|上漲|上涨|看涨|升/.test(raw)) return 'UP'
   if (/\b(?:DOWN|PUT|FALL|LOWER|BEAR|SHORT)\b|跌|下跌|看跌|下降|降/.test(raw)) return 'DOWN'
+  // Numeric outcome indices vary between Gate API releases (both 0/1 and
+  // 1/2 have appeared). Only use the index when the response has no label
+  // that can identify the side unambiguously.
+  const index = Number(firstValue(source, ['index', 'outcomeIndex', 'outcome_index']))
+  if (index === 0 || index === 1) return index === 0 ? 'UP' : 'DOWN'
+  if (index === 2) return 'DOWN'
   return undefined
 }
 
@@ -338,6 +341,29 @@ function toWindow(context: GateMarketContext): ReadOnlyWindowQuote | undefined {
   }
 }
 
+function hasUsableDepth(quote: ReadOnlyOutcomeQuote | undefined): boolean {
+  return Boolean(quote && quote.levels.length > 0 && Number(quote.askSize) > 0)
+}
+
+function mergeOutcomeQuotes(
+  previous: Partial<Record<Direction, ReadOnlyOutcomeQuote>>,
+  incoming: Partial<Record<Direction, ReadOnlyOutcomeQuote>>
+): Partial<Record<Direction, ReadOnlyOutcomeQuote>> {
+  const merged = { ...previous }
+  for (const direction of ['UP', 'DOWN'] as const) {
+    const next = incoming[direction]
+    if (!next) continue
+    const current = previous[direction]
+    // Event catalogue responses often arrive after the live book response,
+    // but only carry a shallow bullish/bearish price with zero depth. Keep the
+    // depth-bearing WS quote instead of briefly reverting the UI to stale data.
+    if (hasUsableDepth(current) && !hasUsableDepth(next)) continue
+    if (current && next.receivedAt < current.receivedAt) continue
+    merged[direction] = next
+  }
+  return merged
+}
+
 export class GateMarketData implements ReadOnlyVenueSource {
   readonly venueId = 'GATE'
   private monitoringEnabled = true
@@ -506,7 +532,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
         this.contexts.set(market.marketId, previous ? {
           ...previous,
           ...market,
-          outcomes: { ...previous.outcomes, ...market.outcomes },
+          outcomes: mergeOutcomeQuotes(previous.outcomes, market.outcomes),
           catalogOutcomeIds: { ...previous.catalogOutcomeIds, ...market.catalogOutcomeIds }
         } : market)
         for (const quote of Object.values(market.outcomes)) {
@@ -747,7 +773,6 @@ export class GateMarketData implements ReadOnlyVenueSource {
     const knownTokens = this.websocketMarketTokens.get(marketKey) ?? {}
     if (knownTokens.UP === tokenId) return { marketId: binding.marketId, direction: 'UP' }
     if (knownTokens.DOWN === tokenId) return { marketId: binding.marketId, direction: 'DOWN' }
-    const knownDirection = (Object.entries(knownTokens) as Array<[Direction, string | undefined]>).find(([, knownToken]) => Boolean(knownToken && knownToken !== tokenId))?.[0]
     const levels = askLevels(item)
     const bestAsk = Number(levels[0]?.price)
     const upAsk = Number(context.outcomes.UP?.bestAsk)
@@ -760,7 +785,10 @@ export class GateMarketData implements ReadOnlyVenueSource {
         inferredDirection = upDistance < downDistance ? 'UP' : 'DOWN'
       }
     }
-    if (!inferredDirection && knownDirection) inferredDirection = knownDirection === 'UP' ? 'DOWN' : 'UP'
+    // Do not infer a replacement token as the opposite of an old token. Gate
+    // can rotate both token IDs on reconnect, so that fallback occasionally
+    // inverted an otherwise valid 15m quote. Wait for a fresh price
+    // correlation instead; an unmapped frame is safer than a wrong side.
     if (!inferredDirection) return undefined
     this.outcomeToMarket.set(tokenId, { marketId: binding.marketId, direction: inferredDirection })
     const tokens = this.websocketMarketTokens.get(marketKey) ?? {}
@@ -798,12 +826,10 @@ export class GateMarketData implements ReadOnlyVenueSource {
     pair.tokens = pair.tokens.slice(-2)
     pair.updatedAt = receivedAt
     this.subscriptionTokensByMarket.set(marketId, pair)
-    const selectedDirection = urlContext({ pageUrl }).pageOutcomeDirection
-    if (selectedDirection) {
-      const oppositeDirection: Direction = selectedDirection === 'UP' ? 'DOWN' : 'UP'
-      if (pair.tokens[0]) this.outcomeToMarket.set(pair.tokens[0], { marketId, direction: selectedDirection })
-      if (pair.tokens[1]) this.outcomeToMarket.set(pair.tokens[1], { marketId, direction: oppositeDirection })
-    }
+    // The page's selected outcome is only a UI tab. Gate does not guarantee
+    // that subscription payload order follows that tab, especially after a
+    // reconnect/round roll. Defer token direction binding until a book price
+    // can be correlated with the event's UP/DOWN catalogue prices.
     while (this.subscriptionTokensByMarket.size > 32) {
       const oldest = this.subscriptionTokensByMarket.keys().next().value
       if (oldest) this.subscriptionTokensByMarket.delete(oldest)
@@ -821,14 +847,6 @@ export class GateMarketData implements ReadOnlyVenueSource {
     if (Number.isFinite(bestAsk)) {
       pair.bestAsks.set(tokenId, bestAsk)
       pair.books.set(tokenId, { levels: currentLevels, receivedAt })
-    }
-    for (const sibling of pair.tokens) {
-      if (sibling === tokenId) continue
-      const siblingContext = this.outcomeToMarket.get(sibling)
-      if (siblingContext?.marketId !== marketId) continue
-      const inferred = { marketId, direction: siblingContext.direction === 'UP' ? 'DOWN' as const : 'UP' as const }
-      this.outcomeToMarket.set(tokenId, inferred)
-      return inferred
     }
     const context = this.contexts.get(marketId)
     const upAsk = Number(context?.outcomes.UP?.bestAsk)

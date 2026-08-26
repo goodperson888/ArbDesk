@@ -467,7 +467,7 @@ describe('GateMarketData', () => {
     })
   })
 
-  it('keeps the page subscription directions when prices move beyond the REST correlation tolerance', async () => {
+  it('keeps the catalogue directions when websocket prices cannot be safely correlated', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-25T04:40:00.000Z'))
     const capture = new FakeGateCapture()
@@ -483,9 +483,10 @@ describe('GateMarketData', () => {
     capture.emitFrame({ result: { aid: 'moving-down-token', a: [['0.59', '70']], b: [] } }, { direction: 'RECEIVED', pageUrl })
 
     expect(source.getLatestWindows()[0].outcomes).toMatchObject({
-      UP: { outcomeId: 'moving-up-token', bestAsk: '0.42' },
-      DOWN: { outcomeId: 'moving-down-token', bestAsk: '0.59' }
+      UP: { outcomeId: 'ge_899852_3831000', bestAsk: '0.28' },
+      DOWN: { outcomeId: 'ge_899852_3831000', bestAsk: '0.73' }
     })
+    expect(source.getStatus().message).toContain('未映射2')
   })
 
   it('refreshes stream observation time when Gate sends an unchanged heartbeat frame', async () => {
@@ -551,6 +552,100 @@ describe('GateMarketData', () => {
 
     expect(source.getLatestWindows()[0].outcomes.UP).toMatchObject({ bestAsk: '0.51', askSize: '12' })
     expect(source.getLatestWindows()[0].outcomes.DOWN).toMatchObject({ bestAsk: '0.48', askSize: '13' })
+  })
+
+  it('prefers an explicit outcome label over an ambiguous numeric index', () => {
+    const parsed = parseGateMarketObject({
+      eventId: 'gate-index-label-conflict', event_name: 'BTC 15分钟涨或跌', period: '15m',
+      start_date: 1_787_488_200, end_date: 1_787_489_100,
+      outcomes: [
+        { id: 'label-up', index: 0, name: 'Up', asks: [[0.41, 10]] },
+        // Gate has emitted zero-based indices in this shape; index 1 is DOWN.
+        { id: 'label-down', index: 1, name: 'Down', asks: [[0.59, 11]] }
+      ]
+    }, Date.now())
+
+    expect(parsed?.outcomes).toMatchObject({
+      UP: { outcomeId: 'label-up', bestAsk: '0.41' },
+      DOWN: { outcomeId: 'label-down', bestAsk: '0.59' }
+    })
+  })
+
+  it('does not trust page tab order when subscribed Gate tokens arrive reversed', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-25T05:00:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-15m?eventId=899900&outcome=Up'
+    const wsUrl = 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web'
+    source.ingest(JSON.stringify({ data: {
+      id: '899900', event_name: 'BTC 15分钟涨或跌', crypto: 'btc', period: '15m',
+      start_date: 1_787_634_600, end_date: 1_787_635_500,
+      bullish: '0.28', bearish: '0.73'
+    } }), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/events/899900', pageUrl)
+
+    // Gate may send the DOWN token first even though the page tab is Up.
+    capture.emitFrame({ channel: 'predict.poly.orderbook', event: 'subscribe', payload: ['token-down-first'] }, { direction: 'SENT', pageUrl })
+    capture.emitFrame({ channel: 'predict.poly.orderbook', event: 'subscribe', payload: ['token-up-second'] }, { direction: 'SENT', pageUrl })
+    capture.emitFrame({ result: { aid: 'token-down-first', a: [['0.73', '20']], b: [] } }, { direction: 'RECEIVED', pageUrl })
+    capture.emitFrame({ result: { aid: 'token-up-second', a: [['0.28', '21']], b: [] } }, { direction: 'RECEIVED', pageUrl })
+
+    expect(source.getLatestWindows()[0].outcomes).toMatchObject({
+      UP: { outcomeId: 'token-up-second', bestAsk: '0.28' },
+      DOWN: { outcomeId: 'token-down-first', bestAsk: '0.73' }
+    })
+  })
+
+  it('does not let a late shallow event snapshot overwrite websocket depth', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-25T05:30:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-15m?eventId=899901&outcome=Up'
+    const wsUrl = 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web'
+    const event = {
+      data: { id: '899901', event_name: 'BTC 15分钟涨或跌', crypto: 'btc', period: '15m',
+        start_date: 1_787_636_400, end_date: 1_787_637_300,
+        bullish: '0.28', bearish: '0.73', clob_token_ids: ['stable-up', 'stable-down'] }
+    }
+    source.ingest(JSON.stringify(event), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/events/899901', pageUrl)
+    source.ingest(JSON.stringify({ result: { aid: 'stable-up', a: [['0.29', '40']], b: [] } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+    source.ingest(JSON.stringify({ result: { aid: 'stable-down', a: [['0.72', '41']], b: [] } }), Date.now(), 'WebSocket', wsUrl, pageUrl)
+
+    // A delayed catalogue response contains only shallow prices, not the
+    // current orderbook. It must not erase the live WS depth.
+    source.ingest(JSON.stringify(event), Date.now() + 5_000, 'REST', 'https://www.gate.com/apiw/v2/event-contract/events/899901', pageUrl)
+
+    expect(source.getLatestWindows()[0].outcomes).toMatchObject({
+      UP: { outcomeId: 'stable-up', bestAsk: '0.29', askSize: '40', levels: [{ price: '0.29', size: '40' }] },
+      DOWN: { outcomeId: 'stable-down', bestAsk: '0.72', askSize: '41', levels: [{ price: '0.72', size: '41' }] }
+    })
+  })
+
+  it('does not infer a rotated token as the opposite of an old token when prices drift', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-25T06:00:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    const pageUrl = 'https://www.gate.com/zh/trade-events/btc-updown-15m?eventId=899902&outcome=Up'
+    const wsUrl = 'wss://prediction-ws.gateio.ws/v1/ws/prediction/event-contract/web'
+    source.ingest(JSON.stringify({ data: {
+      id: '899902', event_name: 'BTC 15分钟涨或跌', crypto: 'btc', period: '15m',
+      start_date: 1_787_638_200, end_date: 1_787_639_100, bullish: '0.28', bearish: '0.73'
+    } }), Date.now(), 'REST', 'https://www.gate.com/apiw/v2/event-contract/events/899902', pageUrl)
+    capture.emitFrame({ channel: 'predict.poly.orderbook', event: 'subscribe', payload: ['old-up', 'old-down'] }, { direction: 'SENT', pageUrl })
+    capture.emitFrame({ result: { mk: 'shared-condition', aid: 'old-up', a: [['0.28', '10']], b: [] } }, { direction: 'RECEIVED', pageUrl })
+    capture.emitFrame({ result: { mk: 'shared-condition', aid: 'old-down', a: [['0.73', '11']], b: [] } }, { direction: 'RECEIVED', pageUrl })
+
+    // Both IDs rotate and the UP price has moved beyond the catalogue
+    // correlation tolerance. The new token must remain unmapped, not be
+    // guessed as DOWN from the old token cache.
+    capture.emitFrame({ result: { mk: 'shared-condition', aid: 'new-up', a: [['0.42', '12']], b: [] } }, { direction: 'RECEIVED', pageUrl })
+
+    expect(source.getLatestWindows()[0].outcomes.DOWN?.outcomeId).not.toBe('new-up')
   })
 
   it('counts event positions and orders only from passive account response URLs', async () => {
