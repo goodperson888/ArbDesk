@@ -180,7 +180,7 @@ export class AppController {
     await this.store.initialize()
     await this.executionSessionStore?.initialize()
     this.multiVenueExecutionHistory = await this.executionSessionStore?.listAll() ?? []
-    this.multiVenueExecutionSessions = this.multiVenueExecutionHistory.filter((session) => ['STARTED', 'RECOVERY_REQUIRED', 'RECONCILE_REQUIRED'].includes(session.status))
+    this.multiVenueExecutionSessions = this.multiVenueExecutionHistory.filter((session) => ['STARTED', 'UNPROTECTED_SUBMITTED', 'RECOVERY_REQUIRED', 'RECONCILE_REQUIRED'].includes(session.status))
     this.settings = await this.store.loadSettings(DEFAULT_SETTINGS)
     this.settings.manualExecutionConditions = defaultManualExecutionConditions(this.settings.manualExecutionConditions)
     this.settings.autoOpenEnabled = false

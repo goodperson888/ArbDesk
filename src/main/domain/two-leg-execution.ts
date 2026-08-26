@@ -161,9 +161,10 @@ export class TwoLegExecutionMachine {
     if (!quantity.isFinite() || quantity.lt(1)) throw new Error('双腿执行数量必须至少为 1 份')
     const stopBeforeExpirySeconds = request.stopBeforeExpirySeconds ?? 20
     const maxQuoteAgeMs = request.maxQuoteAgeMs ?? MAX_QUOTE_AGE_MS
+    const requireFreshQuotes = request.executionPolicy !== 'PARALLEL_UNPROTECTED'
     if (request.endTime - Date.now() < stopBeforeExpirySeconds * 1_000) throw new Error(`市场距离结算不足 ${stopBeforeExpirySeconds} 秒，已拒绝双腿下单`)
     for (const leg of request.legs) {
-      if (!Number.isFinite(leg.quoteAgeMs) || leg.quoteAgeMs > maxQuoteAgeMs) throw new Error(`${leg.venueId} 行情已过期，已拒绝双腿下单`)
+      if (requireFreshQuotes && (!Number.isFinite(leg.quoteAgeMs) || leg.quoteAgeMs > maxQuoteAgeMs)) throw new Error(`${leg.venueId} 行情已过期，已拒绝双腿下单`)
       if (!leg.marketId || !leg.outcomeId) throw new Error(`${leg.venueId} 缺少市场或结果 ID`)
     }
     const firstIndex = request.firstLegIndex ?? 0

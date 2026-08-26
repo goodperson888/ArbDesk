@@ -9,6 +9,7 @@ import type { MexcBrowserManager } from './services/mexc-browser'
 import type { PolymarketBroker, HedgeOrder } from './services/polymarket'
 import type { PolymarketMarketData } from './services/polymarket-market-data'
 import type { PolymarketLiveBroker, PolymarketTradingCapacity } from './services/polymarket-live'
+import { ExecutionSessionStore } from './services/execution-session-store'
 
 const temporaryDirectories: string[] = []
 
@@ -24,7 +25,8 @@ async function createAssistedExecutionController(
   hedge: PolymarketBroker['hedge'],
   readbackFill?: Fill,
   confirmOutcomeQuote?: PolymarketMarketData['confirmOutcomeQuote'],
-  prepareOrderResult?: Partial<Awaited<ReturnType<MexcBrowserManager['prepareOrder']>>>
+  prepareOrderResult?: Partial<Awaited<ReturnType<MexcBrowserManager['prepareOrder']>>>,
+  withExecutionSessionStore = false
 ): Promise<AppController> {
   const directory = await mkdtemp(join(tmpdir(), 'arbdesk-partial-hedge-test-'))
   temporaryDirectories.push(directory)
@@ -78,7 +80,12 @@ async function createAssistedExecutionController(
     ensureTradingCapacity: async () => ({ checkedAt: Date.now(), collateralBalance: '100', allowanceReady: true, closedOnly: false }),
     hedge
   } as unknown as PolymarketLiveBroker
-  const controller = new AppController(new EventStore(directory), mexcBrowser, polymarketData, liveBroker)
+  const controller = withExecutionSessionStore
+    ? new AppController(
+        new EventStore(directory), mexcBrowser, polymarketData, liveBroker,
+        process.env.ARB_ENABLE_LIVE_EXECUTION === 'true', undefined, new ExecutionSessionStore(directory)
+      )
+    : new AppController(new EventStore(directory), mexcBrowser, polymarketData, liveBroker)
   await controller.initialize()
   await controller.updateSettings({ mode: 'ASSISTED', polymarketLiveEnabled: true })
   await controller.refreshOpportunities()
@@ -993,6 +1000,28 @@ describe('AppController simulation', () => {
     expect(hedge.mock.calls[0][0].maximumPrice).toBe('0.9900')
     expect(session.state).toBe('HEDGED')
     expect(Number(session.polymarketFill?.quantity)).toBe(10)
+  })
+
+  it('keeps an unprotected multi-venue submission visible for manual fill verification', async () => {
+    vi.stubEnv('ARB_ENABLE_LIVE_EXECUTION', 'true')
+    const controller = await createAssistedExecutionController(async (order) => ({
+      venue: 'POLYMARKET', direction: order.direction, quantity: order.quantity,
+      averagePrice: '0.50', orderId: 'unused', filledAt: Date.now()
+    }), undefined, undefined, undefined, true)
+
+    await controller.recordMultiVenueReceipt({
+      sessionId: 'parallel-controller', comparisonId: 'gate-kalshi', status: 'UNPROTECTED_SUBMITTED',
+      firstLeg: { venueId: 'GATE', direction: 'UP', requestedQuantity: '13', filledQuantity: '0', orderId: 'gate-order', status: 'SUBMITTED' },
+      secondLeg: { venueId: 'KALSHI', direction: 'DOWN', requestedQuantity: '13', filledQuantity: '13', orderId: 'kalshi-order', status: 'FILLED' },
+      message: '无保护双边已提交，成交待核对'
+    })
+
+    const snapshot = controller.getSnapshot()
+    expect(snapshot.multiVenueExecutionSessions).toEqual([
+      expect.objectContaining({ sessionId: 'parallel-controller', status: 'UNPROTECTED_SUBMITTED' })
+    ])
+    expect(snapshot.recentEvents[0]).toMatchObject({ state: 'RECOVERY_REQUIRED' })
+    expect(snapshot.recentEvents[0].message).toContain('成交待核对')
   })
 
   it('does not expose or block on a recovery session after its market has expired', async () => {

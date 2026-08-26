@@ -15,7 +15,7 @@ function isSession(value: unknown): value is MultiVenueExecutionSession {
   const session = value as Partial<MultiVenueExecutionSession>
   return typeof session.sessionId === 'string' && typeof session.comparisonId === 'string' &&
     typeof session.createdAt === 'number' && typeof session.updatedAt === 'number' &&
-    ['STARTED', 'HEDGED', 'RECOVERY_REQUIRED', 'RECONCILE_REQUIRED', 'CANCELED', 'RECOVERED'].includes(String(session.status))
+    ['STARTED', 'HEDGED', 'UNPROTECTED_SUBMITTED', 'RECOVERY_REQUIRED', 'RECONCILE_REQUIRED', 'CANCELED', 'RECOVERED'].includes(String(session.status))
 }
 
 function statusForReceipt(receipt: MultiVenueExecutionReceipt): MultiVenueExecutionSessionStatus {
@@ -53,7 +53,7 @@ export class ExecutionSessionStore {
 
   async listUnfinished(): Promise<MultiVenueExecutionSession[]> {
     const sessions = await this.listAll()
-    return sessions.filter((session) => session.status === 'STARTED' || session.status === 'RECOVERY_REQUIRED' || session.status === 'RECONCILE_REQUIRED')
+    return sessions.filter((session) => session.status === 'STARTED' || session.status === 'UNPROTECTED_SUBMITTED' || session.status === 'RECOVERY_REQUIRED' || session.status === 'RECONCILE_REQUIRED')
   }
 
   async begin(sessionId: string, comparisonId: string): Promise<MultiVenueExecutionSession> {

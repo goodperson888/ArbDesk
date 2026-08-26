@@ -116,6 +116,63 @@ describe('multi-venue Kalshi execution', () => {
     expect((mocked.kalshi.placeOrder.mock.calls[0] as unknown as [Record<string, string>])[0]).toMatchObject({ quantity: '13.00' })
   })
 
+  it('uses the global unprotected setting to start equal Gate and Kalshi submissions in parallel', async () => {
+    const mocked = deps()
+    type GateResult = Awaited<ReturnType<typeof mocked.gate.submit>>
+    type KalshiResult = Awaited<ReturnType<typeof mocked.kalshi.placeOrder>>
+    let resolveGate!: (result: GateResult) => void
+    let resolveKalshi!: (result: KalshiResult) => void
+    mocked.gate.submit.mockImplementation(() => new Promise<GateResult>((resolve) => { resolveGate = resolve }))
+    mocked.kalshi.placeOrder.mockImplementation(() => new Promise<KalshiResult>((resolve) => { resolveKalshi = resolve }))
+    const latest = comparison()
+    const service = new MultiVenueExecutionService({
+      ...mocked,
+      settings: () => settings({ unprotectedExecutionEnabled: true }),
+      liveExecutionEnabled: true,
+      comparisonProvider: () => latest
+    } as never)
+
+    const execution = service.execute({ comparisonId: latest.id, quantity: '13.00', confirmed: true })
+    await vi.waitFor(() => expect(mocked.gate.submit).toHaveBeenCalledTimes(1))
+    await Promise.resolve()
+    const kalshiStartedBeforeGateResolved = mocked.kalshi.placeOrder.mock.calls.length === 1
+    resolveGate({ orderId: 'gate-parallel', status: 'FILLED', filledQuantity: '13.00', averagePrice: '0.40' })
+    if (!kalshiStartedBeforeGateResolved) await vi.waitFor(() => expect(mocked.kalshi.placeOrder).toHaveBeenCalledTimes(1))
+    resolveKalshi({
+      orderId: 'kalshi-parallel', clientOrderId: 'kalshi-client', ticker: 'KXBTC15M-TEST',
+      direction: 'DOWN', side: 'ask', quantity: '13.00', outcomePrice: '0.50',
+      fillCount: '13.00', remainingCount: '0.00', status: 'EXECUTED', submittedAt: Date.now(), message: 'filled'
+    })
+    const receipt = await execution
+
+    expect(kalshiStartedBeforeGateResolved).toBe(true)
+    expect(receipt.status).toBe('UNPROTECTED_SUBMITTED')
+    expect((mocked.gate.submit.mock.calls[0] as unknown as [Record<string, string>])[0].quantity).toBe('13.00')
+    expect((mocked.kalshi.placeOrder.mock.calls[0] as unknown as [Record<string, string>])[0].quantity).toBe('13.00')
+  })
+
+  it('unprotected multi-venue execution bypasses depth, freshness, fee and settlement gates', async () => {
+    const mocked = deps()
+    const latest = comparison({
+      edgeKind: 'GROSS_ONLY',
+      matchClass: 'CONDITIONAL',
+      conditionalReturnPct: '-20',
+      legs: comparison().legs.map((leg) => ({ ...leg, availableQuantity: '0', quoteAgeMs: 30_000 }))
+    })
+    const service = new MultiVenueExecutionService({
+      ...mocked,
+      settings: () => settings({ unprotectedExecutionEnabled: true, minConditionalReturnPct: '100' }),
+      liveExecutionEnabled: true,
+      comparisonProvider: () => latest
+    } as never)
+
+    const receipt = await service.execute({ comparisonId: latest.id, quantity: '13.00', confirmed: true })
+
+    expect(receipt.status).toBe('UNPROTECTED_SUBMITTED')
+    expect(mocked.gate.submit).toHaveBeenCalledTimes(1)
+    expect(mocked.kalshi.placeOrder).toHaveBeenCalledTimes(1)
+  })
+
   it('treats a two-decimal Kalshi fill as complete after a higher-precision Gate fill is rounded down', async () => {
     const mocked = deps()
     mocked.gate.submit.mockResolvedValueOnce({ orderId: 'gate-precision-order', status: 'FILLED' as const, filledQuantity: '7.192', averagePrice: '0.74' })

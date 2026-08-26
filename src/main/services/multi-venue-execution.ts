@@ -68,6 +68,7 @@ export class MultiVenueExecutionService {
       const comparison = this.dependencies.comparisonProvider(command.comparisonId)
       if (!comparison) throw new Error('机会已变化或不再存在，请重新选择后下单')
       if (comparison.executionProvider !== 'MULTI_VENUE' || comparison.legs.length !== 2) throw new Error('当前机会不是可执行的多平台双腿路线')
+      const unprotected = settings.unprotectedExecutionEnabled === true
       const requestLegs: [MultiVenueExecutionLegRequest, MultiVenueExecutionLegRequest] = [
         { ...comparison.legs[0] },
         { ...comparison.legs[1] }
@@ -89,7 +90,18 @@ export class MultiVenueExecutionService {
         matchClass: comparison.matchClass, endTime: comparison.endTime, now: Date.now(),
         maxCapitalPerTrade: settings.maxCapitalPerTrade, minConditionalReturnPct: settings.minConditionalReturnPct,
         maxQuoteAgeMs: settings.maxQuoteAgeMs, stopBeforeExpirySeconds: settings.stopBeforeExpirySeconds,
-        manualConditions: settings.manualExecutionConditions, executionIdle: true,
+        manualConditions: unprotected
+          ? {
+              ...settings.manualExecutionConditions,
+              conditionalReturn: false,
+              feeVerification: false,
+              settlementRisk: false,
+              quoteFreshness: false,
+              expiryCutoff: true
+            }
+          : settings.manualExecutionConditions,
+        executionIdle: true,
+        depthLimitApplicable: !unprotected,
         readiness: [
           { id: 'kalshi-credentials', label: 'Kalshi 本地身份已配置', passed: kalshiCredentialsReady, blockReason: '请先配置 Kalshi API Key ID 与 RSA 私钥' },
           { id: 'kalshi-live', label: 'Kalshi 实盘开关已开启', passed: settings.kalshiLiveEnabled === true, blockReason: '请先开启 Kalshi 人工实盘下单开关' },
@@ -118,7 +130,7 @@ export class MultiVenueExecutionService {
         sessionId,
         legs: [first, second],
         firstLegIndex: 0,
-        executionPolicy: 'SEQUENTIAL_FILL_THEN_HEDGE'
+        executionPolicy: unprotected ? 'PARALLEL_UNPROTECTED' : 'SEQUENTIAL_FILL_THEN_HEDGE'
       }
       const receipt = await this.machine.execute(orderedRequest, this.adapters)
       await this.dependencies.executionSessionStore?.recordReceipt(receipt)

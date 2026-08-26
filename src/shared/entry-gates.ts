@@ -42,6 +42,7 @@ export interface EntryGateInput {
   legs: EntryGateLeg[]
   feeVerificationApplicable?: boolean
   settlementRiskApplicable?: boolean
+  depthLimitApplicable?: boolean
 }
 
 export interface EntryGateCheck {
@@ -90,8 +91,8 @@ export function entryGateMinimumQuantity(legs: EntryGateLeg[]): Decimal {
   return legs.reduce((maximum, leg) => Decimal.max(maximum, legMinimumQuantity(leg)), new Decimal(0))
 }
 
-function hardCheck(id: string, passed: boolean, label: string, blockReason: string): EntryGateCheck {
-  return { id, passed, label, blockReason, applicable: true, locked: true, enabled: true }
+function hardCheck(id: string, passed: boolean, label: string, blockReason: string, applicable = true): EntryGateCheck {
+  return { id, passed, label, blockReason, applicable, locked: true, enabled: applicable }
 }
 
 function configurableCheck(
@@ -145,7 +146,7 @@ export function evaluateEntryGates(input: EntryGateInput): EntryGateReport {
   const checks: EntryGateCheck[] = [
     hardCheck('quantity-positive', quantityPositive, `输入份额 ${quantityPositive ? quantity.toFixed(2) : input.quantity || '0'} > 0`, '请输入大于 0 的双腿份额'),
     hardCheck('minimum-order', minimumPassed, `最小委托：输入 ${quantityPositive ? quantity.toFixed(2) : '0.00'} 份；${minimumDetail}`, `${minimumDetail}，当前输入不足`),
-    hardCheck('depth-limit', depthPassed, `盘口深度：输入 ${quantityPositive ? quantity.toFixed(2) : '0.00'} ≤ ${finiteFixed(depth, 2)} 份`, `输入份额超过当前任一平台盘口深度 ${finiteFixed(depth, 2)} 份`),
+    hardCheck('depth-limit', depthPassed, `盘口深度：输入 ${quantityPositive ? quantity.toFixed(2) : '0.00'} ≤ ${finiteFixed(depth, 2)} 份`, `输入份额超过当前任一平台盘口深度 ${finiteFixed(depth, 2)} 份`, input.depthLimitApplicable !== false),
     hardCheck('capital-limit', capitalPassed, `预计本金 $${finiteFixed(capital, 2)} ≤ $${finiteFixed(capitalLimit, 2)}`, `预计本金 $${finiteFixed(capital, 2)} 超过单笔上限 $${finiteFixed(capitalLimit, 2)}`),
     hardCheck('market-identity', identityPassed, identityPassed ? '两条腿市场身份完整' : '至少一条腿缺少市场或结果 ID', '市场身份不完整，未发送订单'),
     ...input.readiness.map((item) => hardCheck(item.id, item.passed, item.label, item.blockReason)),

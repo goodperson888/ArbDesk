@@ -38,6 +38,24 @@ describe('execution session store', () => {
     expect((await store.listUnfinished()).map((session) => session.sessionId)).toEqual([])
   })
 
+  it('persists unprotected submissions as unfinished until the user verifies fills', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'arbdesk-sessions-unprotected-'))
+    const store = new ExecutionSessionStore(directory)
+    await store.initialize()
+    await store.begin('parallel-session', 'parallel-route')
+    await store.recordReceipt({
+      sessionId: 'parallel-session', comparisonId: 'parallel-route', status: 'UNPROTECTED_SUBMITTED',
+      firstLeg: { venueId: 'GATE', direction: 'UP', requestedQuantity: '13', filledQuantity: '0', orderId: 'gate-order', status: 'SUBMITTED' },
+      secondLeg: { venueId: 'KALSHI', direction: 'DOWN', requestedQuantity: '13', filledQuantity: '13', orderId: 'kalshi-order', status: 'FILLED' },
+      message: '无保护双边已提交，成交待核对'
+    })
+
+    const [session] = await store.listUnfinished()
+    expect(session.status).toBe('UNPROTECTED_SUBMITTED')
+    expect(session.receipt?.secondLeg?.orderId).toBe('kalshi-order')
+    expect(session.recoveryNote).toContain('成交待核对')
+  })
+
   it('ignores corrupt records instead of failing startup', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'arbdesk-sessions-corrupt-'))
     const store = new ExecutionSessionStore(directory)
