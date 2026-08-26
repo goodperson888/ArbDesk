@@ -19,6 +19,7 @@ export function gateDurationExecutionReady(summary: GateOrderCaptureSummary | un
 }
 
 export function buildMultiVenueEntryGateReport(args: MultiVenueEntryGateArgs): EntryGateReport {
+  const unprotected = args.settings.mode === 'ASSISTED' && args.settings.unprotectedExecutionEnabled === true
   const kalshi = args.comparison.legs.find((leg) => leg.venueId === 'KALSHI')
   const other = args.comparison.legs.find((leg) => leg.venueId !== 'KALSHI')
   const supportedRoute = Boolean(kalshi && other && ['MEXC', 'POLYMARKET', 'GATE'].includes(other.venueId))
@@ -42,7 +43,18 @@ export function buildMultiVenueEntryGateReport(args: MultiVenueEntryGateArgs): E
     matchClass: args.comparison.matchClass, endTime: args.comparison.endTime, now: args.now,
     maxCapitalPerTrade: args.settings.maxCapitalPerTrade, minConditionalReturnPct: args.settings.minConditionalReturnPct,
     maxQuoteAgeMs: args.settings.maxQuoteAgeMs, stopBeforeExpirySeconds: args.settings.stopBeforeExpirySeconds,
-    manualConditions: args.settings.manualExecutionConditions, executionIdle: args.executionIdle,
+    manualConditions: unprotected
+      ? {
+          ...args.settings.manualExecutionConditions,
+          conditionalReturn: false,
+          feeVerification: false,
+          settlementRisk: false,
+          quoteFreshness: false,
+          expiryCutoff: true
+        }
+      : args.settings.manualExecutionConditions,
+    executionIdle: args.executionIdle,
+    depthLimitApplicable: !unprotected,
     readiness,
     legs: args.comparison.legs.map((leg) => ({
       ...leg,

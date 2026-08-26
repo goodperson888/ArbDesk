@@ -62,6 +62,21 @@ describe('multi venue entry gate adapter', () => {
     expect(tooSmall.checks.find((check) => check.id === 'minimum-order')?.locked).toBe(true)
   })
 
+  it('全局无保护模式忽略深度和经济风控但保留最低金额', () => {
+    const risky = comparison({
+      matchClass: 'CONDITIONAL', conditionalReturnPct: '-20',
+      legs: comparison().legs.map((leg) => ({ ...leg, availableQuantity: '0', quoteAgeMs: 30_000 }))
+    })
+    const unprotected = report({
+      comparison: risky,
+      settings: settings({ unprotectedExecutionEnabled: true, minConditionalReturnPct: '100' })
+    })
+
+    expect(unprotected.allowed).toBe(true)
+    expect(unprotected.checks.find((check) => check.id === 'depth-limit')?.applicable).toBe(false)
+    expect(unprotected.checks.find((check) => check.id === 'minimum-order')?.locked).toBe(true)
+  })
+
   it('把 Kalshi 凭据、Gate 捕获结构和人工监督模式作为硬条件', () => {
     expect(report({ kalshiReady: false }).firstBlockReason).toContain('Kalshi')
     expect(report({ gateReady: false }).firstBlockReason).toContain('Gate')

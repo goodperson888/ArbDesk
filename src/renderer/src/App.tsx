@@ -71,9 +71,10 @@ import type { MultiVenueComparison, MultiVenueComparisonStatus, MultiVenueExecut
 import type { EntryGateCheck } from '../../shared/entry-gates'
 import { defaultSettlementDistanceRules } from '../../shared/defaults'
 import { buildMultiVenueEntryGateReport, gateDurationExecutionReady } from './multi-venue-entry-gates'
+import { MULTI_VENUE_TABLE_COLUMNS, multiVenueExecuteLabel, multiVenueReceiptStatusLabel } from './opportunity-table'
 import { selectReadyComparisons, shouldPlayOpportunityAlert } from './opportunity-alert'
 import { undismissedRecoverySessions } from './recovery-banner'
-import { routeDirectionLabel, stableRouteKey } from './route-display'
+import { stableRouteKey } from './route-display'
 
 interface SettlementRuleDraft {
   id: string
@@ -180,14 +181,6 @@ function marketWindowLabel(startTime: number, endTime: number): string {
   return `${format(startTime)}–${format(endTime)}`
 }
 
-function matchClassLabel(matchClass: MultiVenueComparison['matchClass']): string {
-  if (matchClass === 'EXACT') return '结算规则一致'
-  if (matchClass === 'COVERED') return '结算范围覆盖'
-  if (matchClass === 'CONDITIONAL') return '结算规则有差异'
-  if (matchClass === 'CORRELATED') return '仅相关市场'
-  return '市场不兼容'
-}
-
 function cycleStateLabel(state: VenueCycleDataState): string {
   if (state === 'DEPTH_READY') return '深度'
   if (state === 'PRICE_ONLY') return '价格'
@@ -268,19 +261,6 @@ function grossComparisonStatusLabel(status: MultiVenueComparisonStatus): string 
   if (status === 'STALE') return '行情过期'
   if (status === 'BLOCKED') return '深度不足 / 暂不可下单'
   return comparisonStatusLabel(status)
-}
-
-function grossComparisonNotice(status: MultiVenueComparisonStatus): string {
-  if (status === 'MANUAL_EXECUTABLE') return '这条路线已接入受限双腿人工执行；两腿不能原子成交，任一腿失败会进入恢复态。未知深度不参与可执行量或利润计算。'
-  if (status === 'STALE') return 'Gate↔Kalshi 双腿下单已经接入，但当前至少一腿行情超过新鲜度门槛；等待两边盘口恢复后才允许下单。'
-  if (status === 'BLOCKED') return 'Gate↔Kalshi 双腿连接器已经接入，但当前至少一腿没有可执行深度，暂时不能安全确定下单份额。'
-  return '这条路线可用于观察和比价，但当前未通过真实下单门槛。'
-}
-
-function grossComparisonActionLabel(status: MultiVenueComparisonStatus): string {
-  if (status === 'STALE') return '行情过期 · 暂不下单'
-  if (status === 'BLOCKED') return '深度不足 · 暂不下单'
-  return '只读观察 · 暂不支持下单'
 }
 
 function comparisonLegLabel(comparison: MultiVenueComparison, index: number): string {
@@ -811,12 +791,19 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   // 待恢复会话不阻塞新开仓；真正执行中的旧路线仍保持互斥。
   const recoveryPending = snapshot?.activeSession?.state === 'RECOVERY_REQUIRED'
   const executionSessionIdle = !snapshot?.activeSession || ['HEDGED', 'CANCELLED', 'RECOVERY_REQUIRED'].includes(snapshot.activeSession.state)
+  const unprotectedMode = Boolean(snapshot?.settings.unprotectedExecutionEnabled && snapshot.settings.mode === 'ASSISTED')
+  const multiVenueAllInCost = Number(selectedComparison?.allInCostPerShare ?? 0)
+  const unprotectedCapitalQuantity = multiVenueAllInCost > 0
+    ? Number(snapshot?.settings.maxCapitalPerTrade ?? 0) / multiVenueAllInCost
+    : 0
   const multiVenueMaxQuantity = selectedComparison && selectedKalshiLeg && selectedOtherVenueLeg
-    ? Math.floor(Math.min(
-      Number(selectedComparison.executableQuantity),
-      Number(selectedKalshiLeg.availableQuantity),
-      Number(selectedOtherVenueLeg.availableQuantity)
-    ) * 100) / 100
+    ? Math.floor((unprotectedMode
+      ? unprotectedCapitalQuantity
+      : Math.min(
+          Number(selectedComparison.executableQuantity),
+          Number(selectedKalshiLeg.availableQuantity),
+          Number(selectedOtherVenueLeg.availableQuantity)
+        )) * 100) / 100
     : 0
   const multiVenueRequestedQuantity = Number(multiVenueQuantity)
   const multiVenueGateMinimumQuantity = selectedGateLeg && Number(selectedGateLeg.price) > 0
@@ -824,7 +811,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     : 0
   const multiVenueMinimumQuantity = selectedGateLeg ? Math.max(1, multiVenueGateMinimumQuantity) : 1
   const multiVenueRequestedCapital = selectedComparison && Number.isFinite(multiVenueRequestedQuantity)
-    ? Number(selectedComparison.allInCostPerShare) * multiVenueRequestedQuantity
+    ? multiVenueAllInCost * multiVenueRequestedQuantity
     : 0
   const opportunityById = useMemo(() => new Map(
     snapshot?.opportunities.map((opportunity) => [opportunity.id, opportunity]) ?? []
@@ -941,7 +928,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const manualConditions = snapshot?.settings.manualExecutionConditions
   const manualConditionEnabled = (condition: keyof ManualExecutionConditions): boolean => manualConditions?.[condition] !== false
   const manualRiskOverrideActive = Boolean(manualConditions && Object.values(manualConditions).some((enabled) => !enabled))
-  const unprotectedMode = Boolean(snapshot?.settings.unprotectedExecutionEnabled && snapshot.settings.mode === 'ASSISTED')
   const executionPlanBlockReason = currentPlan?.blockReason?.includes('最低条件收益率')
     ? `保护价内盘口有${currentPlan.marketDepthQuantity}份，但滑点后条件收益率${money(effectiveConditionalReturn, 2)}%低于设置的${money(String(snapshot?.settings.minConditionalReturnPct ?? 0), 2)}%`
     : currentPlan?.blockReason
@@ -1407,11 +1393,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       return
     }
     const requestedQuantity = Number(multiVenueQuantity)
-    const maxQuantity = Math.floor(Math.min(
-      Number(selectedComparison.executableQuantity),
-      Number(selectedKalshiLeg.availableQuantity),
-      Number(otherLeg.availableQuantity)
-    ) * 100) / 100
+    const maxQuantity = multiVenueMaxQuantity
     if (!Number.isFinite(requestedQuantity) || requestedQuantity < 1) {
       setMessage('请输入至少 1 份的双腿执行数量，未发送订单')
       return
@@ -1421,12 +1403,14 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       return
     }
     if (!Number.isFinite(maxQuantity) || maxQuantity < 1) {
-      setMessage('两边盘口不足 1 份，未发送双腿订单')
+      setMessage(unprotectedMode ? '单笔本金上限不足以提交 1 份双腿订单' : '两边盘口不足 1 份，未发送双腿订单')
       return
     }
     const orderQuantity = Math.floor(requestedQuantity * 100) / 100
     if (orderQuantity > maxQuantity) {
-      setMessage(`输入 ${orderQuantity.toFixed(2)} 份超过当前两边可执行上限 ${maxQuantity.toFixed(2)} 份`)
+      setMessage(unprotectedMode
+        ? `输入 ${orderQuantity.toFixed(2)} 份超过单笔本金上限可支持的 ${maxQuantity.toFixed(2)} 份`
+        : `输入 ${orderQuantity.toFixed(2)} 份超过当前两边可执行上限 ${maxQuantity.toFixed(2)} 份`)
       return
     }
     const request: MultiVenueExecutionCommand = {
@@ -1576,7 +1560,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   async function toggleUnprotectedExecution(): Promise<void> {
     if (!snapshot) return
     const enabling = !snapshot.settings.unprotectedExecutionEnabled
-    if (enabling && !window.confirm('无保护模式：MEXC点击被接受后立即全量并行提交Polymarket FAK（限价0.99），不等成交回报、不校验滑点/收益/结算信号门槛。单腿失败会产生裸敞口，成交价可能很差，不保证锁利。仅保留单笔本金上限。确认开启？')) return
+    if (enabling && !window.confirm('全局无保护模式：MEXC/Polymarket使用原极速逻辑；Gate/Kalshi按输入份额同时提交两边，不等待首腿成交、不按实际成交量对齐，并跳过深度、滑点、收益和结算门槛。单腿失败或成交数量不同会产生裸敞口，程序不会自动补单或重试。确认开启？')) return
     const result = await run(() => window.arbApp.updateSettings({ unprotectedExecutionEnabled: enabling }),
       enabling ? '无保护极速模式已开启' : '无保护极速模式已关闭')
     if (result && snapshot) setSnapshot({ ...snapshot, settings: result })
@@ -1905,11 +1889,11 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
             <div className="table-wrap">
               <table>
                 <thead>
-                  <tr><th>标的/窗口</th><th>路线/方向</th><th>第一腿</th><th>第二腿</th><th>净边际/份</th><th title="实盘路线显示可执行量；只读路线仅显示已确认的参考深度">数量/深度</th><th>预计净利润</th><th>剩余</th><th>状态</th></tr>
+                  <tr>{MULTI_VENUE_TABLE_COLUMNS.map((column) => <th key={column.id}>{column.label}</th>)}</tr>
                 </thead>
                 <tbody>
                   {orderedComparisonRows.length === 0 && (
-                    <tr><td colSpan={9}><div className="empty-state">当前筛选下暂无真实跨平台报价。{snapshot.connectionDetails.polymarket}</div></td></tr>
+                    <tr><td colSpan={MULTI_VENUE_TABLE_COLUMNS.length}><div className="empty-state">当前筛选下暂无真实跨平台报价。{snapshot.connectionDetails.polymarket}</div></td></tr>
                   )}
                   {orderedComparisonRows.map(({ comparison, opportunity }) => {
                     const positive = opportunity
@@ -1919,14 +1903,14 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                     const isBest = comparison.id === bestComparison?.id
                     const firstLeg = comparison.legs[0]
                     const secondLeg = comparison.legs[1]
+                    const unprotectedReady = !opportunity && unprotectedMode && multiVenueEntryReports.get(comparison.id)?.allowed === true
                     return (
                       <tr key={stableRouteKey(comparison)} className={['opportunity-row', positive ? 'ready' : '', isBest ? 'best' : '', isSelected ? 'selected' : '', opportunity ? '' : comparison.status === 'MANUAL_EXECUTABLE' ? 'manual-executable' : 'read-only'].filter(Boolean).join(' ')} onClick={() => selectComparison(comparison)} tabIndex={0} aria-selected={isSelected} onKeyDown={(event) => {
                         if (event.key !== 'Enter' && event.key !== ' ') return
                         event.preventDefault()
                         selectComparison(comparison)
                       }}>
-                        <td><span className="market-window-cell"><span><span className="duration-pill">{comparison.durationMinutes}m</span>{isBest && <span className="best-badge">最佳</span>}{comparison.edgeKind === 'GROSS_ONLY' && <span className="best-badge">只读</span>}</span><small>{comparison.asset.replace('/USD', '')} · {marketWindowLabel(comparison.startTime, comparison.endTime)}</small></span></td>
-                        <td><span className="route-direction-cell"><strong>{routeDirectionLabel(comparison)}</strong><small>{comparison.executionProvider === 'LEGACY_MEXC_POLY' ? '成熟兼容路线' : comparison.status === 'MANUAL_EXECUTABLE' ? '双腿待确认' : '观察路线'}</small></span></td>
+                        <td><span className="market-window-cell"><span><span className="duration-pill">{comparison.durationMinutes}m</span>{isBest && <span className="best-badge">最佳</span>}</span><small>{comparison.asset.replace('/USD', '')} · {marketWindowLabel(comparison.startTime, comparison.endTime)}</small></span></td>
                         <td><span className="venue-leg"><strong>{firstLeg?.venueLabel ?? '—'}</strong><span className="quote-inline">{firstLeg && <Direction direction={firstLeg.direction} />}<span className="mono">{firstLeg && Number(firstLeg.price) > 0 ? money(firstLeg.price, 4) : '--'}</span>{firstLeg && Number(firstLeg.price) > 0 && !(Number(firstLeg.availableQuantity) > 0) && <span className="price-only-badge" title="已拿到最优价格，真实盘口深度尚未捕获">仅价</span>}</span></span></td>
                         <td><span className="venue-leg"><strong>{secondLeg?.venueLabel ?? '—'}</strong><span className="quote-inline">{secondLeg && <Direction direction={secondLeg.direction} />}<span className="mono">{secondLeg && Number(secondLeg.price) > 0 ? money(secondLeg.price, 4) : '--'}</span>{secondLeg && Number(secondLeg.price) > 0 && !(Number(secondLeg.availableQuantity) > 0) && <span className="price-only-badge" title="已拿到最优价格，真实盘口深度尚未捕获">仅价</span>}</span></span></td>
                         <td><span className="edge-cell" title={comparison.edgeKind === 'GROSS_ONLY' ? comparison.blockReasons.join('；') : opportunity?.feeVerificationBlocked ? '费用待校验' : opportunity?.settlementRiskBlocked ? '风控拦截' : positive ? '当前可执行' : '未通过全部执行门槛'}>
@@ -1935,12 +1919,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                           </span>
                           {!positive && <AlertTriangle aria-hidden="true" />}
                         </span></td>
-                        <td className="mono">{comparison.edgeKind === 'GROSS_ONLY'
-                          ? Number(comparison.executableQuantity) > 0 ? `参考 ${money(comparison.executableQuantity, 2)}` : '—'
-                          : money(comparison.executableQuantity, 2)}</td>
                         <td><span className={positive ? 'positive-value' : 'negative-value'}>{comparison.edgeKind === 'GROSS_ONLY' ? '—' : `${positive ? '+' : ''}${money(displayedProfit(comparison), 2)}`}</span></td>
                         <td className="mono countdown">{secondsRemaining(comparison.endTime, now)}</td>
-                        <td><span className={`comparison-status ${comparison.status.toLowerCase()}`} title={comparison.blockReasons.join('；') || '当前通过展示层机会检查'}>{comparison.edgeKind === 'GROSS_ONLY' ? grossComparisonStatusLabel(comparison.status) : comparisonStatusLabel(comparison.status)}</span></td>
+                        <td><span className={`comparison-status ${unprotectedReady ? 'manual_executable' : comparison.status.toLowerCase()}`} title={comparison.blockReasons.join('；') || '当前通过展示层机会检查'}>{unprotectedReady ? '无保护可执行' : comparison.edgeKind === 'GROSS_ONLY' ? grossComparisonStatusLabel(comparison.status) : comparisonStatusLabel(comparison.status)}</span></td>
+                        <td className="all-in-cost-cell mono"><strong>{money(comparison.allInCostPerShare, 4)}</strong><small>/ 份</small></td>
                       </tr>
                     )
                   })}
@@ -1954,12 +1936,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
         <aside className="order-ticket panel" aria-label="执行面板">
           {selectedComparison ? (
             <>
-              <section className="ticket-market-summary">
-                <div className="ticket-summary-heading">
-                  <span><span className="duration-pill">{selectedComparison.durationMinutes}m</span><span className={`comparison-status ${selectedComparison.status.toLowerCase()}`}>{selectedComparison.edgeKind === 'GROSS_ONLY' ? grossComparisonStatusLabel(selectedComparison.status) : comparisonStatusLabel(selectedComparison.status)}</span></span>
-                  <small>{matchClassLabel(selectedComparison.matchClass)}</small>
-                </div>
-                <h2>{selectedComparison.asset.replace('/USD', '')} · {marketWindowLabel(selectedComparison.startTime, selectedComparison.endTime)}</h2>
+              <section className="ticket-leg-summary">
                 <div className="ticket-leg-grid">
                   {selectedComparison.legs.map((leg, index) => <div className="ticket-leg-card" key={`${leg.venueId}:${leg.direction}:${index}`}>
                     <span><strong>{index + 1}. {leg.venueLabel}</strong><Direction direction={leg.direction} /></span>
@@ -1969,7 +1946,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   </div>)}
                 </div>
                 {selectedKalshiLeg && <div className="kalshi-live-ticket">
-                  {multiVenueReceipt && multiVenueReceipt.comparisonId === selectedComparison.id && <div className="browser-status-detail"><span>双腿</span><p>{multiVenueReceipt.message} · 状态 {multiVenueReceipt.status}</p></div>}
+                  {multiVenueReceipt && multiVenueReceipt.comparisonId === selectedComparison.id && <div className="browser-status-detail"><span>双腿</span><p>{multiVenueReceipt.message} · {multiVenueReceiptStatusLabel(multiVenueReceipt.status)}</p></div>}
                 </div>}
               </section>
 
@@ -2057,7 +2034,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   }} disabled={busy || multiVenueMaxQuantity < 1}>最大</button>
                 </div>
                 <div className="capacity-summary">
-                  <span>当前可执行上限 <strong>{multiVenueMaxQuantity.toFixed(2)}</strong>份</span>
+                  <span>{unprotectedMode ? '单笔本金可支持' : '当前可执行上限'} <strong>{Number.isFinite(multiVenueMaxQuantity) ? multiVenueMaxQuantity.toFixed(2) : '—'}</strong>份</span>
                   <span>预计两腿本金 <strong>${Number.isFinite(multiVenueRequestedCapital) ? multiVenueRequestedCapital.toFixed(2) : '—'}</strong></span>
                 </div>
                 {selectedGateLeg && <div className="capacity-summary">
@@ -2069,17 +2046,14 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 </div>
                 {selectedKalshiLeg && multiVenueGateReport && <>
                   <div className="execute-action-row">
-                    <button className={`execute-button ${multiVenueGateReport.ignoredCount > 0 ? 'risk-override' : ''}`} onClick={() => void executeSelectedMultiVenue()} disabled={busy || !multiVenueGateReport.allowed}>
+                    <button className={`execute-button ${unprotectedMode || multiVenueGateReport.ignoredCount > 0 ? 'risk-override' : ''}`} onClick={() => void executeSelectedMultiVenue()} disabled={busy || !multiVenueGateReport.allowed}>
                       {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <Zap aria-hidden="true" />}
-                      {multiVenueGateReport.ignoredCount > 0 ? '风险执行 · ' : ''}执行双腿（{selectedKalshiLeg.direction} → Kalshi）
+                      {multiVenueExecuteLabel(unprotectedMode, selectedKalshiLeg.direction)}
                     </button>
                     <ExecutionConditionsHelp checks={multiVenueGateReport.checks} busy={busy} onToggle={(condition) => void toggleManualExecutionCondition(condition)} />
                   </div>
-                  {!multiVenueGateReport.allowed && multiVenueGateReport.firstBlockReason && <p className="execution-note"><AlertTriangle aria-hidden="true" />禁用原因：{multiVenueGateReport.firstBlockReason}</p>}
+                  {unprotectedMode && <p className="unprotected-execution-note"><AlertTriangle aria-hidden="true" />按输入份额同时提交两边；不等待首腿成交、不按实际成交量自动对齐或补单。</p>}
                 </>}
-                <div className="read-only-notice"><Info aria-hidden="true" /><span>{grossComparisonNotice(selectedComparison.status)}</span></div>
-                {selectedComparison.blockReasons.length > 0 && <ul className="read-only-reasons">{selectedComparison.blockReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}
-                {selectedComparison.status !== 'MANUAL_EXECUTABLE' && <button className="execute-button read-only-execute" type="button" disabled><LockKeyhole aria-hidden="true" />{grossComparisonActionLabel(selectedComparison.status)}</button>}
               </section>}
             </>
           ) : <div className="empty-state">没有可用机会</div>}
@@ -2609,7 +2583,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 </label>
               </div>
               <button className="wide-secondary" onClick={() => void saveRecoverySettings()} disabled={busy}><Check />保存恢复参数</button>
-              <div><Zap /><div><h3>无保护极速模式</h3><p>MEXC下单被接受后立即全量并行提交Polymarket FAK（限价0.99），不等成交回报，跳过滑点/收益/结算信号门槛。单腿失败会产生裸敞口，仅保留单笔本金上限。</p></div></div>
+              <div><Zap /><div><h3>全局无保护极速模式</h3><p>MEXC/Polymarket沿用原极速逻辑；Gate/Kalshi按输入份额同时提交两边，不等待首腿成交、不自动对齐或补单。跳过深度、滑点、收益和结算门槛，但仍保留身份、最低委托、单笔本金、到期截止和执行互斥。</p></div></div>
               <button
                 className={snapshot.settings.unprotectedExecutionEnabled ? 'wide-secondary danger-active' : 'wide-secondary'}
                 onClick={() => void toggleUnprotectedExecution()}
@@ -2724,8 +2698,8 @@ function HistoryModal({
               const receipt = session.receipt
               const first = receipt?.firstLeg
               const second = receipt?.secondLeg
-              const recoverable = ['STARTED', 'RECOVERY_REQUIRED', 'RECONCILE_REQUIRED'].includes(session.status)
-              const status = session.status === 'HEDGED' ? '两腿已对齐' : session.status === 'RECOVERED' ? '已恢复' : session.status === 'CANCELED' ? '已取消' : session.status === 'RECONCILE_REQUIRED' ? '需要核对' : session.status === 'RECOVERY_REQUIRED' ? '需要恢复' : '执行中'
+              const recoverable = ['STARTED', 'UNPROTECTED_SUBMITTED', 'RECOVERY_REQUIRED', 'RECONCILE_REQUIRED'].includes(session.status)
+              const status = multiVenueReceiptStatusLabel(session.status)
               return <article className={`history-order multi-venue-history-order ${recoverable ? 'recovery_required' : ''}`} key={session.sessionId}>
                 <div className="history-order-head"><div><strong>{session.comparisonId}</strong><span>执行 {new Date(session.createdAt).toLocaleString('zh-CN', { hour12: false })} · 会话 {session.sessionId}</span></div><span className="order-status">{status}</span></div>
                 <div className="history-legs">

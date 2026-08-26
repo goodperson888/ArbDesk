@@ -222,7 +222,8 @@ td small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px
 .edge-cell { gap: 5px; }
 .edge-cell > svg { width: 12px; flex: 0 0 auto; color: var(--amber); }
 .mono { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
-.all-in-cost-cell { color: var(--text); font-size: 14px; font-weight: 800; letter-spacing: -.01em; }
+.all-in-cost-cell { color: var(--text); font-size: 17px; font-weight: 850; letter-spacing: -.02em; white-space: nowrap; }
+.all-in-cost-cell small { margin-top: 0; color: var(--muted); font-size: 9px; font-weight: 650; }
 .countdown { color: var(--text-soft); }
 .comparison-status { display: inline-flex; align-items: center; min-height: 22px; padding: 0 6px; color: var(--muted); border: 1px solid var(--border-soft); border-radius: 6px; background: rgba(148,163,184,.04); font-size: 9px; font-weight: 750; white-space: nowrap; }
 .comparison-status.executable { color: #86efac; border-color: rgba(34,197,94,.22); background: var(--green-soft); }
@@ -246,11 +247,7 @@ tbody tr.opportunity-row.manual-executable:hover { background: rgba(245,158,11,.
 .empty-state { min-height: 110px; display: grid; place-items: center; color: var(--muted); }
 
 .order-ticket { min-width: 0; height: 100%; overflow-x: hidden; overflow-y: auto; padding: 9px; scrollbar-gutter: stable; }
-.ticket-market-summary { padding: 4px 1px 9px; border-bottom: 1px solid var(--border-soft); }
-.ticket-summary-heading { min-height: 24px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.ticket-summary-heading > span { display: flex; align-items: center; gap: 6px; }
-.ticket-summary-heading > small { color: #fcd34d; font-size: 9px; text-align: right; }
-.ticket-market-summary h2 { margin: 7px 0 8px; font-size: 15px; }
+.ticket-leg-summary { padding: 1px 1px 9px; border-bottom: 1px solid var(--border-soft); }
 .ticket-leg-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 .ticket-leg-card { min-width: 0; padding: 8px; display: grid; gap: 4px; border: 1px solid var(--border-soft); border-radius: 9px; background: rgba(2,6,23,.43); }
 .ticket-leg-card > span { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 5px; }
@@ -267,10 +264,6 @@ tbody tr.opportunity-row.manual-executable:hover { background: rgba(245,158,11,.
 .multi-venue-plan-summary > div { display: grid; grid-template-columns: 1fr auto auto; align-items: baseline; gap: 8px; color: var(--muted); font-size: 10px; }
 .multi-venue-plan-summary strong { color: var(--text-soft); font-variant-numeric: tabular-nums; }
 .multi-venue-plan-summary small { color: var(--text); font-variant-numeric: tabular-nums; }
-.read-only-notice { margin-top: 2px; padding: 8px; display: flex; align-items: flex-start; gap: 7px; color: #bae6fd; border: 1px solid rgba(56,189,248,.15); border-radius: 8px; background: rgba(56,189,248,.06); font-size: 10px; line-height: 1.45; }
-.read-only-notice svg { width: 14px; flex: 0 0 auto; }
-.read-only-reasons { margin: 0; padding: 0 0 0 18px; color: var(--muted); font-size: 10px; line-height: 1.6; }
-.read-only-execute { margin-top: 0; color: #94a3b8; border-color: var(--border); background: var(--surface-3); box-shadow: none; }
 .field-label { display: block; margin: 0 0 4px; color: var(--text-soft); font-size: 10px; font-weight: 650; }
 .quantity-control { display: grid; grid-template-columns: 1fr 62px; }
 .quantity-control input, .form-grid input { width: 100%; height: 44px; padding: 0 12px; color: var(--text); border: 1px solid var(--border); border-radius: 9px 0 0 9px; background: rgba(2,6,23,.72); font-variant-numeric: tabular-nums; }
@@ -294,12 +287,13 @@ tbody tr.opportunity-row.manual-executable:hover { background: rgba(245,158,11,.
 .inline-warning svg { width: 14px; flex: 0 0 auto; }
 .execute-button { width: 100%; min-height: 44px; margin-top: 8px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; color: #031309; border: 1px solid #4ade80; border-radius: 10px; background: linear-gradient(180deg, #4ade80, #22c55e); box-shadow: 0 8px 24px rgba(34,197,94,.14); font-weight: 800; transition: filter .2s, box-shadow .2s; }
 .execute-button:hover:not(:disabled) { filter: brightness(1.06); box-shadow: 0 10px 28px rgba(34,197,94,.2); }
-.execute-button.read-only-execute, .execute-button.read-only-execute:disabled { color: #94a3b8; border-color: var(--border); background: var(--surface-3); box-shadow: none; opacity: 1; cursor: not-allowed; }
 .execute-button.risk-override { color: #2a1300; border-color: #f59e0b; background: linear-gradient(180deg, #fbbf24, #f59e0b); box-shadow: 0 8px 24px rgba(245,158,11,.18); }
 .execute-button.risk-override:hover:not(:disabled) { box-shadow: 0 10px 28px rgba(245,158,11,.26); }
 .execute-button svg { width: 17px; }
 .execute-action-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 44px; gap: 6px; margin-top: 8px; }
 .execute-action-row .execute-button { margin-top: 0; }
+.unprotected-execution-note { margin: 0; padding: 7px 8px; display: flex; align-items: flex-start; gap: 6px; color: #fcd34d; border: 1px solid rgba(245,158,11,.18); border-radius: 8px; background: rgba(245,158,11,.07); font-size: 9px; line-height: 1.4; }
+.unprotected-execution-note svg { width: 13px; flex: 0 0 auto; }
 .execution-conditions-help { position: relative; z-index: 12; }
 .execution-conditions-trigger { width: 44px; height: 44px; display: grid; place-items: center; color: #7dd3fc; border: 1px solid rgba(56,189,248,.24); border-radius: 10px; background: rgba(56,189,248,.07); cursor: pointer; }
 .execution-conditions-trigger:hover { color: #bae6fd; border-color: rgba(56,189,248,.44); background: rgba(56,189,248,.12); }
@@ -755,20 +749,12 @@ tbody tr.opportunity-row.manual-executable:hover { background: rgba(245,158,11,.
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
-.route-direction-cell,
 .recovery-sessions-banner {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.route-direction-cell {
-  flex-direction: column;
-  align-items: flex-start;
-  min-width: 150px;
-}
-
-.route-direction-cell small,
 .recovery-sessions-banner small {
   color: var(--muted-text, #94a3b8);
   font-size: 11px;
