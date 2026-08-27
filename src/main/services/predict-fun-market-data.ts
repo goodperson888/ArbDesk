@@ -149,9 +149,14 @@ function categoriesFromGraphql(body: unknown): PredictCategory[] {
   }
   walk(body, 0)
   return [...markets.values()].flatMap(({ market, category }) => {
-    const marketId = Number(market.id)
+    // The page's GraphQL Market.id is not guaranteed to be the numeric ID
+    // used by the orderbook topic. Crypto categories expose that transport ID
+    // explicitly as marketData.marketId; prefer it when present so
+    // predictOrderbook/{marketId} maps to the same market the page publishes.
+    const marketData = category.marketData?.find((entry) => String(entry.marketId) === String(market.id)) ??
+      (category.marketData?.length === 1 ? category.marketData[0] : undefined)
+    const marketId = Number(marketData?.marketId ?? market.id)
     if (!category || !Number.isFinite(marketId)) return []
-    const marketData = category.marketData?.find((entry) => String(entry.marketId) === String(market.id)) ?? category.marketData?.[0]
     return [{
       slug: category.slug ?? category.id,
       startsAt: category.startsAt,
@@ -637,7 +642,8 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       if (!context) {
         if (!officialSocket) {
           this.passiveUnmappedFrameCount += 1
-          this.passiveLastReason = `盘口 marketId ${resolvedMarketId} 不在当前目录`
+          const directoryIds = [...this.marketContexts.keys()].slice(0, 8).join(',') || '空'
+          this.passiveLastReason = `盘口 marketId ${resolvedMarketId} 不在当前目录（目录 ${directoryIds}）`
         }
         return
       }

@@ -155,6 +155,29 @@ describe('PredictFunMarketData', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
+  it('uses the crypto marketData marketId when GraphQL node id differs from the websocket id', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-21T11:32:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+
+    capture.emitResponse('https://graphql.predict.fun/graphql', { data: { category: {
+      id: 'btc-updown-15m-id-mismatch', slug: 'btc-updown-15m-id-mismatch',
+      startsAt: '2026-08-21T11:30:00.000Z', endsAt: '2026-08-21T11:45:00.000Z',
+      status: 'ACTIVE', marketVariant: 'CRYPTO_UP_DOWN',
+      marketData: [{ marketId: '1738399', priceFeedId: '1', priceFeedSymbol: 'BTCUSDT' }],
+      markets: { edges: [{ node: { id: 'graphql-node-id', decimalPrecision: 3, status: 'REGISTERED' } }] }
+    } } })
+    capture.emitFrame({
+      type: 'M', topic: 'predictOrderbook/1738399',
+      data: { marketId: 1738399, updateTimestampMs: Date.now(), asks: [[0.61, 10]], bids: [[0.54, 12]] }
+    })
+
+    expect(source.getLatestWindows()).toHaveLength(1)
+    expect(source.getLatestWindows()[0].marketId).toBe('1738399')
+  })
+
   it('maps localized zh-CN outcomes by their stable index before applying the page websocket book', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-23T12:32:00.000Z'))
