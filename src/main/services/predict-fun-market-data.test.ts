@@ -297,6 +297,48 @@ describe('PredictFunMarketData', () => {
     expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '777', durationMinutes: 5 })
   })
 
+  it('maps the official standalone Market schema to the websocket market id', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-21T11:32:00.000Z'))
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+
+    capture.emitResponse('https://graphql.predict.fun/graphql', { data: { markets: [{
+      id: 1740936,
+      tradingStatus: 'OPEN',
+      status: 'REGISTERED',
+      feeRateBps: 200,
+      categorySlug: 'btc-updown-5m-1787311800',
+      marketVariant: 'CRYPTO_UP_DOWN',
+      variantData: {
+        type: 'CRYPTO_UP_DOWN',
+        priceFeedProvider: 'CHAINLINK',
+        priceFeedId: 'btc-usd',
+        priceFeedSymbol: 'BTCUSDT'
+      },
+      decimalPrecision: 3,
+      outcomes: [
+        { name: 'Yes', indexSet: 1, onChainId: 'up-official' },
+        { name: 'No', indexSet: 2, onChainId: 'down-official' }
+      ]
+    }] } })
+    capture.emitFrame({
+      type: 'M', topic: 'predictOrderbook/1740936',
+      data: { marketId: 1740936, updateTimestampMs: Date.now(), asks: [[0.612, 11]], bids: [[0.557, 13]] }
+    })
+
+    expect(source.getLatestWindows()).toHaveLength(1)
+    expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '1740936', durationMinutes: 5, feeRateBps: 200 })
+    expect(source.getLatestWindows()[0].outcomes.UP).toMatchObject({ outcomeId: 'up-official', bestAsk: '0.612' })
+    expect(source.getLatestWindows()[0].outcomes.DOWN).toMatchObject({ outcomeId: 'down-official', bestAsk: '0.443' })
+    expect(source.getStatus().message).toContain('GraphQL目录 1/1')
+    expect(source.getStatus().message).toContain('categorySlug')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('keeps the official API ahead of page capture when a key exists', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-21T11:32:00.000Z'))

@@ -13,6 +13,7 @@ interface PredictOutcome {
   id?: string
   name?: string
   index?: number
+  indexSet?: number
   onChainId?: string
   bestAsk?: { price?: number; size?: number } | null
 }
@@ -108,13 +109,18 @@ interface PredictGraphqlCategory {
 }
 
 interface PredictGraphqlMarket {
-  id?: string
+  id?: string | number
   decimalPrecision?: number
   takerFeeBps?: number
+  feeRateBps?: number
   isNegRisk?: boolean
   isYieldBearing?: boolean
   isTradingEnabled?: boolean
+  tradingStatus?: string
   status?: string
+  categorySlug?: string
+  marketVariant?: string
+  variantData?: PredictVariant
   outcomes?: { edges?: Array<{ node?: PredictOutcome }> } | PredictOutcome[]
   category?: PredictGraphqlCategory
 }
@@ -157,6 +163,24 @@ function categoriesFromGraphql(body: unknown): PredictCategory[] {
       markets.set(String(candidate.id), { market: candidate, category: candidate.category })
       return
     }
+    // Predict's official Market shape is also used by newer page GraphQL
+    // responses: the market is standalone and references its rolling category
+    // through categorySlug instead of embedding a category object. The
+    // official market id is the same id carried by predictOrderbook/{marketId}.
+    if (candidate.id && candidate.categorySlug && /btc-updown-(?:5|15)m-\d+/i.test(candidate.categorySlug)) {
+      const category: PredictGraphqlCategory = {
+        slug: candidate.categorySlug,
+        status: candidate.tradingStatus ?? candidate.status,
+        marketVariant: candidate.marketVariant ?? candidate.variantData?.type,
+        marketData: {
+          marketId: String(candidate.id),
+          priceFeedProvider: candidate.variantData?.priceFeedProvider,
+          priceFeedId: candidate.variantData?.priceFeedId,
+          priceFeedSymbol: candidate.variantData?.priceFeedSymbol
+        }
+      }
+      if (isCryptoCategory(category)) markets.set(String(candidate.id), { market: candidate, category })
+    }
     for (const [key, entry] of Object.entries(candidate)) {
       if (key === 'timeseries' || key === 'assetOhlc' || key === 'statistics' || key === 'description') continue
       walk(entry, depth + 1)
@@ -189,10 +213,10 @@ function categoriesFromGraphql(body: unknown): PredictCategory[] {
       },
       markets: [{
         id: marketId,
-        feeRateBps: market.takerFeeBps,
+        feeRateBps: market.feeRateBps ?? market.takerFeeBps,
         isNegRisk: market.isNegRisk,
         isYieldBearing: market.isYieldBearing,
-        tradingStatus: market.isTradingEnabled !== false && market.status === 'REGISTERED' ? 'OPEN' : market.status,
+        tradingStatus: market.tradingStatus ?? (market.isTradingEnabled !== false && market.status === 'REGISTERED' ? 'OPEN' : market.status),
         decimalPrecision: market.decimalPrecision,
         outcomes: Array.isArray(market.outcomes)
           ? market.outcomes
@@ -203,6 +227,38 @@ function categoriesFromGraphql(body: unknown): PredictCategory[] {
       }]
     }]
   })
+}
+
+// Keep only field names from market-like GraphQL objects. This gives us a
+// factual schema fingerprint in diagnostics without persisting response
+// values, authentication material, or large page payloads.
+function graphqlMarketSchemaFingerprints(body: unknown): string[] {
+  const fingerprints = new Set<string>()
+  const visited = new Set<object>()
+  const relevant = new Set([
+    'id', 'marketId', 'categorySlug', 'slug', 'tradingStatus', 'status',
+    'marketVariant', 'variantData', 'marketData', 'outcomes', 'markets',
+    'startsAt', 'endsAt'
+  ])
+  const walk = (value: unknown, depth: number): void => {
+    if (!value || typeof value !== 'object' || depth > 10 || visited.has(value) || fingerprints.size >= 3) return
+    visited.add(value)
+    if (Array.isArray(value)) {
+      for (const entry of value) walk(entry, depth + 1)
+      return
+    }
+    const record = value as Record<string, unknown>
+    const keys = Object.keys(record)
+    const looksLikeMarket = keys.some((key) => ['categorySlug', 'marketId', 'marketVariant', 'variantData', 'marketData', 'outcomes', 'markets'].includes(key)) &&
+      keys.some((key) => ['id', 'marketId', 'slug', 'categorySlug'].includes(key))
+    if (looksLikeMarket) {
+      const safeKeys = keys.filter((key) => relevant.has(key)).sort()
+      if (safeKeys.length > 0) fingerprints.add(safeKeys.join('+'))
+    }
+    for (const entry of Object.values(record)) walk(entry, depth + 1)
+  }
+  walk(body, 0)
+  return [...fingerprints]
 }
 
 function levelsFromBook(book: PredictBookResponse, fallback: PredictOutcome | undefined): OrderBookLevel[] {
@@ -276,6 +332,8 @@ function isOpenStatus(value: string | undefined): boolean {
 }
 
 function predictOutcomeDirection(outcome: PredictOutcome): Direction | undefined {
+  if (outcome.indexSet === 1) return 'UP'
+  if (outcome.indexSet === 2) return 'DOWN'
   if (outcome.index === 1) return 'UP'
   if (outcome.index === 2) return 'DOWN'
   const name = String(outcome.name ?? '').trim().toUpperCase()
@@ -390,6 +448,9 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private passiveMappedFrameCount = 0
   private passiveUnmappedFrameCount = 0
   private passiveParseRejectedCount = 0
+  private passiveGraphqlResponseCount = 0
+  private passiveGraphqlMappedCount = 0
+  private passiveLastGraphqlSchema = ''
   private passiveLastReason = ''
   private lastPassiveDiagnosticNotifyAt = 0
   private lastDirectoryAt = 0
@@ -777,8 +838,18 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       return
     }
     if (path.endsWith('/graphql')) {
+      this.passiveGraphqlResponseCount += 1
+      const fingerprints = graphqlMarketSchemaFingerprints(body)
+      if (fingerprints.length > 0) this.passiveLastGraphqlSchema = fingerprints.join(' | ')
       const capturedCategories = categoriesFromGraphql(body)
-      if (capturedCategories.length === 0) return
+      if (capturedCategories.length === 0) {
+        this.passiveLastReason = fingerprints.length > 0
+          ? 'GraphQL 已收到市场结构，但没有形成 BTC 5m/15m 目录'
+          : 'GraphQL 响应中没有发现市场目录字段'
+        this.notifyPassiveDiagnostics()
+        return
+      }
+      this.passiveGraphqlMappedCount += 1
       const categoriesBySlug = new Map((this.discovery?.categories ?? []).map((category) => [category.slug, category]))
       for (const category of capturedCategories) {
         const key = category.slug ?? category.description ?? `category:${category.startsAt ?? ''}:${category.endsAt ?? ''}`
@@ -832,9 +903,12 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   }
 
   private passiveDiagnosticsSuffix(): string {
-    if (this.passiveFrameCount === 0) return '；页面尚未收到可解析的 WebSocket 帧'
+    const graphql = this.passiveGraphqlResponseCount > 0
+      ? `；GraphQL目录 ${this.passiveGraphqlMappedCount}/${this.passiveGraphqlResponseCount}${this.passiveLastGraphqlSchema ? `，字段 ${this.passiveLastGraphqlSchema}` : ''}`
+      : ''
+    if (this.passiveFrameCount === 0) return `${graphql}；页面尚未收到可解析的 WebSocket 帧`
     const reason = this.passiveLastReason ? `，最近原因：${this.passiveLastReason}` : ''
-    return `；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）`
+    return `${graphql}；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）`
   }
 
   private notifyPassiveDiagnostics(): void {
