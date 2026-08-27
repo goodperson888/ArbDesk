@@ -340,6 +340,15 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private requestId = 0
   private pendingSubscriptions = new Map<number, { method: 'subscribe' | 'unsubscribe'; topic: string }>()
   private listeners = new Set<() => void>()
+  // Passive-page diagnostics are counters only; they do not trigger requests
+  // and make it possible to distinguish "no book frames" from "book frames
+  // received but not mapped/parsed" in the UI status line.
+  private passiveFrameCount = 0
+  private passiveOrderbookFrameCount = 0
+  private passiveMappedFrameCount = 0
+  private passiveUnmappedFrameCount = 0
+  private passiveParseRejectedCount = 0
+  private passiveLastReason = ''
 
   constructor(
     private readonly apiKeyProvider: () => Promise<string | undefined>,
@@ -363,7 +372,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
           : ''
       this.status = {
         connectionState: captureStatus.state === 'CONNECTED' ? 'CONNECTED' : captureStatus.state === 'IDLE' ? 'NOT_CONFIGURED' : 'DISCONNECTED',
-        message: `${captureStatus.message}${parsedSuffix}`,
+        message: `${captureStatus.message}${this.passiveDiagnosticsSuffix()}${parsedSuffix}`,
         marketCount: this.snapshot?.windows.length ?? 0,
         updatedAt: captureStatus.updatedAt
       }
@@ -586,6 +595,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   }
 
   private handleStreamPayload(message: PredictStreamMessage, officialSocket: boolean): void {
+    if (!officialSocket) this.passiveFrameCount += 1
     if (message.type === 'R' && officialSocket) {
       const pending = typeof message.requestId === 'number' ? this.pendingSubscriptions.get(message.requestId) : undefined
       if (typeof message.requestId === 'number') this.pendingSubscriptions.delete(message.requestId)
@@ -616,12 +626,31 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       Array.isArray(bookRecord?.yes) || Array.isArray(bookRecord?.no)
     const resolvedMarketId = orderbookMatch?.[1] ?? orderbookMatch?.[2] ??
       (dataMarketId !== undefined && (hasBookData || /order|book/i.test(message.topic)) ? String(dataMarketId) : undefined)
+    const looksLikeOrderbook = Boolean(orderbookMatch) || /order|book/i.test(message.topic)
+    if (!officialSocket && looksLikeOrderbook) this.passiveOrderbookFrameCount += 1
+    if (!officialSocket && looksLikeOrderbook && !resolvedMarketId) {
+      this.passiveUnmappedFrameCount += 1
+      this.passiveLastReason = '盘口帧没有 marketId'
+    }
     if (resolvedMarketId && bookRecord) {
       const context = this.marketContexts.get(resolvedMarketId)
-      if (!context) return
+      if (!context) {
+        if (!officialSocket) {
+          this.passiveUnmappedFrameCount += 1
+          this.passiveLastReason = `盘口 marketId ${resolvedMarketId} 不在当前目录`
+        }
+        return
+      }
       const book = { success: true, data: bookRecord as PredictBookResponse['data'] }
       const parsed = parseCategory(context.category, context.market, book, receivedAtFromBook(book.data?.updateTimestampMs, Date.now()))
-      if (!parsed) return
+      if (!parsed) {
+        if (!officialSocket) {
+          this.passiveParseRejectedCount += 1
+          this.passiveLastReason = `marketId ${resolvedMarketId} 的时间/方向/盘口字段未通过解析`
+        }
+        return
+      }
+      if (!officialSocket) this.passiveMappedFrameCount += 1
       const windows = [...(this.snapshot?.windows ?? []).filter((window) => window.marketId !== parsed.marketId), parsed]
         .sort((left, right) => left.startTime - right.startTime || left.durationMinutes - right.durationMinutes)
       this.snapshot = { fetchedAt: Date.now(), windows }
@@ -739,6 +768,12 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       return
     }
     this.handleStreamPayload(message, false)
+  }
+
+  private passiveDiagnosticsSuffix(): string {
+    if (this.passiveFrameCount === 0) return '；页面尚未收到可解析的 WebSocket 帧'
+    const reason = this.passiveLastReason ? `，最近原因：${this.passiveLastReason}` : ''
+    return `；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）`
   }
 
   private applyCapturedWindow(parsed: ReadOnlyWindowQuote, receivedAt: number): void {
