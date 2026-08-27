@@ -185,6 +185,40 @@ describe('PredictFunMarketData', () => {
     expect(source.getLatestWindows()[0].outcomes.DOWN).toMatchObject({ outcomeId: 'down-chain-id', bestAsk: '0.62', askSize: '21' })
   })
 
+  it('keeps an active page market when a later GraphQL response only contains an unrelated or expired BTC category', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-21T11:32:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+
+    capture.emitResponse('https://graphql.predict.fun/graphql', { data: { category: {
+      id: 'btc-updown-15m-current', slug: 'btc-updown-15m-current',
+      startsAt: '2026-08-21T11:30:00.000Z', endsAt: '2026-08-21T11:45:00.000Z',
+      status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN',
+      marketData: [{ marketId: '99', priceFeedId: '1', priceFeedSymbol: 'BTCUSDT' }],
+      markets: { edges: [{ node: { id: '99', decimalPrecision: 3, status: 'REGISTERED', isTradingEnabled: true } }] }
+    } } })
+    capture.emitFrame({
+      type: 'M', topic: 'predictOrderbook/99',
+      data: { marketId: 99, updateTimestampMs: Date.now(), asks: [[0.61, 10]], bids: [[0.54, 12]] }
+    })
+    expect(source.getLatestWindows()).toHaveLength(1)
+
+    capture.emitResponse('https://graphql.predict.fun/graphql', { data: { category: {
+      // The page also emits a compact market-status response using the same
+      // slug but without the category times. It must not erase the directory
+      // record captured above.
+      id: 'btc-updown-15m-current', slug: 'btc-updown-15m-current',
+      status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN',
+      marketData: [{ marketId: '99', priceFeedId: '1', priceFeedSymbol: 'BTCUSDT' }],
+      markets: { edges: [{ node: { id: '99', decimalPrecision: 3, status: 'REGISTERED', isTradingEnabled: true } }] }
+    } } })
+
+    expect(source.getLatestWindows()).toHaveLength(1)
+    expect(source.getLatestWindows()[0].marketId).toBe('99')
+  })
+
   it('normalizes numeric-second category times from the current 15m page/API shape', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_787_477_000_000)

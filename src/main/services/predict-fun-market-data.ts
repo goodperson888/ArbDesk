@@ -267,6 +267,31 @@ function selectCandidates(categories: PredictCategory[], now: number): Array<{ c
     .slice(0, 4)
 }
 
+function mergeCapturedCategory(previous: PredictCategory | undefined, incoming: PredictCategory): PredictCategory {
+  if (!previous) return incoming
+  const previousMarkets = new Map((previous.markets ?? []).filter((market) => market.id).map((market) => [String(market.id), market]))
+  const markets = (incoming.markets ?? []).map((market) => {
+    const old = market.id ? previousMarkets.get(String(market.id)) : undefined
+    return old ? {
+      ...old,
+      ...market,
+      outcomes: market.outcomes ?? old.outcomes
+    } : market
+  })
+  return {
+    ...previous,
+    ...incoming,
+    startsAt: incoming.startsAt ?? previous.startsAt,
+    endsAt: incoming.endsAt ?? previous.endsAt,
+    status: incoming.status ?? previous.status,
+    marketVariant: incoming.marketVariant ?? previous.marketVariant,
+    resolutionProvider: incoming.resolutionProvider ?? previous.resolutionProvider,
+    description: incoming.description ?? previous.description,
+    variantData: { ...(previous.variantData ?? {}), ...(incoming.variantData ?? {}) },
+    markets: markets.length > 0 ? markets : previous.markets
+  }
+}
+
 function parseCategory(category: PredictCategory, market: PredictMarket, book: PredictBookResponse, receivedAt: number): ReadOnlyWindowQuote | undefined {
   const startTime = categoryTimestamp(category.startsAt)
   const endTime = categoryTimestamp(category.endsAt)
@@ -639,6 +664,15 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       if (!Array.isArray(response.data)) return
       this.discovery = { fetchedAt: receivedAt, categories: response.data }
       const candidates = selectCandidates(response.data, receivedAt)
+      const activeContextExists = [...this.marketContexts.values()].some(({ category }) => categoryTimestamp(category.endsAt) > receivedAt)
+      if (candidates.length === 0 && activeContextExists) {
+        this.status = {
+          connectionState: 'CONNECTED', marketCount: this.snapshot?.windows.length ?? 0, updatedAt: receivedAt,
+          message: '网页单页面收到非当前轮次目录；保留仍有效的 BTC 盘口上下文'
+        }
+        this.emitMarketData()
+        return
+      }
       this.marketContexts = new Map(candidates.flatMap((context) => context.market.id ? [[String(context.market.id), context]] : []))
       if (this.snapshot) {
         const wanted = new Set(this.marketContexts.keys())
@@ -657,10 +691,22 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       const capturedCategories = categoriesFromGraphql(body)
       if (capturedCategories.length === 0) return
       const categoriesBySlug = new Map((this.discovery?.categories ?? []).map((category) => [category.slug, category]))
-      for (const category of capturedCategories) categoriesBySlug.set(category.slug, category)
+      for (const category of capturedCategories) {
+        const key = category.slug ?? category.description ?? `category:${category.startsAt ?? ''}:${category.endsAt ?? ''}`
+        categoriesBySlug.set(key, mergeCapturedCategory(categoriesBySlug.get(key), category))
+      }
       const categories = [...categoriesBySlug.values()]
       this.discovery = { fetchedAt: receivedAt, categories }
       const candidates = selectCandidates(categories, receivedAt)
+      const activeContextExists = [...this.marketContexts.values()].some(({ category }) => categoryTimestamp(category.endsAt) > receivedAt)
+      if (candidates.length === 0 && activeContextExists) {
+        this.status = {
+          connectionState: 'CONNECTED', marketCount: this.snapshot?.windows.length ?? 0, updatedAt: receivedAt,
+          message: '网页单页面收到非当前轮次 GraphQL 数据；保留仍有效的 BTC 盘口上下文'
+        }
+        this.emitMarketData()
+        return
+      }
       this.marketContexts = new Map(candidates.flatMap((context) => context.market.id ? [[String(context.market.id), context]] : []))
       if (this.snapshot) {
         const wanted = new Set(this.marketContexts.keys())

@@ -4,7 +4,11 @@ import type { PredictFunPageCaptureStatus } from '../../shared/types'
 export type { PredictFunPageCaptureStatus } from '../../shared/types'
 
 const PAGE_START_TIMEOUT_MS = 20_000
-const PAGE_ROLL_INTERVAL_MS = 5 * 60_000
+// The passive page is anchored to the 15m market URL. Reloading it every 5m
+// tears down the page WebSocket twice per 15m window and creates an avoidable
+// period with no captured book. The page itself exposes both 5m and 15m
+// markets, so roll only when that anchor actually changes.
+const PAGE_ROLL_INTERVAL_MS = 15 * 60_000
 
 function currentPredictMarketUrl(now = Date.now()): string {
   const slot = Math.floor(now / 900_000) * 900
