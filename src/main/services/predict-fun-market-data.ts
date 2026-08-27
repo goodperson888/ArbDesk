@@ -87,6 +87,13 @@ interface PredictStreamMessage {
   error?: { code?: string; message?: string }
 }
 
+interface PredictGraphqlMarketDataEntry {
+  marketId?: string
+  priceFeedProvider?: string
+  priceFeedId?: string
+  priceFeedSymbol?: string
+}
+
 interface PredictGraphqlCategory {
   id?: string
   slug?: string
@@ -96,12 +103,7 @@ interface PredictGraphqlCategory {
   marketVariant?: string
   resolutionProvider?: string
   description?: string
-  marketData?: Array<{
-    marketId?: string
-    priceFeedProvider?: string
-    priceFeedId?: string
-    priceFeedSymbol?: string
-  }>
+  marketData?: PredictGraphqlMarketDataEntry[] | PredictGraphqlMarketDataEntry
   markets?: { edges?: Array<{ node?: PredictGraphqlMarket }> } | PredictGraphqlMarket[]
 }
 
@@ -121,7 +123,14 @@ function isCryptoCategory(category: PredictGraphqlCategory): boolean {
   const variant = String(category.marketVariant ?? '').toUpperCase()
   if (/CRYPTO.?UP.?DOWN/.test(variant)) return true
   const text = `${category.slug ?? ''} ${category.description ?? ''}`.toUpperCase()
-  return text.includes('BTC') && /UP.?DOWN|HIGHER.?LOWER|RISE.?FALL/.test(text)
+  if (text.includes('BTC') && /UP.?DOWN|HIGHER.?LOWER|RISE.?FALL/.test(text)) return true
+  const feeds = Array.isArray(category.marketData) ? category.marketData : category.marketData ? [category.marketData] : []
+  return feeds.some((feed) => /BTC(?:USD|USDT)?/i.test(String(feed.priceFeedSymbol ?? '')))
+}
+
+function marketDataEntries(category: PredictGraphqlCategory): PredictGraphqlMarketDataEntry[] {
+  if (!category.marketData) return []
+  return Array.isArray(category.marketData) ? category.marketData : [category.marketData]
 }
 
 function categoriesFromGraphql(body: unknown): PredictCategory[] {
@@ -159,8 +168,9 @@ function categoriesFromGraphql(body: unknown): PredictCategory[] {
     // used by the orderbook topic. Crypto categories expose that transport ID
     // explicitly as marketData.marketId; prefer it when present so
     // predictOrderbook/{marketId} maps to the same market the page publishes.
-    const marketData = category.marketData?.find((entry) => String(entry.marketId) === String(market.id)) ??
-      (category.marketData?.length === 1 ? category.marketData[0] : undefined)
+    const marketDataList = marketDataEntries(category)
+    const marketData = marketDataList.find((entry) => String(entry.marketId) === String(market.id)) ??
+      (marketDataList.length === 1 ? marketDataList[0] : undefined)
     const marketId = Number(marketData?.marketId ?? market.id)
     if (!category || !Number.isFinite(marketId)) return []
     return [{
@@ -280,8 +290,11 @@ function selectCandidates(categories: PredictCategory[], now: number): Array<{ c
     // safe second signal and keeps those markets from being discarded before
     // their actual order book is inspected.
     .filter((category) => {
-      const variantText = `${category.marketVariant ?? ''} ${category.slug ?? ''} ${category.description ?? ''}`
-      return isOpenStatus(category.status) && /CRYPTO.?UP.?DOWN|BTC.?UP.?DOWN/i.test(variantText)
+      const variantText = `${category.marketVariant ?? ''} ${category.slug ?? ''} ${category.description ?? ''} ${category.variantData?.type ?? ''} ${category.variantData?.priceFeedSymbol ?? ''}`
+      const window = categoryWindowTimes(category)
+      const duration = window ? Math.round((window.endTime - window.startTime) / 60_000) : 0
+      const cryptoSignal = /CRYPTO.?UP.?DOWN|BTC.?UP.?DOWN|BTC(?:USD|USDT)?/i.test(variantText)
+      return isOpenStatus(category.status) && cryptoSignal && (duration === 5 || duration === 15)
     })
     .filter((category) => /BTC(?:USD|USDT|UPDOWN)?/.test(assetSymbol(category)))
     .filter((category) => {

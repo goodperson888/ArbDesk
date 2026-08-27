@@ -282,6 +282,21 @@ describe('PredictFunMarketData', () => {
     expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '501', durationMinutes: 5, startTime: 1_787_477_400_000, endTime: 1_787_477_700_000 })
   })
 
+  it('accepts the single-object marketData shape emitted by newer GraphQL pages', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-21T11:32:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+    capture.emitResponse('https://graphql.predict.fun/graphql', { data: { category: {
+      slug: 'btc-updown-5m-1787302200', startsAt: '2026-08-21T11:30:00.000Z', endsAt: '2026-08-21T11:35:00.000Z',
+      status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN', marketData: { marketId: '777', priceFeedSymbol: 'BTCUSDT' },
+      markets: { edges: [{ node: { id: 'graphql-id', status: 'REGISTERED' } }] }
+    } } })
+    capture.emitFrame({ type: 'M', topic: 'predictOrderbook/777', data: { marketId: 777, asks: [[0.6, 3]], bids: [[0.4, 3]] } })
+    expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '777', durationMinutes: 5 })
+  })
+
   it('keeps the official API ahead of page capture when a key exists', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-21T11:32:00.000Z'))
