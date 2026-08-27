@@ -264,6 +264,24 @@ describe('PredictFunMarketData', () => {
     expect(windows[0]).toMatchObject({ marketId: '889291', durationMinutes: 15, startTime: 1_787_477_400_000 })
   })
 
+  it('derives a rolling 5m window when the page omits explicit category timestamps', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_787_477_000_000)
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+    capture.emitResponse('https://api.predict.fun/graphql', { data: { category: {
+      slug: 'btc-updown-5m-1787477400', status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN',
+      marketData: [{ marketId: '501', priceFeedSymbol: 'BTCUSDT' }],
+      markets: { edges: [{ node: { id: 'graphql-id', status: 'REGISTERED', outcomes: { edges: [
+        { node: { name: 'Up', index: 1, onChainId: 'up-501' } },
+        { node: { name: 'Down', index: 2, onChainId: 'down-501' } }
+      ] } } }] }
+    } } })
+    capture.emitFrame({ type: 'M', topic: 'predictOrderbook/501', data: { marketId: 501, asks: [[0.6, 3]], bids: [[0.4, 3]] } })
+    expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '501', durationMinutes: 5, startTime: 1_787_477_400_000, endTime: 1_787_477_700_000 })
+  })
+
   it('keeps the official API ahead of page capture when a key exists', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-21T11:32:00.000Z'))

@@ -62,6 +62,7 @@ const DEFAULT_SETTINGS: RiskSettings = {
   polymarketLiveEnabled: false,
   kalshiLiveEnabled: false,
   gateLiveEnabled: false,
+  predictFunLiveEnabled: false,
   allowUnprofitableTestTrade: false,
   autoOpenEnabled: false,
   autoOpenQuantityMode: 'FIXED',
@@ -480,7 +481,7 @@ export class AppController {
       'mode', 'maxCapitalPerTrade', 'minConditionalReturnPct', 'maxQuoteAgeMs',
       'maxHedgeSlippage', 'stopBeforeExpirySeconds', 'settlementDistanceRules', 'mexcBrowserMode',
       'mexcElementMode', 'hubstudioContainerCode', 'polymarketProxyUrl', 'mexcAutomationEnabled',
-      'polymarketLiveEnabled', 'gateLiveEnabled', 'allowUnprofitableTestTrade', 'autoOpenQuantityMode',
+      'polymarketLiveEnabled', 'gateLiveEnabled', 'predictFunLiveEnabled', 'allowUnprofitableTestTrade', 'autoOpenQuantityMode',
       'autoOpenFixedQuantity', 'autoOpenMaxQuantityPct', 'maxRecoveryLossUsdt',
       'polymarketHedgeRetryCount', 'polymarketHedgeMode', 'autoOpenStabilityMs'
     ]
@@ -578,6 +579,10 @@ export class AppController {
     }
     if (next.gateLiveEnabled) {
       if (next.mode !== 'ASSISTED') throw new Error('Gate 事件合约真实下单只允许在人工监督模式启用')
+      if (!this.liveExecutionEnabled) throw new Error('实盘总开关未启用；开发环境请用 npm run dev:live 启动ArbDesk')
+    }
+    if (next.predictFunLiveEnabled) {
+      if (next.mode !== 'ASSISTED') throw new Error('Predict.fun真实下单只允许在人工监督模式启用')
       if (!this.liveExecutionEnabled) throw new Error('实盘总开关未启用；开发环境请用 npm run dev:live 启动ArbDesk')
     }
     if (next.allowUnprofitableTestTrade && next.mode !== 'ASSISTED') {

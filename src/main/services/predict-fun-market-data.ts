@@ -38,6 +38,12 @@ export interface PredictFunPreparationCandidate {
   isYieldBearing: boolean
 }
 
+export interface PredictFunTradingMetadata {
+  feeRateBps: number
+  isNegRisk: boolean
+  isYieldBearing: boolean
+}
+
 interface PredictVariant {
   type?: string
   priceFeedProvider?: string
@@ -241,6 +247,20 @@ function categoryTimestamp(value: unknown): number {
   return Date.parse(String(value ?? ''))
 }
 
+function categoryWindowTimes(category: PredictCategory): { startTime: number; endTime: number } | undefined {
+  const startsAt = categoryTimestamp(category.startsAt)
+  const endsAt = categoryTimestamp(category.endsAt)
+  if (Number.isFinite(startsAt) && Number.isFinite(endsAt) && endsAt > startsAt) return { startTime: startsAt, endTime: endsAt }
+  // Some page GraphQL payloads omit startsAt/endsAt but retain the canonical
+  // rolling slug (btc-updown-{5m|15m}-{unixStart}). Derive the window from
+  // that stable identifier instead of discarding an otherwise valid market.
+  const match = /(?:^|-)btc-updown-(5|15)m-(\d{9,})/i.exec(String(category.slug ?? ''))
+  if (!match) return undefined
+  const startTime = Number(match[2]) * 1_000
+  const endTime = startTime + Number(match[1]) * 60_000
+  return Number.isFinite(startTime) ? { startTime, endTime } : undefined
+}
+
 function isOpenStatus(value: string | undefined): boolean {
   return !value || ['OPEN', 'ACTIVE', 'LIVE', 'TRADING', 'REGISTERED'].includes(value.toUpperCase())
 }
@@ -264,7 +284,10 @@ function selectCandidates(categories: PredictCategory[], now: number): Array<{ c
       return isOpenStatus(category.status) && /CRYPTO.?UP.?DOWN|BTC.?UP.?DOWN/i.test(variantText)
     })
     .filter((category) => /BTC(?:USD|USDT|UPDOWN)?/.test(assetSymbol(category)))
-    .filter((category) => categoryTimestamp(category.endsAt) > now && categoryTimestamp(category.startsAt) < now + 16 * 60_000)
+    .filter((category) => {
+      const window = categoryWindowTimes(category)
+      return Boolean(window && window.endTime > now && window.startTime < now + 16 * 60_000)
+    })
     .flatMap((category) => (category.markets ?? [])
       .filter((market) => isOpenStatus(market.tradingStatus))
       .map((market) => ({ category, market })))
@@ -298,8 +321,9 @@ function mergeCapturedCategory(previous: PredictCategory | undefined, incoming: 
 }
 
 function parseCategory(category: PredictCategory, market: PredictMarket, book: PredictBookResponse, receivedAt: number): ReadOnlyWindowQuote | undefined {
-  const startTime = categoryTimestamp(category.startsAt)
-  const endTime = categoryTimestamp(category.endsAt)
+  const window = categoryWindowTimes(category)
+  const startTime = window?.startTime ?? Number.NaN
+  const endTime = window?.endTime ?? Number.NaN
   const duration = Math.round((endTime - startTime) / 60_000)
   if (!Number.isFinite(startTime) || !Number.isFinite(endTime) || (duration !== 5 && duration !== 15) || !market.id) return undefined
   // The public page localizes outcome names (for example 涨/跌 on zh-CN),
@@ -354,6 +378,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private passiveUnmappedFrameCount = 0
   private passiveParseRejectedCount = 0
   private passiveLastReason = ''
+  private lastPassiveDiagnosticNotifyAt = 0
 
   constructor(
     private readonly apiKeyProvider: () => Promise<string | undefined>,
@@ -411,6 +436,16 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       }
     }
     return undefined
+  }
+
+  getTradingMetadata(marketId: string): PredictFunTradingMetadata | undefined {
+    const context = this.marketContexts.get(String(marketId))
+    if (!context) return undefined
+    return {
+      feeRateBps: Number(context.market.feeRateBps ?? 0),
+      isNegRisk: Boolean(context.market.isNegRisk),
+      isYieldBearing: Boolean(context.market.isYieldBearing)
+    }
   }
 
   onMarketData(listener: () => void): () => void {
@@ -636,6 +671,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     if (!officialSocket && looksLikeOrderbook && !resolvedMarketId) {
       this.passiveUnmappedFrameCount += 1
       this.passiveLastReason = '盘口帧没有 marketId'
+      this.notifyPassiveDiagnostics()
     }
     if (resolvedMarketId && bookRecord) {
       const context = this.marketContexts.get(resolvedMarketId)
@@ -644,6 +680,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
           this.passiveUnmappedFrameCount += 1
           const directoryIds = [...this.marketContexts.keys()].slice(0, 8).join(',') || '空'
           this.passiveLastReason = `盘口 marketId ${resolvedMarketId} 不在当前目录（目录 ${directoryIds}）`
+          this.notifyPassiveDiagnostics()
         }
         return
       }
@@ -653,6 +690,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         if (!officialSocket) {
           this.passiveParseRejectedCount += 1
           this.passiveLastReason = `marketId ${resolvedMarketId} 的时间/方向/盘口字段未通过解析`
+          this.notifyPassiveDiagnostics()
         }
         return
       }
@@ -664,7 +702,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         connectionState: 'CONNECTED', marketCount: windows.length, updatedAt: Date.now(),
         message: officialSocket
           ? `官方WebSocket实时盘口已连接，最近推送 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`
-          : `网页单页面被动盘口已接收，最近推送 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}；未额外请求接口`
+          : `网页单页面被动盘口已接收，最近推送 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}；${this.passiveDiagnosticsSuffix().replace(/^；/, '')}；未额外请求接口`
       }
       this.emitMarketData()
       return
@@ -782,13 +820,26 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     return `；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）`
   }
 
+  private notifyPassiveDiagnostics(): void {
+    const now = Date.now()
+    if (now - this.lastPassiveDiagnosticNotifyAt < 1_000) return
+    this.lastPassiveDiagnosticNotifyAt = now
+    this.status = {
+      ...this.status,
+      connectionState: this.status.connectionState === 'NOT_CONFIGURED' ? 'CONNECTED' : this.status.connectionState,
+      message: `网页被动盘口诊断${this.passiveDiagnosticsSuffix()}`,
+      updatedAt: now
+    }
+    this.emitMarketData()
+  }
+
   private applyCapturedWindow(parsed: ReadOnlyWindowQuote, receivedAt: number): void {
     const windows = [...(this.snapshot?.windows ?? []).filter((window) => window.marketId !== parsed.marketId), parsed]
       .sort((left, right) => left.startTime - right.startTime || left.durationMinutes - right.durationMinutes)
     this.snapshot = { fetchedAt: receivedAt, windows }
     this.status = {
       connectionState: 'CONNECTED', marketCount: windows.length, updatedAt: receivedAt,
-      message: `网页单页面被动盘口已接收（${windows.length}个市场）；没有额外调用内部接口`
+      message: `网页单页面被动盘口已接收（${windows.length}个市场）；${this.passiveDiagnosticsSuffix().replace(/^；/, '')}；没有额外调用内部接口`
     }
     this.emitMarketData()
   }

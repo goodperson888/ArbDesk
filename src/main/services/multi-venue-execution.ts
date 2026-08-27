@@ -12,10 +12,12 @@ import type { MexcBrowserManager } from './mexc-browser'
 import type { PolymarketLiveBroker } from './polymarket-live'
 import type { KalshiTradingService } from './kalshi-trading'
 import type { GateOrderTransport } from '../platforms/adapters/gate-adapter'
+import type { PredictFunTradingService } from './predict-fun-trading'
 import { MexcVenueAdapter } from '../platforms/adapters/mexc-adapter'
 import { PolymarketVenueAdapter } from '../platforms/adapters/polymarket-adapter'
 import { KalshiVenueAdapter } from '../platforms/adapters/kalshi-adapter'
 import { GateVenueAdapter } from '../platforms/adapters/gate-adapter'
+import { PredictFunVenueAdapter } from '../platforms/adapters/predict-fun-adapter'
 import { TwoLegExecutionMachine } from '../domain/two-leg-execution'
 import type { ExecutionSessionStore } from './execution-session-store'
 
@@ -24,6 +26,7 @@ interface PairExecutionDependencies {
   polymarket?: PolymarketLiveBroker
   kalshi: KalshiTradingService
   gate?: GateOrderTransport
+  predictFun?: PredictFunTradingService
   settings: () => RiskSettings
   comparisonProvider: (comparisonId: string) => MultiVenueComparison | undefined
   kalshiCredentialsReady: () => Promise<boolean>
@@ -35,8 +38,8 @@ interface PairExecutionDependencies {
 function pairFor(legs: MultiVenueExecutionLegRequest[]): { first: MultiVenueExecutionLegRequest; second: MultiVenueExecutionLegRequest } {
   const kalshi = legs.find((leg) => leg.venueId === 'KALSHI')
   const other = legs.find((leg) => leg.venueId !== 'KALSHI')
-  if (!kalshi || !other || !['MEXC', 'POLYMARKET', 'GATE'].includes(other.venueId)) {
-    throw new Error('当前双腿执行需要 MEXC、Polymarket 或 Gate 与 Kalshi 组成已验证路线')
+  if (!kalshi || !other || !['MEXC', 'POLYMARKET', 'GATE', 'PREDICT_FUN'].includes(other.venueId)) {
+    throw new Error('当前双腿执行需要 MEXC、Polymarket、Predict.fun 或 Gate 与 Kalshi 组成已验证路线')
   }
   // Keep the mature route ordering: MEXC's web order is the lead leg and
   // Polymarket's FAK is the lead leg for the direct-API route. Kalshi is always
@@ -55,6 +58,7 @@ export class MultiVenueExecutionService {
     if (dependencies.polymarket) this.adapters.set('POLYMARKET', new PolymarketVenueAdapter(dependencies.polymarket))
     this.adapters.set('KALSHI', new KalshiVenueAdapter(dependencies.kalshi))
     if (dependencies.gate) this.adapters.set('GATE', new GateVenueAdapter(dependencies.gate, { liveEnabledProvider: () => dependencies.settings().gateLiveEnabled === true }))
+    if (dependencies.predictFun) this.adapters.set('PREDICT_FUN', new PredictFunVenueAdapter(dependencies.predictFun, () => dependencies.settings().predictFunLiveEnabled === true))
   }
 
   async execute(command: MultiVenueExecutionCommand): Promise<MultiVenueExecutionReceipt> {
@@ -78,7 +82,9 @@ export class MultiVenueExecutionService {
         ? settings.mexcAutomationEnabled
         : first.venueId === 'POLYMARKET'
           ? settings.polymarketLiveEnabled
-          : first.venueId === 'GATE' && settings.gateLiveEnabled
+          : first.venueId === 'GATE'
+            ? settings.gateLiveEnabled
+            : first.venueId === 'PREDICT_FUN' && settings.predictFunLiveEnabled
       const kalshiCredentialsReady = await this.dependencies.kalshiCredentialsReady()
       const gateDuration = comparison.durationMinutes === 5 || comparison.durationMinutes === 15
         ? comparison.durationMinutes

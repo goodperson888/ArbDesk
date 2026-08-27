@@ -40,7 +40,7 @@ export class PredictFunCredentialStore {
     }
     const configured = Boolean(encryptionAvailable && apiKeyMasked)
     const tradingConfigured = Boolean(
-      configured && stored?.accountType && stored.accountAddress && stored.signerAddress && stored.signerPrivateKeyEncrypted
+      configured && (environmentKey || stored?.apiKeyEncrypted) && stored?.accountType && stored.accountAddress && stored.signerAddress && stored.signerPrivateKeyEncrypted
     )
     return {
       configured,

@@ -1193,7 +1193,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   async function setMode(mode: 'SIMULATION' | 'ASSISTED'): Promise<void> {
     const result = await run(() => window.arbApp.updateSettings({
       mode,
-      ...(mode === 'SIMULATION' ? { mexcAutomationEnabled: false, polymarketLiveEnabled: false, allowUnprofitableTestTrade: false } : {})
+      ...(mode === 'SIMULATION' ? { mexcAutomationEnabled: false, polymarketLiveEnabled: false, gateLiveEnabled: false, predictFunLiveEnabled: false, kalshiLiveEnabled: false, allowUnprofitableTestTrade: false } : {})
     }))
     if (result && snapshot) setSnapshot({ ...snapshot, settings: result })
   }
@@ -1364,7 +1364,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       return
     }
     const otherLeg = selectedComparison.legs.find((leg) => leg.venueId !== 'KALSHI')
-    if (!otherLeg || (otherLeg.venueId !== 'MEXC' && otherLeg.venueId !== 'POLYMARKET' && otherLeg.venueId !== 'GATE')) {
+    if (!otherLeg || (otherLeg.venueId !== 'MEXC' && otherLeg.venueId !== 'POLYMARKET' && otherLeg.venueId !== 'GATE' && otherLeg.venueId !== 'PREDICT_FUN')) {
       setMessage('当前机会没有可真实执行的第二平台；仍是观察机会')
       return
     }
@@ -1390,6 +1390,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     }
     if (otherLeg.venueId === 'GATE' && !snapshot.settings.gateLiveEnabled) {
       setMessage('Gate↔Kalshi 双腿执行需要开启 Gate 实盘下单')
+      return
+    }
+    if (otherLeg.venueId === 'PREDICT_FUN' && !snapshot.settings.predictFunLiveEnabled) {
+      setMessage('Predict.fun↔Kalshi 双腿执行需要开启 Predict.fun 实盘下单')
       return
     }
     const requestedQuantity = Number(multiVenueQuantity)
@@ -1476,6 +1480,21 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       if (!confirmed) return
     }
     const result = await run(() => window.arbApp.updateSettings({ gateLiveEnabled: enabling }))
+    if (result) setSnapshot({ ...snapshot, settings: result })
+  }
+
+  async function togglePredictFunLive(): Promise<void> {
+    if (!snapshot) return
+    const enabling = !snapshot.settings.predictFunLiveEnabled
+    if (enabling) {
+      if (!predictFunCredentials?.tradingConfigured) {
+        setMessage('请先保存 Predict.fun API Key、账户地址和签名私钥，并完成不下单联调')
+        return
+      }
+      const confirmed = window.confirm('开启后，Predict.fun 会使用已保存的 API Key 和签名身份提交 LIMIT 订单；成交回读只使用订单状态 GET，不会自动重试 POST。确认开启？')
+      if (!confirmed) return
+    }
+    const result = await run(() => window.arbApp.updateSettings({ predictFunLiveEnabled: enabling }))
     if (result) setSnapshot({ ...snapshot, settings: result })
   }
 
@@ -2395,9 +2414,12 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <div className="credential-notice"><Network aria-hidden="true" /><span>未配置 API Key 时，软件只被动监听这一个网页自身的 REST 响应和 WebSocket 帧，不复制网页 Key、不额外调用内部接口，也不会通过页面下单。</span></div>
                 {predictFunPageStatus && <div className="browser-status-detail"><span>页面</span><p>{predictFunPageStatus.message}</p></div>}
                 {snapshot.multiVenueBoard.platforms.filter((platform) => platform.id === 'LIMITLESS' || platform.id === 'PREDICT_FUN' || platform.id === 'GATE' || platform.id === 'KALSHI').map((platform) => (
-                  <div className="browser-status-detail" key={platform.id}><span>{platform.id === 'LIMITLESS' ? 'LIMIT' : platform.id === 'PREDICT_FUN' ? 'PRED' : platform.id === 'GATE' ? 'GATE' : 'KALSHI'}</span><p>{platform.integrationState === 'PLANNED' ? '暂不纳入短周期扫描' : platform.connectionState === 'CONNECTED' ? '只读行情在线' : platform.connectionState === 'NOT_CONFIGURED' ? '等待网页行情或官方Key' : '连接异常'} · {platform.integrationState === 'READ_ONLY' ? '禁止下单' : platform.integrationState}</p></div>
+                  <div className="browser-status-detail" key={platform.id}><span>{platform.id === 'LIMITLESS' ? 'LIMIT' : platform.id === 'PREDICT_FUN' ? 'PRED' : platform.id === 'GATE' ? 'GATE' : 'KALSHI'}</span><p>{platform.integrationState === 'PLANNED' ? '暂不纳入短周期扫描' : platform.connectionState === 'CONNECTED' ? '行情在线' : platform.connectionState === 'NOT_CONFIGURED' ? '等待网页行情或官方Key' : '连接异常'} · {platform.id === 'PREDICT_FUN' && snapshot.settings.predictFunLiveEnabled ? '实盘下单已开启' : platform.integrationState === 'READ_ONLY' ? '只读' : platform.integrationState}</p></div>
                 ))}
                 {predictFunCredentials?.message && <div className="browser-status-detail"><span>PRED</span><p>{predictFunCredentials.message}{predictFunCredentials.apiKeyMasked ? ` · ${predictFunCredentials.apiKeyMasked}` : ''}{predictFunCredentials.signerAddress ? ` · signer ${shortAddress(predictFunCredentials.signerAddress)}` : ''}</p></div>}
+                <button className={`wide-secondary ${snapshot.settings.predictFunLiveEnabled ? 'live-toggle enabled' : ''}`} onClick={() => void togglePredictFunLive()} disabled={busy || (!snapshot.settings.predictFunLiveEnabled && !predictFunCredentials?.tradingConfigured)}>
+                  <ShieldCheck aria-hidden="true" />{snapshot.settings.predictFunLiveEnabled ? '关闭 Predict.fun 实盘下单' : '开启 Predict.fun 实盘下单'}
+                </button>
                 <button className="wide-secondary safe-preparation-button" onClick={() => void preparePredictFunWithoutSubmitting()} disabled={busy || !predictFunCredentials?.tradingConfigured}><ShieldCheck aria-hidden="true" />完整联调 Predict.fun（绝不下单）</button>
                 {predictFunPreparation && <PreparationReportView report={predictFunPreparation} />}
                   </div>

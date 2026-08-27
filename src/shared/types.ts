@@ -256,6 +256,8 @@ export interface RiskSettings {
   kalshiLiveEnabled?: boolean
   /** Gate 事件合约页面下单总开关；默认关闭，且必须先捕获真实订单结构。 */
   gateLiveEnabled?: boolean
+  /** Predict.fun 官方 API 下单总开关；默认关闭，需要 API Key 与签名身份。 */
+  predictFunLiveEnabled?: boolean
   allowUnprofitableTestTrade: boolean
   autoOpenEnabled: boolean
   autoOpenQuantityMode: 'FIXED' | 'MAX_PERCENT'

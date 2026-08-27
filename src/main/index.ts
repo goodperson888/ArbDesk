@@ -22,6 +22,7 @@ import { MultiVenueExecutionService } from './services/multi-venue-execution'
 import { ExecutionSessionStore } from './services/execution-session-store'
 import { KalshiPageCapture } from './services/kalshi-page-capture'
 import { PredictFunMarketData } from './services/predict-fun-market-data'
+import { PredictFunTradingService } from './services/predict-fun-trading'
 import { PredictFunPageCapture } from './services/predict-fun-page-capture'
 import { LimitlessMarketData } from './services/limitless-market-data'
 import { MultiVenueMarketData } from './services/multi-venue-market-data'
@@ -178,6 +179,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   ], marketProfile)
   const limitlessPreparation = new LimitlessPreparationService(limitlessCredentials, limitlessMarketData)
   const predictFunPreparation = new PredictFunPreparationService(predictFunCredentials, predictFunMarketData)
+  const predictFunTrading = new PredictFunTradingService(predictFunCredentials, predictFunMarketData)
   const gatePreparation = new GatePreparationService(gateCredentials, gateMarketData, fetch, gateOrderCapture)
   const kalshiPreparation = new KalshiPreparationService(kalshiCredentials, kalshiMarketData, kalshiFetch)
   const controller = new AppController(
@@ -204,6 +206,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     polymarket: polymarketLive,
     kalshi: kalshiTrading,
     gate: gateOrderTransport,
+    predictFun: predictFunTrading,
     settings: () => controller.getSnapshot().settings,
     comparisonProvider: (comparisonId) => controller.getSnapshot().multiVenueBoard.comparisons.find((comparison) => comparison.id === comparisonId),
     kalshiCredentialsReady: async () => (await kalshiCredentials.getSummary()).configured,
@@ -333,6 +336,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     const summary = await predictFunCredentials.update(request)
     predictFunMarketData.credentialsChanged()
     predictFunPreparation.credentialsChanged()
+    predictFunTrading.credentialsChanged()
     await controller.refreshOpportunities()
     return summary
   }))

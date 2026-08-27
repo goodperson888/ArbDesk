@@ -56,13 +56,15 @@ const venues: RegisteredVenue[] = [
   {
     id: 'PREDICT_FUN',
     label: 'Predict.fun',
-    integrationState: 'READ_ONLY',
+    // Direct API orders require an explicit runtime switch plus API Key and
+    // signer credentials; page-only mode remains read-only.
+    integrationState: 'LIVE',
     supportedSubjects: ['BTC'],
     supportedIntervals: ['5m', '15m'],
     capabilities: {
       marketDiscovery: true,
       realtimeBook: true,
-      placeOrder: false,
+      placeOrder: true,
       cancelOrder: false,
       fillStream: false,
       exitPosition: false,

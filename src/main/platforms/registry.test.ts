@@ -6,7 +6,10 @@ describe('venue registry', () => {
     expect(getVenueDescriptor('MEXC').integrationState).toBe('LIVE')
     expect(getVenueDescriptor('POLYMARKET').integrationState).toBe('LIVE')
     expect(getVenueDescriptor('LIMITLESS').integrationState).toBe('READ_ONLY')
-    expect(getVenueDescriptor('PREDICT_FUN').integrationState).toBe('READ_ONLY')
+    expect(getVenueDescriptor('PREDICT_FUN')).toMatchObject({
+      integrationState: 'LIVE',
+      capabilities: { marketDiscovery: true, realtimeBook: true, placeOrder: true }
+    })
     expect(getVenueDescriptor('GATE')).toMatchObject({
       integrationState: 'LIVE',
       capabilities: { marketDiscovery: true, realtimeBook: true, placeOrder: true }

@@ -91,7 +91,7 @@ function legs(route: BidirectionalRoute, now: number): MultiVenueLeg[] {
 
 export function routeToComparison(route: BidirectionalRoute, settings: RiskSettings, now: number): MultiVenueComparison {
   const includesKalshi = route.left.venueId === 'KALSHI' || route.right.venueId === 'KALSHI'
-  const kalshiPairSupported = includesKalshi && [route.left.venueId, route.right.venueId].some((venue) => venue === 'MEXC' || venue === 'POLYMARKET' || venue === 'GATE')
+  const kalshiPairSupported = includesKalshi && [route.left.venueId, route.right.venueId].some((venue) => venue === 'MEXC' || venue === 'POLYMARKET' || venue === 'GATE' || venue === 'PREDICT_FUN')
   const comparisonLegs = legs(route, now)
   const maxAge = Math.max(...comparisonLegs.map((leg) => leg.quoteAgeMs))
   const staleLegs = comparisonLegs.filter((leg) => leg.quoteAgeMs > settings.maxQuoteAgeMs)
