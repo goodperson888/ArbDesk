@@ -4,11 +4,12 @@ import type { PredictFunPageCaptureStatus } from '../../shared/types'
 export type { PredictFunPageCaptureStatus } from '../../shared/types'
 
 const PAGE_START_TIMEOUT_MS = 20_000
-// The passive page is anchored to the 15m market URL. Reloading it every 5m
-// tears down the page WebSocket twice per 15m window and creates an avoidable
-// period with no captured book. The page itself exposes both 5m and 15m
-// markets, so roll only when that anchor actually changes.
-const PAGE_ROLL_INTERVAL_MS = 15 * 60_000
+// The page is anchored to the current 15m URL, but the 5m market IDs exposed
+// by that page rotate every five minutes. Reload once at the 5m boundary so
+// its GraphQL directory and WebSocket subscriptions advance together. This is
+// a page-owned refresh, not an additional application API poll.
+const PAGE_ROLL_INTERVAL_MS = 5 * 60_000
+const PAGE_ROLL_SETTLE_MS = 1_250
 
 function currentPredictMarketUrl(now = Date.now()): string {
   const slot = Math.floor(now / 900_000) * 900
@@ -85,7 +86,9 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   private lastCaptureAt?: number
   private lastStatusNotifyAt = 0
   private loadedRollSlot?: number
+  private lastPageRollAt?: number
   private rollPromise?: Promise<void>
+  private rollTimer?: NodeJS.Timeout
   private responseListeners = new Set<(event: PredictFunCapturedResponse) => void>()
   private frameListeners = new Set<(event: PredictFunCapturedWebSocketFrame) => void>()
   private statusListeners = new Set<(status: PredictFunPageCaptureStatus) => void>()
@@ -142,6 +145,8 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     const window = this.window
     if (!window || window.isDestroyed()) return
     this.destroying = true
+    if (this.rollTimer) clearTimeout(this.rollTimer)
+    this.rollTimer = undefined
     window.destroy()
   }
 
@@ -197,6 +202,8 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     })
     window.on('closed', () => {
       clearTimeout(startupTimeout)
+      if (this.rollTimer) clearTimeout(this.rollTimer)
+      this.rollTimer = undefined
       if (this.window === window) this.window = undefined
       this.socketUrls.clear()
       const wasDestroying = this.destroying
@@ -215,7 +222,11 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     this.attachDebugger(window, !show)
     const initialRollSlot = Math.floor(Date.now() / PAGE_ROLL_INTERVAL_MS)
     void window.loadURL(currentPredictMarketUrl())
-      .then(() => { this.loadedRollSlot = initialRollSlot })
+      .then(() => {
+        this.loadedRollSlot = initialRollSlot
+        this.lastPageRollAt = Date.now()
+        this.scheduleNextRoll(window)
+      })
       .catch((error) => {
         clearTimeout(startupTimeout)
         this.setStatus('DISCONNECTED', `Predict.fun 页面无法打开：${error instanceof Error ? error.message : String(error)}`)
@@ -227,12 +238,28 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     if (this.loadedRollSlot === rollSlot) return
     if (this.rollPromise) return await this.rollPromise
     this.rollPromise = window.loadURL(currentPredictMarketUrl())
-      .then(() => { this.loadedRollSlot = rollSlot })
+      .then(() => {
+        this.loadedRollSlot = rollSlot
+        this.lastPageRollAt = Date.now()
+      })
       .catch((error) => {
         this.setStatus('DISCONNECTED', `Predict.fun 新轮次页面刷新失败：${error instanceof Error ? error.message : String(error)}`)
       })
       .finally(() => { this.rollPromise = undefined })
     await this.rollPromise
+  }
+
+  private scheduleNextRoll(window: BrowserWindow): void {
+    if (this.rollTimer) clearTimeout(this.rollTimer)
+    const now = Date.now()
+    const nextBoundary = (Math.floor(now / PAGE_ROLL_INTERVAL_MS) + 1) * PAGE_ROLL_INTERVAL_MS
+    this.rollTimer = setTimeout(async () => {
+      this.rollTimer = undefined
+      if (this.window !== window || window.isDestroyed()) return
+      await this.refreshForCurrentRoll(window)
+      if (this.window === window && !window.isDestroyed()) this.scheduleNextRoll(window)
+    }, Math.max(1_000, nextBoundary - now + PAGE_ROLL_SETTLE_MS))
+    this.rollTimer.unref()
   }
 
   private attachDebugger(window: BrowserWindow, backgroundCapture: boolean): void {
@@ -312,7 +339,8 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   }
 
   private captureStatusMessage(): string {
-    return `Predict.fun 单页面被动监听在线；已捕获 ${this.responseCount} 个目标 REST/GraphQL 响应、${this.webSocketFrameCount} 个 WebSocket 帧，没有额外调用内部接口`
+    const roll = this.lastPageRollAt ? `；页面目录最近换轮 ${new Date(this.lastPageRollAt).toLocaleTimeString('zh-CN', { hour12: false })}` : ''
+    return `Predict.fun 单页面被动监听在线；已捕获 ${this.responseCount} 个目标 REST/GraphQL 响应、${this.webSocketFrameCount} 个 WebSocket 帧${roll}，没有额外调用内部接口`
   }
 
   private setStatus(state: PredictFunPageCaptureStatus['state'], message: string): void {

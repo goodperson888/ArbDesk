@@ -392,6 +392,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private passiveParseRejectedCount = 0
   private passiveLastReason = ''
   private lastPassiveDiagnosticNotifyAt = 0
+  private lastDirectoryAt = 0
 
   constructor(
     private readonly apiKeyProvider: () => Promise<string | undefined>,
@@ -692,7 +693,8 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         if (!officialSocket) {
           this.passiveUnmappedFrameCount += 1
           const directoryIds = [...this.marketContexts.keys()].slice(0, 8).join(',') || '空'
-          this.passiveLastReason = `盘口 marketId ${resolvedMarketId} 不在当前目录（目录 ${directoryIds}）`
+          const directoryAge = this.lastDirectoryAt ? `${Math.max(0, Math.round((Date.now() - this.lastDirectoryAt) / 1_000))}秒前更新` : '尚未建立'
+          this.passiveLastReason = `盘口 marketId ${resolvedMarketId} 不在当前目录（目录 ${directoryIds}，${directoryAge}）`
           this.notifyPassiveDiagnostics()
         }
         return
@@ -760,6 +762,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         return
       }
       this.marketContexts = new Map(candidates.flatMap((context) => context.market.id ? [[String(context.market.id), context]] : []))
+      this.lastDirectoryAt = receivedAt
       if (this.snapshot) {
         const wanted = new Set(this.marketContexts.keys())
         this.snapshot = { fetchedAt: receivedAt, windows: this.snapshot.windows.filter((window) => wanted.has(window.marketId)) }
@@ -794,6 +797,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         return
       }
       this.marketContexts = new Map(candidates.flatMap((context) => context.market.id ? [[String(context.market.id), context]] : []))
+      this.lastDirectoryAt = receivedAt
       if (this.snapshot) {
         const wanted = new Set(this.marketContexts.keys())
         this.snapshot = { fetchedAt: receivedAt, windows: this.snapshot.windows.filter((window) => wanted.has(window.marketId)) }
