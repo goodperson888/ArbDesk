@@ -11,9 +11,9 @@ const PAGE_START_TIMEOUT_MS = 20_000
 const PAGE_ROLL_INTERVAL_MS = 5 * 60_000
 const PAGE_ROLL_SETTLE_MS = 1_250
 
-function currentPredictMarketUrl(now = Date.now()): string {
+function currentPredictMarketUrl(durationMinutes: 5 | 15, now = Date.now()): string {
   const slot = Math.floor(now / 900_000) * 900
-  return `https://predict.fun/zh-cn/market/btc-updown-15m-${slot}`
+  return `https://predict.fun/zh-cn/market/btc-updown-${durationMinutes}m-${slot}`
 }
 
 export interface PredictFunCapturedResponse {
@@ -116,7 +116,7 @@ function isUsefulResponse(rawUrl: string): boolean {
   try {
     const url = new URL(rawUrl)
     const path = url.pathname
-    return path.includes('/v1/categories') || /^\/v1\/markets\/\d+(?:\/orderbook)?$/.test(path) ||
+    return path.includes('/v1/categories') || /(?:^|\/)markets(?:\/|$)/i.test(path) ||
       path.endsWith('/graphql')
   } catch {
     return false
@@ -271,7 +271,7 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     })
     this.attachDebugger(window, !show)
     const initialRollSlot = Math.floor(Date.now() / PAGE_ROLL_INTERVAL_MS)
-    void window.loadURL(currentPredictMarketUrl())
+    void this.loadCurrentRollPair(window)
       .then(() => {
         this.loadedRollSlot = initialRollSlot
         this.lastPageRollAt = Date.now()
@@ -287,7 +287,7 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     const rollSlot = Math.floor(Date.now() / PAGE_ROLL_INTERVAL_MS)
     if (this.loadedRollSlot === rollSlot) return
     if (this.rollPromise) return await this.rollPromise
-    this.rollPromise = window.loadURL(currentPredictMarketUrl())
+    this.rollPromise = this.loadCurrentRollPair(window)
       .then(() => {
         this.loadedRollSlot = rollSlot
         this.lastPageRollAt = Date.now()
@@ -297,6 +297,15 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
       })
       .finally(() => { this.rollPromise = undefined })
     await this.rollPromise
+  }
+
+  // A single hidden BrowserWindow visits both rolling pages in sequence. This
+  // gives the page its own 5m and 15m directory queries without keeping two
+  // Chromium renderers alive; the final page remains 15m for stable streaming.
+  private async loadCurrentRollPair(window: BrowserWindow): Promise<void> {
+    await window.loadURL(currentPredictMarketUrl(5))
+    await new Promise<void>((resolve) => setTimeout(resolve, PAGE_ROLL_SETTLE_MS))
+    await window.loadURL(currentPredictMarketUrl(15))
   }
 
   private scheduleNextRoll(window: BrowserWindow): void {

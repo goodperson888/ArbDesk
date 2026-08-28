@@ -472,6 +472,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private passiveGraphqlResponseCount = 0
   private passiveGraphqlMappedCount = 0
   private passiveMarketDetailCount = 0
+  private passiveLastMarketPath = ''
   private passiveLastGraphqlSchema = ''
   private passiveLastGraphqlOperation = ''
   private passiveLastGraphqlSlugs = ''
@@ -847,7 +848,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         this.emitMarketData()
         return
       }
-      this.marketContexts = new Map(candidates.flatMap((context) => context.market.id ? [[String(context.market.id), context]] : []))
+      this.mergePassiveMarketContexts(candidates, receivedAt)
       this.lastDirectoryAt = receivedAt
       if (this.snapshot) {
         const wanted = new Set(this.marketContexts.keys())
@@ -863,7 +864,8 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       return
     }
     const isGraphql = path.endsWith('/graphql')
-    const isMarketDetail = /^\/v1\/markets\/\d+$/.test(path)
+    const isMarketDetail = /(?:^|\/)markets\/\d+$/i.test(path)
+    if (/(?:^|\/)markets(?:\/|$)/i.test(path)) this.passiveLastMarketPath = path
     if (isGraphql || isMarketDetail) {
       if (isGraphql) this.passiveGraphqlResponseCount += 1
       if (isMarketDetail) this.passiveMarketDetailCount += 1
@@ -901,7 +903,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         this.emitMarketData()
         return
       }
-      this.marketContexts = new Map(candidates.flatMap((context) => context.market.id ? [[String(context.market.id), context]] : []))
+      this.mergePassiveMarketContexts(candidates, receivedAt)
       this.lastDirectoryAt = receivedAt
       if (this.snapshot) {
         const wanted = new Set(this.marketContexts.keys())
@@ -936,11 +938,25 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     this.handleStreamPayload(message, false)
   }
 
+  private mergePassiveMarketContexts(candidates: Array<{ category: PredictCategory; market: PredictMarket }>, now: number): void {
+    const merged = new Map(this.marketContexts)
+    for (const context of candidates) {
+      if (context.market.id) merged.set(String(context.market.id), context)
+    }
+    for (const [marketId, context] of merged) {
+      const endTime = categoryWindowTimes(context.category)?.endTime
+      if (endTime !== undefined && endTime <= now) merged.delete(marketId)
+    }
+    this.marketContexts = merged
+  }
+
   private passiveDiagnosticsSuffix(): string {
     const graphql = this.passiveGraphqlResponseCount > 0
       ? `；GraphQL目录 ${this.passiveGraphqlMappedCount}/${this.passiveGraphqlResponseCount}${this.passiveLastGraphqlOperation ? `，操作 ${this.passiveLastGraphqlOperation}` : ''}${this.passiveLastGraphqlSlugs ? `，slug ${this.passiveLastGraphqlSlugs}` : ''}${this.passiveLastGraphqlSchema ? `，字段 ${this.passiveLastGraphqlSchema}` : ''}`
       : ''
-    const marketDetail = this.passiveMarketDetailCount > 0 ? `；REST市场详情 ${this.passiveMarketDetailCount}` : ''
+    const marketDetail = this.passiveMarketDetailCount > 0
+      ? `；REST市场详情 ${this.passiveMarketDetailCount}${this.passiveLastMarketPath ? `（${this.passiveLastMarketPath}）` : ''}`
+      : this.passiveLastMarketPath ? `；REST市场路径 ${this.passiveLastMarketPath}` : ''
     if (this.passiveFrameCount === 0) return `${graphql}${marketDetail}；页面尚未收到可解析的 WebSocket 帧`
     const reason = this.passiveLastReason ? `，最近原因：${this.passiveLastReason}` : ''
     return `${graphql}${marketDetail}；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）`
