@@ -1150,7 +1150,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
 
   private passiveDiagnosticsSuffix(): string {
     const graphql = this.passiveGraphqlResponseCount > 0
-      ? `；GraphQL目录 ${this.passiveGraphqlMappedCount}/${this.passiveGraphqlResponseCount}${this.passiveLastGraphqlOperation ? `，操作 ${this.passiveLastGraphqlOperation}` : ''}${this.passiveLastGraphqlSlugs ? `，slug ${this.passiveLastGraphqlSlugs}` : ''}${this.passiveLastGraphqlSchema ? `，字段 ${this.passiveLastGraphqlSchema}` : ''}`
+      ? `；GraphQL目录 ${this.passiveGraphqlMappedCount}/${this.passiveGraphqlResponseCount}${this.passiveLastGraphqlOperation ? `，操作 ${this.passiveLastGraphqlOperation}${isNonMarketGraphqlOperation(this.passiveLastGraphqlOperation) ? '（非市场响应，已忽略）' : ''}` : ''}${this.passiveLastGraphqlSlugs ? `，slug ${this.passiveLastGraphqlSlugs}` : ''}${this.passiveLastGraphqlSchema ? `，字段 ${this.passiveLastGraphqlSchema}` : ''}`
       : ''
     const marketDetail = this.passiveMarketDetailCount > 0
       ? `；REST市场详情 ${this.passiveMarketDetailCount}${this.passiveLastMarketPath ? `（${this.passiveLastMarketPath}）` : ''}`
