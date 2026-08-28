@@ -128,7 +128,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   const gateCredentials = new GateCredentialStore(join(dataDirectory, 'gate-credentials.json'))
   const kalshiCredentials = new KalshiCredentialStore(join(dataDirectory, 'kalshi-credentials.json'))
   const limitlessMarketData = new LimitlessMarketData({ hmacCredentialsProvider: () => limitlessCredentials.getHmacCredentials() })
-  const predictFunPageCapture = new PredictFunPageCapture()
+  const predictFunPageCapture = new PredictFunPageCapture(fingerprintRuntime)
   const predictFunMarketData = new PredictFunMarketData(
     () => predictFunCredentials.getApiKey(),
     undefined,

@@ -1,5 +1,7 @@
 import { app, BrowserWindow, shell } from 'electron'
+import type { CDPSession, Page } from 'playwright-core'
 import type { PredictFunPageCaptureStatus } from '../../shared/types'
+import type { FingerprintBrowserRuntime } from './fingerprint-browser-runtime'
 
 export type { PredictFunPageCaptureStatus } from '../../shared/types'
 
@@ -250,6 +252,10 @@ function isUsefulResponse(rawUrl: string): boolean {
 
 export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   private window?: BrowserWindow
+  private fingerprintPage?: Page
+  private fingerprintSession?: CDPSession
+  private fingerprintSocketUrls = new Map<string, string>()
+  private fingerprintStartPromise?: Promise<void>
   private startPromise?: Promise<void>
   private stopping = false
   private destroying = false
@@ -273,7 +279,7 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   private frameListeners = new Set<(event: PredictFunCapturedWebSocketFrame) => void>()
   private statusListeners = new Set<(status: PredictFunPageCaptureStatus) => void>()
 
-  constructor() {
+  constructor(private readonly fingerprintRuntime?: FingerprintBrowserRuntime) {
     app.once('before-quit', () => {
       this.stopping = true
       this.window?.destroy()
@@ -286,6 +292,9 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
 
   canExecutePageOrders(durationMinutes?: 5 | 15): boolean {
     if (durationMinutes !== undefined && durationMinutes !== 5 && durationMinutes !== 15) return false
+    // Page execution is currently implemented for the app-owned window only.
+    // Fingerprint monitoring is intentionally read-only until its controls are
+    // validated against the user's logged-in Predict.fun page.
     return Boolean(this.window && !this.window.isDestroyed() && this.status.state === 'CONNECTED')
   }
 
@@ -499,6 +508,20 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   }
 
   async start(show = false): Promise<void> {
+    if (this.fingerprintRuntime?.isConfigured()) {
+      if (this.fingerprintPage && !this.fingerprintPage.isClosed() && this.fingerprintSession) {
+        if (show) await this.fingerprintPage.bringToFront()
+        return
+      }
+      if (this.fingerprintStartPromise) {
+        await this.fingerprintStartPromise
+        if (show) await this.fingerprintPage?.bringToFront()
+        return
+      }
+      this.fingerprintStartPromise = this.createFingerprintPage(show)
+      try { await this.fingerprintStartPromise } finally { this.fingerprintStartPromise = undefined }
+      return
+    }
     if (this.window && !this.window.isDestroyed()) {
       await this.refreshForCurrentRoll(this.window)
       if (show) {
@@ -521,6 +544,14 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   }
 
   stop(): void {
+    if (this.fingerprintPage || this.fingerprintSession || this.fingerprintStartPromise) {
+      void this.fingerprintSession?.detach().catch(() => undefined)
+      this.fingerprintSession = undefined
+      this.fingerprintSocketUrls.clear()
+      this.fingerprintPage = undefined
+      this.setStatus('IDLE', 'Predict.fun 指纹浏览器页面监听已停止；页面本身未关闭')
+      return
+    }
     const window = this.window
     if (!window || window.isDestroyed()) return
     this.destroying = true
@@ -530,6 +561,10 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   }
 
   open(): void {
+    if (this.fingerprintPage && !this.fingerprintPage.isClosed()) {
+      void this.fingerprintPage.bringToFront()
+      return
+    }
     if (!this.window || this.window.isDestroyed()) {
       void this.start(true)
       return
@@ -615,6 +650,107 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
         clearTimeout(startupTimeout)
         this.setStatus('DISCONNECTED', `Predict.fun 页面无法打开：${error instanceof Error ? error.message : String(error)}`)
       })
+  }
+
+  private async createFingerprintPage(show: boolean): Promise<void> {
+    this.setStatus('STARTING', '正在接管已登录的 Predict.fun 指纹浏览器页面；只监听页面自身请求')
+    let page: Page
+    try {
+      page = await this.fingerprintRuntime!.attach('PREDICT_FUN', {
+        hosts: ['predict.fun'], createIfMissing: true, startupUrl: currentPredictMarketUrl(15)
+      })
+    } catch (error) {
+      this.setStatus('DISCONNECTED', `Predict.fun 指纹浏览器接管失败：${error instanceof Error ? error.message : String(error)}`)
+      return
+    }
+    this.fingerprintPage = page
+    page.on('close', () => {
+      if (this.fingerprintPage !== page) return
+      void this.fingerprintSession?.detach().catch(() => undefined)
+      this.fingerprintSession = undefined
+      this.fingerprintPage = undefined
+      this.fingerprintSocketUrls.clear()
+      this.setStatus('DISCONNECTED', 'Predict.fun 指纹浏览器页面已关闭')
+    })
+    try {
+      const session = await page.context().newCDPSession(page)
+      this.fingerprintSession = session
+      await session.send('Network.enable')
+      session.on('Network.requestWillBeSent', (raw) => {
+        const event = raw as CdpRequestWillBeSent
+        const url = event.request?.url ?? ''
+        if (event.requestId && isLikelyPredictOrderRequest(url, event.request?.method, event.request?.postData)) {
+          this.orderRequestIds.add(event.requestId)
+          const body = traceBody(event.request?.postData)
+          this.pushOrderTrace({ kind: 'REQUEST', endpoint: traceEndpoint(url), method: String(event.request?.method ?? 'POST').toUpperCase(), resourceType: event.type, bodyFormat: body.format, bodyBytes: body.bytes, requestFields: body.fields, operationName: body.operationName, bodyPreview: body.preview, pageUrl: traceEndpoint(page.url()), receivedAt: Date.now() })
+        }
+        if (event.requestId && isPredictHost(url) && url.includes('/graphql')) {
+          const metadata = graphqlRequestMetadata(event.request?.postData)
+          if (metadata) this.graphqlRequests.set(event.requestId, metadata)
+        }
+      })
+      session.on('Network.responseReceived', (raw) => { void this.handleFingerprintResponse(session, page, raw as CdpResponseReceived) })
+      session.on('Network.webSocketCreated', (raw) => {
+        const event = raw as CdpWebSocketCreated
+        if (event.requestId && event.url && isPredictHost(event.url)) this.fingerprintSocketUrls.set(event.requestId, event.url)
+      })
+      session.on('Network.webSocketClosed', (raw) => {
+        const requestId = (raw as { requestId?: string }).requestId
+        if (requestId) this.fingerprintSocketUrls.delete(requestId)
+      })
+      session.on('Network.webSocketFrameReceived', (raw) => this.handleFingerprintFrame(raw as CdpWebSocketFrame, page.url(), 'RECEIVED'))
+      session.on('Network.webSocketFrameSent', (raw) => this.handleFingerprintFrame(raw as CdpWebSocketFrame, page.url(), 'SENT'))
+      if (show) await page.bringToFront()
+      this.setStatus('CONNECTED', this.captureStatusMessage('已接管指纹浏览器'))
+    } catch (error) {
+      await this.fingerprintSession?.detach().catch(() => undefined)
+      this.fingerprintSession = undefined
+      this.fingerprintPage = undefined
+      this.setStatus('DISCONNECTED', `Predict.fun 指纹浏览器网络监听失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private async handleFingerprintResponse(session: CDPSession, page: Page, event: CdpResponseReceived): Promise<void> {
+    const url = event.response?.url ?? ''
+    if (!event.requestId || !isUsefulResponse(url) || !['XHR', 'Fetch'].includes(event.type ?? '')) return
+    const isOrderResponse = this.orderRequestIds.has(event.requestId)
+    if (isOrderResponse) this.orderRequestIds.delete(event.requestId)
+    try {
+      const result = await session.send('Network.getResponseBody', { requestId: event.requestId }) as { body?: string; base64Encoded?: boolean }
+      const body = result.base64Encoded ? Buffer.from(result.body ?? '', 'base64').toString('utf8') : (result.body ?? '')
+      if (isOrderResponse) {
+        const meta = traceBody(body)
+        this.pushOrderTrace({ kind: 'RESPONSE', endpoint: traceEndpoint(url), status: event.response?.status, resourceType: event.type, bodyFormat: meta.format, bodyBytes: meta.bytes, responseFields: meta.fields, operationName: meta.operationName, bodyPreview: meta.preview, pageUrl: traceEndpoint(page.url()), receivedAt: Date.now() })
+      }
+      if (!body) return
+      const requestMetadata = this.graphqlRequests.get(event.requestId)
+      this.graphqlRequests.delete(event.requestId)
+      const captured: PredictFunCapturedResponse = { url, body, receivedAt: Date.now(), pageUrl: page.url(), operationName: requestMetadata?.operationName, requestSlugs: requestMetadata?.slugs, requestMarketIds: requestMetadata?.marketIds }
+      this.responseCount += 1
+      this.lastCaptureAt = captured.receivedAt
+      this.setStatus('CONNECTED', this.captureStatusMessage('已接管指纹浏览器'))
+      for (const listener of this.responseListeners) listener(captured)
+    } catch {
+      // Cached, redirected or evicted responses may disappear before CDP reads them.
+    }
+  }
+
+  private handleFingerprintFrame(event: CdpWebSocketFrame, pageUrl: string, direction: 'SENT' | 'RECEIVED'): void {
+    const frame = event.response ?? event.request
+    if (!event.requestId || frame?.opcode !== 1 || typeof frame.payloadData !== 'string') return
+    const url = this.fingerprintSocketUrls.get(event.requestId)
+    if (!url) return
+    const payload = frame.payloadData
+    if (this.orderCapturing && /order|trade|fill|mutation|execution|place/i.test(payload)) {
+      const body = traceBody(payload)
+      this.pushOrderTrace({ kind: 'WEBSOCKET', endpoint: traceEndpoint(url), direction, bodyFormat: body.format, bodyBytes: body.bytes, responseFields: body.fields, operationName: body.operationName, bodyPreview: body.preview, pageUrl: traceEndpoint(pageUrl), receivedAt: Date.now() })
+    }
+    if (payload.length > 2_000_000 || !/predictOrderbook|predict(?:Trading|Market)Status|order[._:/-]?book|"type"\s*:\s*"M"/i.test(payload)) return
+    const captured = { url, payload, receivedAt: Date.now(), pageUrl }
+    this.webSocketFrameCount += 1
+    this.lastCaptureAt = captured.receivedAt
+    this.setStatus('CONNECTED', this.captureStatusMessage('已接管指纹浏览器'))
+    for (const listener of this.frameListeners) listener(captured)
   }
 
   private async refreshForCurrentRoll(window: BrowserWindow): Promise<void> {
@@ -827,9 +963,9 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     for (const listener of this.frameListeners) listener(captured)
   }
 
-  private captureStatusMessage(): string {
+  private captureStatusMessage(prefix = '单页面'): string {
     const roll = this.lastPageRollAt ? `；页面目录最近换轮 ${new Date(this.lastPageRollAt).toLocaleTimeString('zh-CN', { hour12: false })}` : ''
-    return `Predict.fun 单页面被动监听在线；已捕获 ${this.responseCount} 个目标 REST/GraphQL 响应、${this.webSocketFrameCount} 个 WebSocket 帧${roll}，没有额外调用内部接口`
+    return `Predict.fun ${prefix}被动监听在线；已捕获 ${this.responseCount} 个目标 REST/GraphQL 响应、${this.webSocketFrameCount} 个 WebSocket 帧${roll}，没有额外调用内部接口`
   }
 
   private setStatus(state: PredictFunPageCaptureStatus['state'], message: string): void {
