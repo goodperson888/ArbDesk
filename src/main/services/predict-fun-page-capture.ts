@@ -35,11 +35,30 @@ export interface PredictFunCapturedWebSocketFrame {
   pageUrl?: string
 }
 
+export interface PredictFunPageOrderIntent {
+  marketId: string
+  outcomeId: string
+  direction: 'UP' | 'DOWN'
+  quantity: string
+  limitPrice: string
+  clientOrderId: string
+  startTime: number
+  durationMinutes: 5 | 15
+  allowSubmit: boolean
+}
+
+export interface PredictFunPageOrderResponse {
+  status: number
+  body: string
+}
+
 export interface PredictFunPageCaptureSource {
   getStatus(): PredictFunPageCaptureStatus
   onResponse(listener: (event: PredictFunCapturedResponse) => void): () => void
   onWebSocketFrame(listener: (event: PredictFunCapturedWebSocketFrame) => void): () => void
   onStatus(listener: (status: PredictFunPageCaptureStatus) => void): () => void
+  canExecutePageOrders?(durationMinutes?: 5 | 15): boolean
+  executePageOrder?(intent: PredictFunPageOrderIntent): Promise<PredictFunPageOrderResponse>
   start(show?: boolean): Promise<void>
   stop(): void
 }
@@ -121,6 +140,16 @@ function isPredictHost(rawUrl: string): boolean {
   }
 }
 
+function isPredictOrderUrl(rawUrl: string): boolean {
+  if (!isPredictHost(rawUrl)) return false
+  try {
+    const path = new URL(rawUrl).pathname
+    return /(?:order|trade|graphql)/i.test(path)
+  } catch {
+    return false
+  }
+}
+
 function isUsefulResponse(rawUrl: string): boolean {
   if (!isPredictHost(rawUrl)) return false
   try {
@@ -163,6 +192,137 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
 
   getStatus(): PredictFunPageCaptureStatus {
     return { ...this.status }
+  }
+
+  canExecutePageOrders(durationMinutes?: 5 | 15): boolean {
+    if (durationMinutes !== undefined && durationMinutes !== 5 && durationMinutes !== 15) return false
+    return Boolean(this.window && !this.window.isDestroyed() && this.status.state === 'CONNECTED')
+  }
+
+  /**
+   * Submit through the logged-in Predict.fun page without copying its
+   * cookies or replaying a captured request. The page owns the session and
+   * Chromium emits the real order request; an uncertain response is surfaced
+   * to the execution machine and is never retried automatically.
+   */
+  async executePageOrder(intent: PredictFunPageOrderIntent): Promise<PredictFunPageOrderResponse> {
+    if (!this.canExecutePageOrders(intent.durationMinutes)) throw new Error('Predict.fun 页面未就绪；请先打开已登录的 5m/15m 单页面')
+    const window = this.window!
+    const targetUrl = currentPredictMarketUrl(intent.durationMinutes, intent.startTime)
+    const currentStart = Number(window.webContents.getURL().match(new RegExp(`/market/btc-updown-${intent.durationMinutes}m-(\\d+)`, 'i'))?.[1] ?? 0) * 1_000
+    if (!currentStart || Math.abs(currentStart - intent.startTime) > 60_000) {
+      await window.loadURL(targetUrl)
+      await new Promise<void>((resolve) => setTimeout(resolve, PAGE_ROLL_SETTLE_MS))
+    }
+    const quantity = Number(intent.quantity)
+    const price = Number(intent.limitPrice)
+    if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0 || price >= 1) {
+      throw new Error('Predict.fun 页面下单数量或价格无效，未操作订单')
+    }
+    const cost = (quantity * price).toFixed(2)
+    const prepared = await this.runPageOrderDom(window, intent, cost, false)
+    if (!prepared) throw new Error('Predict.fun 页面未识别买入控件或金额输入，未操作订单')
+    if (!intent.allowSubmit) return { status: 200, body: JSON.stringify({ status: 'prepared' }) }
+
+    const debug = window.webContents.debugger
+    const requestIds = new Set<string>()
+    const responsePromise = new Promise<PredictFunPageOrderResponse>((resolve, reject) => {
+      let settled = false
+      const finish = (value: PredictFunPageOrderResponse | Error): void => {
+        if (settled) return
+        settled = true
+        debug.removeListener('message', onMessage)
+        clearTimeout(timer)
+        value instanceof Error ? reject(value) : resolve(value)
+      }
+      const timer = setTimeout(() => finish(new Error('已点击 Predict.fun 买入，但 8 秒内没有捕获订单响应；订单状态不明，禁止重试')), 8_000)
+      const onMessage = async (_event: unknown, method: string, rawParams: unknown): Promise<void> => {
+        const params = rawParams as { requestId?: string; request?: { url?: string; method?: string; postData?: string }; response?: { url?: string; status?: number } }
+        if (method === 'Network.requestWillBeSent' && params.requestId && params.request?.method?.toUpperCase() === 'POST' && isPredictOrderUrl(params.request.url ?? '')) {
+          const url = params.request.url ?? ''
+          const postData = params.request.postData ?? ''
+          // Predict.fun currently sends most reads through GraphQL as POST.
+          // Only retain a GraphQL request when its operation is a mutation
+          // that contains an order/trade verb; this prevents a normal market
+          // directory response from being mistaken for an order receipt.
+          if (/\/graphql(?:$|\?)/i.test(url) && (!/mutation/i.test(postData) || !/(order|trade|buy|place|create)/i.test(postData))) return
+          requestIds.add(params.requestId)
+          return
+        }
+        if (method !== 'Network.responseReceived' || !params.requestId || !requestIds.has(params.requestId)) return
+        requestIds.delete(params.requestId)
+        try {
+          const result = await debug.sendCommand('Network.getResponseBody', { requestId: params.requestId }) as { body?: string; base64Encoded?: boolean }
+          const body = result.base64Encoded ? Buffer.from(result.body ?? '', 'base64').toString('utf8') : (result.body ?? '')
+          if (!/order|trade|filled|success|error/i.test(body)) return
+          finish({ status: Number(params.response?.status ?? 0), body })
+        } catch (error) {
+          finish(error instanceof Error ? error : new Error(String(error)))
+        }
+      }
+      debug.on('message', onMessage)
+      void this.runPageOrderDom(window, intent, cost, true).catch((error) => finish(error instanceof Error ? error : new Error(String(error))))
+    })
+    const response = await responsePromise
+    // The passive source keeps the 15m page as its long-lived stream. A 5m
+    // page click temporarily reuses the same hidden Chromium window, then
+    // returns it to the current 15m page so monitoring resumes without a
+    // second renderer.
+    if (intent.durationMinutes === 5 && this.window === window && !window.isDestroyed()) {
+      void window.loadURL(currentPredictMarketUrl(15)).catch(() => undefined)
+    }
+    return response
+  }
+
+  private async runPageOrderDom(window: BrowserWindow, intent: PredictFunPageOrderIntent, cost: string, submit: boolean): Promise<boolean> {
+    return await window.webContents.executeJavaScript(`(async () => {
+      const visible = (node) => {
+        if (!node) return false
+        const rect = node.getBoundingClientRect()
+        const style = getComputedStyle(node)
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
+      }
+      const text = (node) => (node.innerText || node.textContent || '').trim().replace(/\\s+/g, ' ')
+      const buttons = [...document.querySelectorAll('button')].filter(visible)
+      const clickText = (matcher, exact = false) => {
+        const found = buttons.filter((button) => exact ? matcher.test(text(button)) : matcher.test(text(button)))
+        const target = found[found.length - 1]
+        if (!target) return false
+        target.click()
+        return true
+      }
+      clickText(/^买入$/, true)
+      if (!clickText(new RegExp('^' + (${JSON.stringify(intent.direction === 'UP' ? '上涨' : '下跌')}) + '(?:\\\\s|$)', 'i'))) return false
+      const isAmountInput = (node) => {
+        if (!visible(node)) return false
+        const placeholder = (node.getAttribute('placeholder') || '').toLowerCase()
+        const aria = (node.getAttribute('aria-label') || '').toLowerCase()
+        if (/search|搜索/.test(placeholder + aria)) return false
+        const descriptors = (node.type || '') + ' ' + (node.getAttribute('inputmode') || '') + ' ' + placeholder + ' ' + aria
+        return node.tagName === 'TEXTAREA' || node.getAttribute('contenteditable') === 'true' || /number|decimal|amount|cost|金额|数量/.test(descriptors) || !placeholder
+      }
+      let input = [...document.querySelectorAll('input,textarea,[contenteditable="true"]')].find(isAmountInput)
+      if (!input) {
+        const edit = buttons.find((button) => /^编辑$/.test(text(button)))
+        if (edit) edit.click()
+        await new Promise((resolve) => setTimeout(resolve, 250))
+        input = [...document.querySelectorAll('input,textarea,[contenteditable="true"]')].find(isAmountInput)
+      }
+      if (input) {
+        const value = ${JSON.stringify(cost)}
+        if ('value' in input) { input.value = value } else { input.textContent = value }
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        input.dispatchEvent(new Event('change', { bubbles: true }))
+      } else if (!clickText(new RegExp('^\\$' + (${JSON.stringify(cost)}) + '\\b'))) {
+        return false
+      }
+      if (!${submit ? 'true' : 'false'}) return true
+      const submitButtons = [...document.querySelectorAll('button')].filter(visible).filter((button) => /^(?:买入|确认买入|下单)/.test(text(button)) && !/^买入$/.test(text(button)))
+      const submitButton = submitButtons[submitButtons.length - 1]
+      if (!submitButton || submitButton.disabled) return false
+      submitButton.click()
+      return true
+    })()`, true)
   }
 
   onResponse(listener: (event: PredictFunCapturedResponse) => void): () => void {

@@ -59,11 +59,17 @@ describe('bidirectional route builder', () => {
     expect(routeToComparison(route, settings, 10_100).status).toBe('MANUAL_EXECUTABLE')
   })
 
-  it('keeps Predict.fun and Limitless routes read-only', () => {
+  it('allows Predict.fun routes into the validated multi-venue execution board', () => {
     const route = buildBidirectionalRoutes([market('PREDICT_FUN'), market('GATE')], settings, 10_100)[0]
     const comparison = routeToComparison(route, settings, 10_100)
+    expect(comparison.status).toBe('MANUAL_EXECUTABLE')
+  })
+
+  it('keeps Limitless routes read-only', () => {
+    const route = buildBidirectionalRoutes([market('LIMITLESS'), market('GATE')], settings, 10_100)[0]
+    const comparison = routeToComparison(route, settings, 10_100)
     expect(comparison.status).toBe('BLOCKED')
-    expect(comparison.blockReasons).toContain('Predict.fun 当前只读，尚未开放实盘执行')
+    expect(comparison.blockReasons).toContain('Limitless 当前只读，尚未开放实盘执行')
   })
 
   it('marks a Gate↔Kalshi route stale when either quote exceeds the freshness gate', () => {

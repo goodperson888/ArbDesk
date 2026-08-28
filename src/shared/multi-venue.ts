@@ -6,7 +6,7 @@ export type VenueId = string
  * validated independently; keeping this allow-list in shared code prevents a
  * UI route from being accidentally treated as executable by the main process.
  */
-export const MULTI_VENUE_EXECUTION_VENUES = ['MEXC', 'POLYMARKET', 'GATE', 'KALSHI'] as const
+export const MULTI_VENUE_EXECUTION_VENUES = ['MEXC', 'POLYMARKET', 'GATE', 'KALSHI', 'PREDICT_FUN'] as const
 
 export function isMultiVenueExecutionVenue(venueId: VenueId): boolean {
   return (MULTI_VENUE_EXECUTION_VENUES as readonly string[]).includes(venueId.toUpperCase())

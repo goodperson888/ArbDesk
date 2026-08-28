@@ -91,7 +91,6 @@ function legs(route: BidirectionalRoute, now: number): MultiVenueLeg[] {
 
 export function routeToComparison(route: BidirectionalRoute, settings: RiskSettings, now: number): MultiVenueComparison {
   const executionEligible = [route.left.venueId, route.right.venueId].every(isMultiVenueExecutionVenue)
-  const hasPredictFun = [route.left.venueId, route.right.venueId].some((venue) => venue === 'PREDICT_FUN')
   const hasLimitless = [route.left.venueId, route.right.venueId].some((venue) => venue === 'LIMITLESS')
   const comparisonLegs = legs(route, now)
   const maxAge = Math.max(...comparisonLegs.map((leg) => leg.quoteAgeMs))
@@ -104,9 +103,7 @@ export function routeToComparison(route: BidirectionalRoute, settings: RiskSetti
   const blockReasons = [
     executionEligible
       ? '跨平台双腿执行需人工确认；按首腿实际成交量对齐第二腿'
-      : hasPredictFun
-        ? 'Predict.fun 当前只读，尚未开放实盘执行'
-        : hasLimitless
+      : hasLimitless
           ? 'Limitless 当前只读，尚未开放实盘执行'
           : '交易连接器尚未接入',
     route.matchClass === 'EXACT'

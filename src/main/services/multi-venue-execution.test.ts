@@ -140,12 +140,12 @@ describe('multi-venue Kalshi execution', () => {
     expect(mocked.kalshi.placeOrder).not.toHaveBeenCalled()
   })
 
-  it('rejects Predict.fun before any credential lookup or order submission', async () => {
+  it('rejects Limitless before any credential lookup or order submission', async () => {
     const mocked = deps()
     const executionRequest: MultiVenueExecutionRequest = {
       comparisonId: 'predict-gate-1', quantity: '13.00', startTime: Date.now() - 10_000, endTime: Date.now() + 60_000, confirmed: true,
       legs: [
-        { venueId: 'PREDICT_FUN', marketId: 'predict-event', outcomeId: 'predict-token', direction: 'UP', price: '0.40', availableQuantity: '13', quoteAgeMs: 100 },
+        { venueId: 'LIMITLESS', marketId: 'limitless-event', outcomeId: 'limitless-token', direction: 'UP', price: '0.40', availableQuantity: '13', quoteAgeMs: 100 },
         { venueId: 'GATE', marketId: 'gate-event', outcomeId: 'gate-token', direction: 'DOWN', price: '0.40', availableQuantity: '13', quoteAgeMs: 100 }
       ]
     }
@@ -155,7 +155,7 @@ describe('multi-venue Kalshi execution', () => {
       kalshiCredentialsReady: vi.fn(async () => { throw new Error('Kalshi credentials should not be read') })
     } as never)
 
-    await expect(service.execute(executionRequest)).rejects.toThrow('Predict.fun')
+    await expect(service.execute(executionRequest)).rejects.toThrow('Limitless')
     expect(mocked.gate.submit).not.toHaveBeenCalled()
     expect(mocked.kalshi.placeOrder).not.toHaveBeenCalled()
   })

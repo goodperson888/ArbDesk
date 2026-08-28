@@ -22,9 +22,7 @@ export function buildMultiVenueEntryGateReport(args: MultiVenueEntryGateArgs): E
   const unprotected = args.settings.mode === 'ASSISTED' && args.settings.unprotectedExecutionEnabled === true
   const supportedRoute = args.comparison.legs.length === 2 && args.comparison.legs.every((leg) => isMultiVenueExecutionVenue(leg.venueId))
   const unsupportedVenue = args.comparison.legs.find((leg) => !isMultiVenueExecutionVenue(leg.venueId))?.venueId
-  const unsupportedReason = unsupportedVenue === 'PREDICT_FUN'
-    ? 'Predict.fun 当前只读，尚未开放实盘执行'
-    : unsupportedVenue === 'LIMITLESS'
+  const unsupportedReason = unsupportedVenue === 'LIMITLESS'
       ? 'Limitless 当前只读，尚未开放实盘执行'
       : '当前路线尚未接入真实执行'
   const liveReady = (venueId: string): boolean => venueId === 'MEXC'
@@ -35,6 +33,8 @@ export function buildMultiVenueEntryGateReport(args: MultiVenueEntryGateArgs): E
         ? args.settings.gateLiveEnabled === true
         : venueId === 'KALSHI'
           ? args.settings.kalshiLiveEnabled === true
+          : venueId === 'PREDICT_FUN'
+            ? args.settings.predictFunLiveEnabled === true
           : false
   const readiness: EntryGateReadiness[] = [
     { id: 'supported-route', label: supportedRoute ? '双腿路线已接入' : unsupportedReason, passed: supportedRoute, blockReason: unsupportedReason },

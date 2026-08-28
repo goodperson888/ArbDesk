@@ -1351,7 +1351,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   async function executeSelectedMultiVenue(): Promise<void> {
     if (!snapshot || !selectedComparison || selectedComparison.executionProvider !== 'MULTI_VENUE' || selectedComparison.legs.length !== 2) return
     if (!selectedComparison.legs.every((leg) => isMultiVenueExecutionVenue(leg.venueId))) {
-      setMessage('Predict.fun 与 Limitless 当前只读，暂不支持真实双腿下单')
+      setMessage('当前路线包含尚未开放真实执行的平台（Limitless 仍为只读）')
       return
     }
     if (!multiVenueGateReport?.allowed) {
@@ -1449,12 +1449,11 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     if (!snapshot) return
     const enabling = !snapshot.settings.predictFunLiveEnabled
     if (enabling) {
-      if (!predictFunCredentials?.tradingConfigured) {
-        setMessage('请先保存 Predict.fun API Key、账户地址和签名私钥，并完成不下单联调')
+      const pageReady = predictFunPageStatus?.state === 'CONNECTED'
+      if (!predictFunCredentials?.tradingConfigured && !pageReady) {
+        setMessage('请先配置 Predict.fun API 交易身份，或打开已登录的 Predict.fun 5m/15m 页面')
         return
       }
-      const confirmed = window.confirm('开启后，Predict.fun 会使用已保存的 API Key 和签名身份提交 LIMIT 订单；成交回读只使用订单状态 GET，不会自动重试 POST。确认开启？')
-      if (!confirmed) return
     }
     const result = await run(() => window.arbApp.updateSettings({ predictFunLiveEnabled: enabling }))
     if (result) setSnapshot({ ...snapshot, settings: result })
@@ -2345,7 +2344,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 </details>
 
                 <details className="credential-platform-card">
-                  <summary><div><strong>Predict.fun</strong><span>{predictFunCredentials?.tradingConfigured ? '交易身份已配置' : '无 API Key 时仅页面行情监听'}</span><small>API Key 可选；真实页面交互另行布防</small></div><ChevronRight /></summary>
+                  <summary><div><strong>Predict.fun</strong><span>{predictFunCredentials?.tradingConfigured ? 'API交易身份已配置' : predictFunPageStatus?.state === 'CONNECTED' ? '已打开页面，可页面下单' : '等待 API 或已登录页面'}</span><small>支持 5m/15m；有 API 走签名接口，无 API 使用已登录页面控件</small></div><ChevronRight /></summary>
                   <div className="credential-platform-body">
                 <div className="credential-route-card">
                   <strong>Predict.fun 交易身份</strong>
@@ -2373,13 +2372,14 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <button className="wide-secondary" onClick={() => void savePredictFunCredentials()} disabled={busy || !predictFunCredentials?.encryptionAvailable || (!predictFunCredentials?.configured && predictFunApiKey.trim().length < 8)}>{busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <LockKeyhole aria-hidden="true" />}加密保存 Predict.fun 身份</button>
                 <button className="wide-secondary" onClick={() => void openPredictFunPage()} disabled={busy}><ExternalLink aria-hidden="true" />打开 Predict.fun 单页面行情</button>
                 <button className="wide-secondary" onClick={() => void stopPredictFunPage()} disabled={busy}><Square aria-hidden="true" />停止 Predict.fun 监听并释放页面</button>
-                <div className="credential-notice"><Network aria-hidden="true" /><span>未配置 API Key 时，软件只被动监听这一个网页自身的 REST 响应和 WebSocket 帧，不复制网页 Key、不额外调用内部接口，也不会通过页面下单。</span></div>
+                <div className="credential-notice"><Network aria-hidden="true" /><span>未配置 API Key 时，软件只被动监听这一个网页自身的 REST 响应和 WebSocket 帧；开启实盘后会在同一已登录页面按当前 5m/15m 市场模拟点击买入，不复制网页 Key，也不重放捕获请求。</span></div>
                 {predictFunPageStatus && <div className="browser-status-detail"><span>页面</span><p>{predictFunPageStatus.message}</p></div>}
                 {snapshot.multiVenueBoard.platforms.filter((platform) => platform.id === 'LIMITLESS' || platform.id === 'PREDICT_FUN' || platform.id === 'GATE' || platform.id === 'KALSHI').map((platform) => (
                   <div className="browser-status-detail" key={platform.id}><span>{platform.id === 'LIMITLESS' ? 'LIMIT' : platform.id === 'PREDICT_FUN' ? 'PRED' : platform.id === 'GATE' ? 'GATE' : 'KALSHI'}</span><p>{platform.integrationState === 'PLANNED' ? '暂不纳入短周期扫描' : platform.connectionState === 'CONNECTED' ? '行情在线' : platform.connectionState === 'NOT_CONFIGURED' ? '等待网页行情或官方Key' : '连接异常'} · {platform.id === 'PREDICT_FUN' && snapshot.settings.predictFunLiveEnabled ? '实盘下单已开启' : platform.integrationState === 'READ_ONLY' ? '只读' : platform.integrationState}</p></div>
                 ))}
                 {predictFunCredentials?.message && <div className="browser-status-detail"><span>PRED</span><p>{predictFunCredentials.message}{predictFunCredentials.apiKeyMasked ? ` · ${predictFunCredentials.apiKeyMasked}` : ''}{predictFunCredentials.signerAddress ? ` · signer ${shortAddress(predictFunCredentials.signerAddress)}` : ''}</p></div>}
-                <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>Predict.fun 当前仅接入行情与盘口监听，实盘下单尚未开放；不会进入真实双腿执行。</span></div>
+                <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>Predict.fun 双腿执行已接入：API 身份和页面控件二选一；首次建议用小额、无自动重试方式验证 5m/15m 各一单。</span></div>
+                <button className="wide-secondary" onClick={() => void togglePredictFunLive()} disabled={busy}>{snapshot.settings.predictFunLiveEnabled ? <Square aria-hidden="true" /> : <ShieldCheck aria-hidden="true" />}{snapshot.settings.predictFunLiveEnabled ? '关闭 Predict.fun 实盘下单' : '开启 Predict.fun 实盘下单'}</button>
                 <button className="wide-secondary safe-preparation-button" onClick={() => void preparePredictFunWithoutSubmitting()} disabled={busy || !predictFunCredentials?.tradingConfigured}><ShieldCheck aria-hidden="true" />完整联调 Predict.fun（绝不下单）</button>
                 {predictFunPreparation && <PreparationReportView report={predictFunPreparation} />}
                   </div>

@@ -2,6 +2,6 @@
   "id": "btc-executable-all",
   "subjects": ["BTC"],
   "intervals": ["5m", "15m"],
-  "venues": ["MEXC", "POLYMARKET", "GATE", "KALSHI"],
+  "venues": ["MEXC", "POLYMARKET", "GATE", "KALSHI", "PREDICT_FUN"],
   "routes": ["*"]
 }

@@ -96,13 +96,15 @@ describe('multi venue entry gate adapter', () => {
     expect(result.allowed).toBe(true)
   })
 
-  it('明确阻止 Predict.fun 进入真实双腿门禁', () => {
+  it('允许 Predict.fun 进入真实双腿门禁并受独立实盘开关控制', () => {
     const predict = comparison({
       legs: [
         { venueId: 'PREDICT_FUN', venueLabel: 'Predict.fun', marketId: 'predict-market', outcomeId: 'predict-up', direction: 'UP', price: '0.40', availableQuantity: '20', quoteAgeMs: 100 },
         { venueId: 'GATE', venueLabel: 'Gate', marketId: 'gate-market', outcomeId: 'gate-down', direction: 'DOWN', price: '0.50', availableQuantity: '20', quoteAgeMs: 100 }
       ]
     })
-    expect(report({ comparison: predict }).firstBlockReason).toContain('Predict.fun')
+    const result = report({ comparison: predict, settings: settings({ predictFunLiveEnabled: true }) })
+    expect(result.checks.find((check) => check.id === 'supported-route')?.passed).toBe(true)
+    expect(result.firstBlockReason).not.toContain('Predict.fun 当前只读')
   })
 })

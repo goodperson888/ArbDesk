@@ -23,6 +23,12 @@ export class PredictFunVenueAdapter implements VenueAdapter {
     if (!this.liveEnabledProvider()) throw new Error('Predict.fun 实盘下单开关尚未开启')
     if (!request.confirmed) throw new Error('Predict.fun 双腿执行未完成确认')
     if (!request.marketId || !request.outcomeId) throw new Error('Predict.fun 缺少市场或结果 ID')
+    const duration = Math.round((request.endTime - request.startTime) / 60_000)
+    if (duration !== 5 && duration !== 15) throw new Error(`Predict.fun 不支持 ${duration} 分钟周期`)
+    const mode = typeof this.trading.executionMode === 'function'
+      ? await this.trading.executionMode(duration)
+      : 'API'
+    if (mode === 'UNAVAILABLE') throw new Error('Predict.fun 未配置 API 交易身份，且已登录页面下单不可用；请打开对应 5m/15m 页面并登录')
     const quantity = new Decimal(request.quantity)
     const price = new Decimal(request.limitPrice)
     if (!quantity.isFinite() || quantity.lte(0)) throw new Error('Predict.fun 下单数量无效')

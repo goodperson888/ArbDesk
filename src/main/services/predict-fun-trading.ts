@@ -7,6 +7,7 @@ import { JsonRpcProvider, Wallet, parseEther } from 'ethers'
 import Decimal from 'decimal.js'
 import type { PredictFunCredentialStore, PredictFunCredentials } from './predict-fun-credential-store'
 import type { PredictFunMarketData } from './predict-fun-market-data'
+import type { PredictFunPageCaptureSource } from './predict-fun-page-capture'
 import type { VenueExecutionRequest } from '../platforms/venue-adapter'
 
 const API_BASE = 'https://api.predict.fun'
@@ -52,7 +53,8 @@ export class PredictFunTradingService {
     private readonly credentials: PredictFunCredentialStore,
     private readonly marketData: PredictFunMarketData,
     private readonly fetchImpl: typeof fetch = fetch,
-    rpcUrl = BNB_RPC_URL
+    rpcUrl = BNB_RPC_URL,
+    private readonly pageExecutor?: PredictFunPageCaptureSource
   ) {
     this.provider = new JsonRpcProvider(rpcUrl, 56, { staticNetwork: true })
   }
@@ -63,7 +65,16 @@ export class PredictFunTradingService {
   }
 
   async submit(request: VenueExecutionRequest): Promise<PredictFunOrderResult> {
-    const credentials = await this.credentials.getCredentials()
+    let credentials: PredictFunCredentials | undefined
+    try {
+      credentials = await this.credentials.getCredentials()
+    } catch (error) {
+      if (this.pageExecutor?.executePageOrder && this.pageExecutor.canExecutePageOrders?.(durationFromRequest(request))) {
+        return await this.submitThroughPage(request)
+      }
+      throw error
+    }
+    if (!credentials) throw new Error('Predict.fun 交易身份尚未完整配置')
     const metadata = this.marketData.getTradingMetadata(request.marketId)
     if (!metadata) throw new Error(`Predict.fun 市场 ${request.marketId} 未找到交易元数据`)
     const price = new Decimal(request.limitPrice)
@@ -109,6 +120,34 @@ export class PredictFunTradingService {
     const returnedHash = response.data?.orderHash ?? orderHash
     if (!orderId) throw new Error(`Predict.fun 下单响应未返回订单号（${response.data?.code ?? 'unknown'}）`)
     return { orderId, orderHash: returnedHash, status: 'ACCEPTED', filledQuantity: '0', averagePrice: price.toString() }
+  }
+
+  async executionMode(durationMinutes: 5 | 15): Promise<'API' | 'PAGE' | 'UNAVAILABLE'> {
+    try {
+      const summary = await this.credentials.getSummary()
+      if (summary.tradingConfigured) return 'API'
+    } catch {
+      // Fall through to page mode. A missing API key is expected for many
+      // Predict.fun accounts.
+    }
+    return this.pageExecutor?.canExecutePageOrders?.(durationMinutes) ? 'PAGE' : 'UNAVAILABLE'
+  }
+
+  private async submitThroughPage(request: VenueExecutionRequest): Promise<PredictFunOrderResult> {
+    if (!this.pageExecutor?.executePageOrder) throw new Error('Predict.fun 页面下单执行器不可用')
+    const response = await this.pageExecutor.executePageOrder({
+      marketId: request.marketId,
+      outcomeId: request.outcomeId,
+      direction: request.direction,
+      quantity: request.quantity,
+      limitPrice: request.limitPrice,
+      clientOrderId: request.clientOrderId,
+      startTime: request.startTime,
+      durationMinutes: durationFromRequest(request),
+      allowSubmit: true
+    })
+    const parsed = parsePageOrderResult(response.body, response.status)
+    return parsed
   }
 
   async reconcile(orderHash: string): Promise<PredictFunOrderResult | undefined> {
@@ -223,4 +262,50 @@ function jwtExpiry(token: string): number | undefined {
   } catch {
     return undefined
   }
+}
+
+function durationFromRequest(request: VenueExecutionRequest): 5 | 15 {
+  const duration = Math.round((request.endTime - request.startTime) / 60_000)
+  if (duration !== 5 && duration !== 15) throw new Error(`Predict.fun 不支持 ${duration} 分钟周期`)
+  return duration
+}
+
+function parsePageOrderResult(body: string, httpStatus: number): PredictFunOrderResult {
+  let root: unknown
+  try { root = JSON.parse(body) as unknown } catch { root = undefined }
+  const values: unknown[] = []
+  const walk = (value: unknown, depth = 0): void => {
+    if (depth > 6 || value === null || value === undefined) return
+    values.push(value)
+    if (Array.isArray(value)) { for (const item of value) walk(item, depth + 1); return }
+    if (typeof value === 'object') for (const item of Object.values(value as Record<string, unknown>)) walk(item, depth + 1)
+  }
+  walk(root)
+  const records = values.filter((value): value is Record<string, unknown> => Boolean(value && typeof value === 'object' && !Array.isArray(value)))
+  const read = (keys: string[]): string | undefined => {
+    for (const record of records) for (const key of keys) {
+      const value = record[key]
+      if (typeof value === 'string' || typeof value === 'number') return String(value)
+    }
+    return undefined
+  }
+  const orderId = read(['orderId', 'order_id', 'id'])
+  const orderHash = read(['orderHash', 'order_hash', 'hash'])
+  const filledQuantity = read(['filledQuantity', 'filled_quantity', 'amountFilled', 'filled', 'quantityFilled']) ?? '0'
+  const averagePrice = read(['averagePrice', 'average_price', 'pricePerShare', 'price'])
+  const rawStatus = (read(['status', 'state', 'orderStatus']) ?? '').toUpperCase()
+  const status: PredictFunOrderResult['status'] = ['FILLED', 'MATCHED', 'COMPLETED'].includes(rawStatus)
+    ? 'FILLED'
+    : ['PARTIAL', 'PARTIALLY_FILLED'].includes(rawStatus)
+      ? 'PARTIAL'
+      : ['REJECTED', 'FAILED', 'ERROR'].includes(rawStatus) || httpStatus >= 400
+        ? 'REJECTED'
+        : ['CANCELED', 'CANCELLED', 'EXPIRED'].includes(rawStatus)
+          ? 'CANCELED'
+          : 'ACCEPTED'
+  if (!orderId && !orderHash) {
+    if (httpStatus >= 400) throw new Error(`Predict.fun 页面下单失败（HTTP ${httpStatus}）`)
+    throw new Error('Predict.fun 页面已点击买入但响应未返回订单号；订单状态不明，禁止重试')
+  }
+  return { orderId, orderHash, status, filledQuantity, averagePrice }
 }

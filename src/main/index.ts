@@ -179,7 +179,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   ], marketProfile)
   const limitlessPreparation = new LimitlessPreparationService(limitlessCredentials, limitlessMarketData)
   const predictFunPreparation = new PredictFunPreparationService(predictFunCredentials, predictFunMarketData)
-  const predictFunTrading = new PredictFunTradingService(predictFunCredentials, predictFunMarketData)
+  const predictFunTrading = new PredictFunTradingService(predictFunCredentials, predictFunMarketData, fetch, undefined, predictFunPageCapture)
   const gatePreparation = new GatePreparationService(gateCredentials, gateMarketData, fetch, gateOrderCapture)
   const kalshiPreparation = new KalshiPreparationService(kalshiCredentials, kalshiMarketData, kalshiFetch)
   const controller = new AppController(

@@ -56,17 +56,17 @@ const venues: RegisteredVenue[] = [
   {
     id: 'PREDICT_FUN',
     label: 'Predict.fun',
-    // Market/page observation is live, but real orders remain disabled until
-    // the captured flow has been independently validated.
-    integrationState: 'READ_ONLY',
+    // Supports the official API and the logged-in page click transport. The
+    // explicit user live switch remains the final execution gate.
+    integrationState: 'LIVE',
     supportedSubjects: ['BTC'],
     supportedIntervals: ['5m', '15m'],
     capabilities: {
       marketDiscovery: true,
       realtimeBook: true,
-      placeOrder: false,
+      placeOrder: true,
       cancelOrder: false,
-      fillStream: false,
+      fillStream: true,
       exitPosition: false,
       splitMerge: false
     }

@@ -40,12 +40,13 @@ const leadPriority: Record<string, number> = {
   MEXC: 10,
   POLYMARKET: 20,
   GATE: 30,
-  KALSHI: 40
+  KALSHI: 40,
+  PREDICT_FUN: 50
 }
 
 function pairFor(legs: MultiVenueExecutionLegRequest[]): { first: MultiVenueExecutionLegRequest; second: MultiVenueExecutionLegRequest } {
   if (legs.length !== 2 || legs[0].venueId === legs[1].venueId || legs.some((leg) => !isMultiVenueExecutionVenue(leg.venueId))) {
-    throw new Error('当前双腿执行仅开放 MEXC、Polymarket、Gate、Kalshi 的已验证平台组合；Predict.fun 与 Limitless 暂为只读')
+    throw new Error('当前双腿执行仅开放 MEXC、Polymarket、Gate、Kalshi、Predict.fun 的组合；Limitless 暂为只读')
   }
   // Prefer a direct API leg as the lead where possible. Gate remains ahead of
   // Kalshi to preserve the existing Gate↔Kalshi route semantics.
@@ -61,6 +62,7 @@ function liveReadyForVenue(venueId: string, settings: RiskSettings): boolean {
     case 'POLYMARKET': return settings.polymarketLiveEnabled === true
     case 'GATE': return settings.gateLiveEnabled === true
     case 'KALSHI': return settings.kalshiLiveEnabled === true
+    case 'PREDICT_FUN': return settings.predictFunLiveEnabled === true
     default: return false
   }
 }

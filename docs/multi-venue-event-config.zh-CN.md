@@ -34,8 +34,8 @@ venueId + marketId + eventId + outcomeId + quote/depth
 | Polymarket | 已接入 | 已接入 | 保留成熟链路 |
 | Kalshi | 不纳入 | 已接入 | 双腿人工确认，Kalshi FOK 第二腿 |
 | Limitless | 观察 | 观察 | 只读 |
-| Predict.fun | 观察 | 观察 | 只读 |
-| Gate | 观察 | 观察 | 只读 |
+| Predict.fun | 已接入 | 已接入 | API 或已登录页面双腿执行（人工监督） |
+| Gate | 已接入 | 已接入 | 页面双腿执行（人工监督） |
 
 ## 以后加入 ETH
 

@@ -185,13 +185,6 @@ export class AppController {
     this.settings = await this.store.loadSettings(DEFAULT_SETTINGS)
     this.settings.manualExecutionConditions = defaultManualExecutionConditions(this.settings.manualExecutionConditions)
     this.settings.autoOpenEnabled = false
-    // Predict.fun has market/page observation wired, but its real-order flow
-    // has not been validated yet. Never carry an old persisted live toggle into
-    // a build that explicitly keeps Predict.fun read-only.
-    if (this.settings.predictFunLiveEnabled) {
-      this.settings = { ...this.settings, predictFunLiveEnabled: false }
-      await this.store.saveSettings(this.settings)
-    }
     try {
       this.settings = {
         ...this.settings,
@@ -589,7 +582,8 @@ export class AppController {
       if (!this.liveExecutionEnabled) throw new Error('实盘总开关未启用；开发环境请用 npm run dev:live 启动ArbDesk')
     }
     if (next.predictFunLiveEnabled) {
-      throw new Error('Predict.fun 当前仅只读，实盘下单尚未开放')
+      if (next.mode !== 'ASSISTED') throw new Error('Predict.fun 双腿实盘目前只允许在人工监督模式启用')
+      if (!this.liveExecutionEnabled) throw new Error('实盘总开关未启用；开发环境请用 npm run dev:live 启动ArbDesk')
     }
     if (next.allowUnprofitableTestTrade && next.mode !== 'ASSISTED') {
       throw new Error('小额亏损联调只允许在人工监督模式启用')

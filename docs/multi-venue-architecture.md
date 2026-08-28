@@ -8,7 +8,7 @@
 
 - MEXC 与 Polymarket 当前实盘流程继续由 `LEGACY_MEXC_POLY` 执行器负责。
 - 新机会榜通过 `legacyOpportunityId` 映射回现有 `Opportunity`，不改变下单 IPC、订单状态机和持久化订单格式。
-- 新平台默认只能提供行情和比较数据；未完成回放、模拟和受控实盘验证前，不能获得交易能力。
+- 新平台默认先提供行情和比较数据；通过受控适配后，只有显式人工监督开关开启才可进入双腿执行。
 - Legacy 与新执行器不能同时接管同一套利组。
 
 ## 数据流
@@ -38,7 +38,9 @@
 - `src/main/platforms/registry.ts`：平台注册与能力声明。
 - `src/main/platforms/legacy-board-adapter.ts`：把现有 MEXC/Polymarket 机会只读映射为通用机会榜。
 - `src/main/services/limitless-market-data.ts`：Limitless BTC 5m/15m 市场发现与盘口，只读。
-- `src/main/services/predict-fun-market-data.ts`：Predict.fun BTC 5m/15m 市场发现与盘口，只读。
+- `src/main/services/predict-fun-market-data.ts`：Predict.fun BTC 5m/15m 市场发现与盘口。
+- `src/main/services/predict-fun-page-capture.ts`：单页面被动监听，并按 5m/15m 目标轮次复用已登录页面控件执行一次买入；订单响应通过 CDP 捕获，不重放请求。
+- `src/main/services/predict-fun-trading.ts`：官方 API 签名下单；无 API Key 时回退到页面控件，成交回读仅接受页面真实响应或官方状态查询。
 - `src/main/services/gate-market-data.ts`：Gate 事件合约网页响应/推送的容错解析和 BTC 5m/15m 双向盘口标准化。
 - `src/main/services/gate-page-capture.ts`、`gate-order-capture.ts`、`gate-order-transport.ts`：复用通用指纹浏览器页面，持续捕获用户手动订单期间的脱敏请求/响应/WebSocket 链路，导出后确认真实订单结构，再在显式门禁下执行页面会话订单。
 - `src/main/services/kalshi-market-data.ts`：读取 KXBTC15M 开放市场、YES/NO 互补盘口并接入默认只读扫描；当前不纳入 5 分钟周期。
@@ -71,7 +73,7 @@
 ## 当前只读连接策略
 
 - Limitless 公开 API 不需要密钥。只读取 `automationType=lumy`、CLOB、BTC、5m/15m 市场。
-- Predict.fun 主网没有 API Key 时只启动一个持久网页，并通过 Electron CDP 被动读取网页自身的 categories/orderbook 响应与 WebSocket 帧；不复制网页凭据、不额外调用内部接口。配置官方 Key 后优先使用请求头鉴权 WebSocket，REST 只访问 categories 与 orderbook。
+- Predict.fun 主网没有 API Key 时只启动一个持久网页，并通过 Electron CDP 被动读取网页自身的 categories/orderbook 响应与 WebSocket 帧；不复制网页凭据、不额外调用内部接口。配置官方 Key 后优先使用请求头鉴权 WebSocket，REST 只访问 categories 与 orderbook。需要真实双腿时，无 Key 模式会在该已登录页面按当前 5m/15m URL 模拟点击一次买入，并等待这一次订单响应；不复制 Cookie、不重放捕获请求。
 - Predict.fun API Key 使用系统钥匙串加密，不进入普通设置、日志或页面快照。
 - Gate 没有在项目中确认的公开事件合约 API。软件优先接管用户已登录的 `/trade-events` 页面并被动读取页面自身流量；APIv4 Key 只用于官方 `GET /api/v4/spot/accounts` 身份/USDT 余额检查。订单必须来自用户手动捕获的真实请求，不能猜端点或改用现货订单接口。
 - Kalshi 默认读取 KXBTC15M 的公开 Markets/Orderbook；当前不纳入 5 分钟周期。配置 API Key ID + RSA 私钥后，准备按钮仍只允许签名读取余额、持仓和活动委托；真实路径仅开放 MEXC↔Kalshi、Polymarket↔Kalshi 双腿人工 FOK，撤单、自动下单、充值、提现和划转均未接入。
