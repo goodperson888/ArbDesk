@@ -127,7 +127,7 @@ describe('PredictFunMarketData', () => {
 
   it('binds an early passive websocket frame to the rolling page slug before the directory arrives', async () => {
     vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
+    vi.setSystemTime(new Date('2026-08-28T00:34:00.000Z'))
     const capture = new FakePredictPageCapture()
     const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
     await source.fetchWindows()
@@ -140,6 +140,28 @@ describe('PredictFunMarketData', () => {
     expect(source.getLatestWindows()).toHaveLength(1)
     expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '1761139', durationMinutes: 15 })
     expect(source.getStatus().message).toContain('页面绑定 1')
+  })
+
+  it('treats a new unknown frame on the 15m page as the next 5m roll after the old 5m window ends', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-28T00:34:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+
+    capture.emitResponse('https://api.predict.fun/v1/categories/page-metadata', {
+      success: true,
+      data: [
+        { slug: 'btc-updown-5m-1787877000', startsAt: '2026-08-28T00:30:00.000Z', endsAt: '2026-08-28T00:35:00.000Z', status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN', markets: [{ id: 1761000, tradingStatus: 'OPEN', outcomes: [{ name: 'Up', index: 1, onChainId: 'old-up' }, { name: 'Down', index: 2, onChainId: 'old-down' }] }] },
+        { slug: 'btc-updown-15m-1787877000', startsAt: '2026-08-28T00:30:00.000Z', endsAt: '2026-08-28T00:45:00.000Z', status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN', markets: [{ id: 1761001, tradingStatus: 'OPEN', outcomes: [{ name: 'Up', index: 1, onChainId: 'fifteen-up' }, { name: 'Down', index: 2, onChainId: 'fifteen-down' }] }] }
+      ]
+    })
+    capture.emitFrame({ type: 'M', topic: 'predictOrderbook/1761000', data: { marketId: 1761000, asks: [[0.60, 4]], bids: [[0.56, 5]] } }, 'https://predict.fun/zh-cn/market/btc-updown-15m-1787877000')
+    vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
+    capture.emitFrame({ type: 'M', topic: 'predictOrderbook/1761001', data: { marketId: 1761001, asks: [[0.61, 4]], bids: [[0.55, 5]] } }, 'https://predict.fun/zh-cn/market/btc-updown-15m-1787877000')
+    capture.emitFrame({ type: 'M', topic: 'predictOrderbook/1761139', data: { marketId: 1761139, asks: [[0.62, 4]], bids: [[0.54, 5]] } }, 'https://predict.fun/zh-cn/market/btc-updown-15m-1787877000')
+
+    expect(source.getLatestWindows().some((window) => window.marketId === '1761139' && window.durationMinutes === 5)).toBe(true)
   })
 
   it('discovers the current BTC windows from the new page GraphQL response before applying passive websocket books', async () => {

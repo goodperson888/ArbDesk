@@ -334,7 +334,8 @@ function categoryTimestamp(value: unknown): number {
   return Date.parse(String(value ?? ''))
 }
 
-function categoryWindowTimes(category: PredictCategory): { startTime: number; endTime: number } | undefined {
+function categoryWindowTimes(category: PredictCategory | undefined): { startTime: number; endTime: number } | undefined {
+  if (!category) return undefined
   const startsAt = categoryTimestamp(category.startsAt)
   const endsAt = categoryTimestamp(category.endsAt)
   if (Number.isFinite(startsAt) && Number.isFinite(endsAt) && endsAt > startsAt) return { startTime: startsAt, endTime: endsAt }
@@ -382,6 +383,35 @@ function contextFromPassivePageUrl(pageUrl: string | undefined, marketId: string
       ]
     }
   }
+}
+
+function contextFromRollingDuration(duration: 5 | 15, marketId: string, now: number): { category: PredictCategory; market: PredictMarket } {
+  const slotSeconds = duration * 60
+  const start = Math.floor(now / (slotSeconds * 1_000)) * slotSeconds
+  const categorySlug = `btc-updown-${duration}m-${start}`
+  return {
+    category: {
+      slug: categorySlug,
+      startsAt: new Date(start * 1_000).toISOString(),
+      endsAt: new Date((start + slotSeconds) * 1_000).toISOString(),
+      status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN',
+      variantData: { type: 'CRYPTO_UP_DOWN', priceFeedSymbol: 'BTCUSDT' }
+    },
+    market: {
+      id: Number(marketId), tradingStatus: 'OPEN', decimalPrecision: 2,
+      outcomes: [
+        { name: 'Up', index: 1, onChainId: `predict-page:${marketId}:up` },
+        { name: 'Down', index: 2, onChainId: `predict-page:${marketId}:down` }
+      ]
+    }
+  }
+}
+
+function durationFromCategory(category: PredictCategory | undefined): 5 | 15 | undefined {
+  const window = categoryWindowTimes(category)
+  if (!window) return undefined
+  const duration = Math.round((window.endTime - window.startTime) / 60_000)
+  return duration === 5 || duration === 15 ? duration : undefined
 }
 
 function isOpenStatus(value: string | undefined): boolean {
@@ -814,11 +844,29 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       let context = this.marketContexts.get(resolvedMarketId)
       if (!context && !officialSocket) {
         const pageContext = contextFromPassivePageUrl(pageUrl, resolvedMarketId)
-        if (pageContext) {
-          context = pageContext
-          this.marketContexts.set(resolvedMarketId, pageContext)
-          this.lastDirectoryAt = Date.now()
+        const pageDuration = durationFromCategory(pageContext?.category)
+        // The 15m page also streams the rolling 5m book. At each 5m boundary
+        // the new 5m marketId can arrive before its directory response. Use
+        // the expired 5m context as an explicit rotation signal; keep the
+        // page's own 15m context as the default for all other frames.
+        const hasActiveFifteenMinute = pageDuration === 15 && [...this.marketContexts.values()].some((candidate) =>
+          durationFromCategory(candidate.category) === 15 && (categoryWindowTimes(candidate.category)?.endTime ?? 0) > Date.now()
+        )
+        const expiredFiveMinute = hasActiveFifteenMinute
+          ? [...this.marketContexts.values()]
+            .filter((candidate) => durationFromCategory(candidate.category) === 5)
+            .find((candidate) => (categoryWindowTimes(candidate.category)?.endTime ?? Infinity) <= Date.now() + 15_000)
+          : undefined
+        if (expiredFiveMinute) {
+          context = contextFromRollingDuration(5, resolvedMarketId, Date.now())
           this.passivePageBoundFrameCount += 1
+        } else if (pageContext) {
+          context = pageContext
+          this.passivePageBoundFrameCount += 1
+        }
+        if (context) {
+          this.marketContexts.set(resolvedMarketId, context)
+          this.lastDirectoryAt = Date.now()
         }
       }
       if (!context) {
