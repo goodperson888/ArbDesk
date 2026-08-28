@@ -366,6 +366,19 @@ describe('PredictFunMarketData', () => {
     expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '1741179', durationMinutes: 15 })
   })
 
+  it('does not treat match/event logs as market directory responses', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+    capture.emitResponse('https://predict.fun/graphql', {
+      data: { market: { id: 1741179, status: 'REGISTERED', outcomes: [{ name: 'Yes', indexSet: 1, onChainId: 'up' }] } }
+    }, { operationName: 'GetMatchEventLog', requestSlugs: ['btc-updown-15m-1787877000'] })
+    expect(source.getStatus().message).toContain('GraphQL目录 0/1')
+    expect(source.getLatestWindows()).toEqual([])
+  })
+
   it('keeps the official API ahead of page capture when a key exists', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-21T11:32:00.000Z'))

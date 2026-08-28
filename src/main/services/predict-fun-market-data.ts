@@ -142,6 +142,11 @@ function marketDataEntries(category: PredictGraphqlCategory): PredictGraphqlMark
 interface PredictGraphqlCaptureHints {
   requestSlugs: string[]
   requestMarketIds: string[]
+  operationName?: string
+}
+
+function isNonMarketGraphqlOperation(operationName: string | undefined): boolean {
+  return /match|event|log|activity|comment|notification|history|order/i.test(String(operationName ?? ''))
 }
 
 function categoriesFromGraphql(body: unknown, hints?: PredictGraphqlCaptureHints): PredictCategory[] {
@@ -188,7 +193,7 @@ function categoriesFromGraphql(body: unknown, hints?: PredictGraphqlCaptureHints
     }
     const requestSlug = hints?.requestSlugs.find((slug) => /^btc-updown-(?:5|15)m-\d+$/i.test(slug))
     const requestTargetsMarket = !hints || hints.requestMarketIds.length === 0 || hints.requestMarketIds.includes(String(candidate.id))
-    if (candidate.id && candidate.outcomes && requestSlug && requestTargetsMarket) {
+    if (candidate.id && candidate.outcomes && requestSlug && requestTargetsMarket && !isNonMarketGraphqlOperation(hints?.operationName)) {
       const category: PredictGraphqlCategory = {
         slug: requestSlug,
         status: candidate.tradingStatus ?? candidate.status,
@@ -864,7 +869,8 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       if (fingerprints.length > 0) this.passiveLastGraphqlSchema = fingerprints.join(' | ')
       const capturedCategories = categoriesFromGraphql(body, {
         requestSlugs: event.requestSlugs ?? [],
-        requestMarketIds: event.requestMarketIds ?? []
+        requestMarketIds: event.requestMarketIds ?? [],
+        operationName: event.operationName
       })
       if (capturedCategories.length === 0) {
         this.passiveLastReason = fingerprints.length > 0
