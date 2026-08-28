@@ -12,7 +12,8 @@ const PAGE_ROLL_INTERVAL_MS = 5 * 60_000
 const PAGE_ROLL_SETTLE_MS = 1_250
 
 function currentPredictMarketUrl(durationMinutes: 5 | 15, now = Date.now()): string {
-  const slot = Math.floor(now / 900_000) * 900
+  const slotSeconds = durationMinutes * 60
+  const slot = Math.floor(now / (slotSeconds * 1_000)) * slotSeconds
   return `https://predict.fun/zh-cn/market/btc-updown-${durationMinutes}m-${slot}`
 }
 
@@ -30,6 +31,8 @@ export interface PredictFunCapturedWebSocketFrame {
   url: string
   payload: string
   receivedAt: number
+  /** URL of the page that owned the frame; binds the rolling slug to marketId. */
+  pageUrl?: string
 }
 
 export interface PredictFunPageCaptureSource {
@@ -137,6 +140,7 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   private destroying = false
   private status: PredictFunPageCaptureStatus = { state: 'IDLE', message: 'Predict.fun 网页被动行情尚未启动' }
   private socketUrls = new Map<string, string>()
+  private socketPageUrls = new Map<string, string>()
   private graphqlRequests = new Map<string, PredictGraphqlRequestMetadata>()
   private responseCount = 0
   private webSocketFrameCount = 0
@@ -263,6 +267,7 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
       this.rollTimer = undefined
       if (this.window === window) this.window = undefined
       this.socketUrls.clear()
+      this.socketPageUrls.clear()
       const wasDestroying = this.destroying
       this.destroying = false
       this.setStatus(wasDestroying ? 'IDLE' : 'DISCONNECTED', wasDestroying ? 'Predict.fun 网页监听已停止；页面资源已释放' : 'Predict.fun 网页监听窗口已关闭')
@@ -271,6 +276,9 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
       clearTimeout(startupTimeout)
       this.setStatus('CONNECTED', this.captureStatusMessage())
       void this.capturePageMarketMetadata(window)
+      setTimeout(() => {
+        if (this.window === window && !window.isDestroyed()) void this.capturePageMarketMetadata(window)
+      }, PAGE_ROLL_SETTLE_MS).unref()
     })
     window.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedUrl, isMainFrame) => {
       if (!isMainFrame) return
@@ -322,8 +330,11 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
         const pageUrl = location.href
         const categorySlug = /\\/market\\/(btc-updown-(?:5|15)m-\\d+)/i.exec(location.pathname)?.[1]
         const image = document.querySelector('meta[property="og:image"]')?.getAttribute('content') || ''
-        const marketId = new URL(image, location.origin).searchParams.get('marketId') || ''
         const html = document.documentElement.innerHTML
+        const marketId = [
+          ...image.matchAll(/(?:marketId|market_id)[^0-9]{0,12}(\\d{4,})/gi),
+          ...html.matchAll(/(?:marketId|market_id)[^0-9]{0,12}(\\d{4,})/gi)
+        ].map((match) => match[1]).find((id) => /^\\d+$/.test(id)) || ''
         const outcomeIds = [...html.matchAll(/onChainId.{0,24}?(\\d{20,})/g)].map((match) => match[1]).filter((id, index, all) => all.indexOf(id) === index).slice(0, 2)
         return categorySlug && /^\\d+$/.test(marketId) ? { pageUrl, categorySlug, marketId, outcomeIds } : null
       })()`, true) as PredictPageMarketMetadata | null
@@ -408,15 +419,19 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
         const event = rawParams as CdpWebSocketCreated
         if (event.requestId && event.url && isPredictHost(event.url)) {
           this.socketUrls.set(event.requestId, event.url)
+          this.socketPageUrls.set(event.requestId, window.webContents.getURL())
         }
         return
       }
       if (method === 'Network.webSocketClosed') {
         const requestId = (rawParams as { requestId?: string }).requestId
-        if (requestId) this.socketUrls.delete(requestId)
+        if (requestId) {
+          this.socketUrls.delete(requestId)
+          this.socketPageUrls.delete(requestId)
+        }
         return
       }
-      if (method === 'Network.webSocketFrameReceived') this.handleFrame(rawParams as CdpWebSocketFrame)
+      if (method === 'Network.webSocketFrameReceived') this.handleFrame(window, rawParams as CdpWebSocketFrame)
     })
     debug.on('detach', (_event, reason) => {
       if (!this.stopping) this.setStatus('DISCONNECTED', `Predict.fun 网络监听已断开：${reason}`)
@@ -453,7 +468,7 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     }
   }
 
-  private handleFrame(event: CdpWebSocketFrame): void {
+  private handleFrame(window: BrowserWindow, event: CdpWebSocketFrame): void {
     if (!event.requestId || event.response?.opcode !== 1 || typeof event.response.payloadData !== 'string') return
     const url = this.socketUrls.get(event.requestId)
     if (!url) return
@@ -462,7 +477,7 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     // Only forward likely orderbook frames to the JSON parser; no API key is
     // required for this passive page path.
     if (payload.length > 2_000_000 || !/predictOrderbook|predict(?:Trading|Market)Status|order[._:/-]?book|"type"\s*:\s*"M"/i.test(payload)) return
-    const captured = { url, payload, receivedAt: Date.now() }
+    const captured = { url, payload, receivedAt: Date.now(), pageUrl: this.socketPageUrls.get(event.requestId) ?? window.webContents.getURL() }
     this.webSocketFrameCount += 1
     this.lastCaptureAt = captured.receivedAt
     this.setStatus('CONNECTED', this.captureStatusMessage())

@@ -35,8 +35,8 @@ class FakePredictPageCapture implements PredictFunPageCaptureSource {
   emitResponse(url: string, body: unknown, metadata: Partial<PredictFunCapturedResponse> = {}): void {
     for (const listener of this.responseListeners) listener({ url, body: JSON.stringify(body), receivedAt: Date.now(), ...metadata })
   }
-  emitFrame(message: unknown): void {
-    for (const listener of this.frameListeners) listener({ url: 'wss://ws.predict.fun/ws', payload: JSON.stringify(message), receivedAt: Date.now() })
+  emitFrame(message: unknown, pageUrl?: string): void {
+    for (const listener of this.frameListeners) listener({ url: 'wss://ws.predict.fun/ws', payload: JSON.stringify(message), receivedAt: Date.now(), pageUrl })
   }
 }
 
@@ -123,6 +123,23 @@ describe('PredictFunMarketData', () => {
     expect(source.getStatus().message).toContain('未额外请求接口')
     expect(listener).toHaveBeenCalled()
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('binds an early passive websocket frame to the rolling page slug before the directory arrives', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+
+    capture.emitFrame({
+      type: 'M', topic: 'predictOrderbook/1761139',
+      data: { marketId: 1761139, updateTimestampMs: Date.now(), asks: [[0.61, 4]], bids: [[0.55, 5]] }
+    }, 'https://predict.fun/zh-cn/market/btc-updown-15m-1787877000')
+
+    expect(source.getLatestWindows()).toHaveLength(1)
+    expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '1761139', durationMinutes: 15 })
+    expect(source.getStatus().message).toContain('页面绑定 1')
   })
 
   it('discovers the current BTC windows from the new page GraphQL response before applying passive websocket books', async () => {

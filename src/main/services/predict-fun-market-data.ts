@@ -348,6 +348,42 @@ function categoryWindowTimes(category: PredictCategory): { startTime: number; en
   return Number.isFinite(startTime) ? { startTime, endTime } : undefined
 }
 
+/**
+ * A passive page can publish an orderbook before its GraphQL directory query
+ * finishes. The page URL itself is an authoritative rolling category slug;
+ * bind the observed websocket marketId to that slug so the first live frame
+ * is not discarded. This fallback is display-only (synthetic outcome IDs);
+ * API-key trading continues to use official market metadata.
+ */
+function contextFromPassivePageUrl(pageUrl: string | undefined, marketId: string): { category: PredictCategory; market: PredictMarket } | undefined {
+  if (!pageUrl || !/^\d+$/.test(marketId)) return undefined
+  let pathname = ''
+  try { pathname = new URL(pageUrl).pathname } catch { return undefined }
+  const match = /\/market\/(btc-updown-(5|15)m-(\d+))(?:$|\/)/i.exec(pathname)
+  if (!match) return undefined
+  const duration = Number(match[2])
+  const start = Number(match[3])
+  if (!Number.isFinite(start) || (duration !== 5 && duration !== 15)) return undefined
+  const categorySlug = match[1]
+  const numericMarketId = Number(marketId)
+  return {
+    category: {
+      slug: categorySlug,
+      startsAt: new Date(start * 1_000).toISOString(),
+      endsAt: new Date((start + duration * 60) * 1_000).toISOString(),
+      status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN',
+      variantData: { type: 'CRYPTO_UP_DOWN', priceFeedSymbol: 'BTCUSDT' }
+    },
+    market: {
+      id: numericMarketId, tradingStatus: 'OPEN', decimalPrecision: 2,
+      outcomes: [
+        { name: 'Up', index: 1, onChainId: `predict-page:${marketId}:up` },
+        { name: 'Down', index: 2, onChainId: `predict-page:${marketId}:down` }
+      ]
+    }
+  }
+}
+
 function isOpenStatus(value: string | undefined): boolean {
   return !value || ['OPEN', 'ACTIVE', 'LIVE', 'TRADING', 'REGISTERED'].includes(value.toUpperCase())
 }
@@ -468,6 +504,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private passiveOrderbookFrameCount = 0
   private passiveMappedFrameCount = 0
   private passiveUnmappedFrameCount = 0
+  private passivePageBoundFrameCount = 0
   private passiveParseRejectedCount = 0
   private passiveGraphqlResponseCount = 0
   private passiveGraphqlMappedCount = 0
@@ -492,7 +529,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     } = {}
   ) {
     options.pageCapture?.onResponse((event) => this.ingestCapturedResponse(event))
-    options.pageCapture?.onWebSocketFrame((event) => this.ingestCapturedWebSocketFrame(event.payload))
+    options.pageCapture?.onWebSocketFrame((event) => this.ingestCapturedWebSocketFrame(event.payload, event.pageUrl))
     options.pageCapture?.onStatus((captureStatus) => {
       if (this.socketApiKey) return
       const parsedSuffix = (this.snapshot?.windows.length ?? 0) > 0
@@ -734,7 +771,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     this.handleStreamPayload(message, true)
   }
 
-  private handleStreamPayload(message: PredictStreamMessage, officialSocket: boolean): void {
+  private handleStreamPayload(message: PredictStreamMessage, officialSocket: boolean, pageUrl?: string): void {
     if (!officialSocket) this.passiveFrameCount += 1
     if (message.type === 'R' && officialSocket) {
       const pending = typeof message.requestId === 'number' ? this.pendingSubscriptions.get(message.requestId) : undefined
@@ -774,7 +811,16 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       this.notifyPassiveDiagnostics()
     }
     if (resolvedMarketId && bookRecord) {
-      const context = this.marketContexts.get(resolvedMarketId)
+      let context = this.marketContexts.get(resolvedMarketId)
+      if (!context && !officialSocket) {
+        const pageContext = contextFromPassivePageUrl(pageUrl, resolvedMarketId)
+        if (pageContext) {
+          context = pageContext
+          this.marketContexts.set(resolvedMarketId, pageContext)
+          this.lastDirectoryAt = Date.now()
+          this.passivePageBoundFrameCount += 1
+        }
+      }
       if (!context) {
         if (!officialSocket) {
           this.passiveUnmappedFrameCount += 1
@@ -927,7 +973,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     if (parsed) this.applyCapturedWindow(parsed, receivedAt)
   }
 
-  private ingestCapturedWebSocketFrame(rawPayload: string): void {
+  private ingestCapturedWebSocketFrame(rawPayload: string, pageUrl?: string): void {
     if (!this.monitoringEnabled) return
     let message: PredictStreamMessage
     try {
@@ -935,7 +981,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     } catch {
       return
     }
-    this.handleStreamPayload(message, false)
+    this.handleStreamPayload(message, false, pageUrl)
   }
 
   private mergePassiveMarketContexts(candidates: Array<{ category: PredictCategory; market: PredictMarket }>, now: number): void {
@@ -959,7 +1005,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       : this.passiveLastMarketPath ? `；REST市场路径 ${this.passiveLastMarketPath}` : ''
     if (this.passiveFrameCount === 0) return `${graphql}${marketDetail}；页面尚未收到可解析的 WebSocket 帧`
     const reason = this.passiveLastReason ? `，最近原因：${this.passiveLastReason}` : ''
-    return `${graphql}${marketDetail}；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）`
+    return `${graphql}${marketDetail}；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、页面绑定 ${this.passivePageBoundFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）`
   }
 
   private notifyPassiveDiagnostics(): void {
