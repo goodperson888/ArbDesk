@@ -65,7 +65,7 @@ export function buildReadOnlyComparisons(windows: ReadOnlyWindowQuote[], setting
   const uniqueWindows = new Map<string, ReadOnlyWindowQuote>()
   const quality = (window: ReadOnlyWindowQuote): [number, number, number, number] => {
     const quotes = Object.values(window.outcomes).filter((quote): quote is NonNullable<typeof quote> => Boolean(quote))
-    const latestQuoteAt = Math.max(0, ...quotes.map((quote) => quote.receivedAt))
+    const latestQuoteAt = Math.max(0, ...quotes.map((quote) => Math.max(quote.receivedAt, quote.observedAt ?? 0)))
     const complete = quotes.length === 2 ? 1 : 0
     const depth = quotes.reduce((sum, quote) => sum + Math.max(0, Number(quote.askSize) || 0), 0)
     return [latestQuoteAt, complete, depth, quotes.length]

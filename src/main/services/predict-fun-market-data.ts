@@ -307,10 +307,10 @@ function noLevelsFromYesBook(book: PredictBookResponse, fallback: PredictOutcome
     : []
 }
 
-function outcome(direction: Direction, source: PredictOutcome | undefined, levels: OrderBookLevel[], receivedAt: number): ReadOnlyOutcomeQuote | undefined {
+function outcome(direction: Direction, source: PredictOutcome | undefined, levels: OrderBookLevel[], receivedAt: number, observedAt = receivedAt): ReadOnlyOutcomeQuote | undefined {
   const best = levels[0]
   if (!source?.onChainId || !best) return undefined
-  return { direction, outcomeId: source.onChainId, bestAsk: best.price, askSize: best.size, levels, receivedAt }
+  return { direction, outcomeId: source.onChainId, bestAsk: best.price, askSize: best.size, levels, receivedAt, observedAt }
 }
 
 function assetSymbol(category: PredictCategory): string {
@@ -478,7 +478,7 @@ function mergeCapturedCategory(previous: PredictCategory | undefined, incoming: 
   }
 }
 
-function parseCategory(category: PredictCategory, market: PredictMarket, book: PredictBookResponse, receivedAt: number): ReadOnlyWindowQuote | undefined {
+function parseCategory(category: PredictCategory, market: PredictMarket, book: PredictBookResponse, receivedAt: number, observedAt = receivedAt): ReadOnlyWindowQuote | undefined {
   const window = categoryWindowTimes(category)
   const startTime = window?.startTime ?? Number.NaN
   const endTime = window?.endTime ?? Number.NaN
@@ -490,8 +490,8 @@ function parseCategory(category: PredictCategory, market: PredictMarket, book: P
   const upSource = market.outcomes?.find((candidate) => predictOutcomeDirection(candidate) === 'UP')
   const downSource = market.outcomes?.find((candidate) => predictOutcomeDirection(candidate) === 'DOWN')
   const precision = Number.isInteger(market.decimalPrecision) ? Number(market.decimalPrecision) : 2
-  const up = outcome('UP', upSource, levelsFromBook(book, upSource), receivedAt)
-  const down = outcome('DOWN', downSource, noLevelsFromYesBook(book, downSource, precision), receivedAt)
+  const up = outcome('UP', upSource, levelsFromBook(book, upSource), receivedAt, observedAt)
+  const down = outcome('DOWN', downSource, noLevelsFromYesBook(book, downSource, precision), receivedAt, observedAt)
   if (!up && !down) return undefined
   const feedId = category.variantData?.priceFeedId ?? 'unknown'
   const feedSymbol = category.variantData?.priceFeedSymbol ?? 'BTCUSDT'
@@ -559,7 +559,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     } = {}
   ) {
     options.pageCapture?.onResponse((event) => this.ingestCapturedResponse(event))
-    options.pageCapture?.onWebSocketFrame((event) => this.ingestCapturedWebSocketFrame(event.payload, event.pageUrl))
+    options.pageCapture?.onWebSocketFrame((event) => this.ingestCapturedWebSocketFrame(event.payload, event.pageUrl, event.receivedAt))
     options.pageCapture?.onStatus((captureStatus) => {
       if (this.socketApiKey) return
       const parsedSuffix = (this.snapshot?.windows.length ?? 0) > 0
@@ -716,7 +716,8 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       const results = await Promise.allSettled(booksToFetch.map(async ({ category, market }) => {
         if (!market.id) return undefined
         const book = await this.fetchJson<PredictBookResponse>(`${this.apiBase}/v1/markets/${market.id}/orderbook`, apiKey, signal)
-        return parseCategory(category, market, book, receivedAtFromBook(book.data?.updateTimestampMs, Date.now()))
+        const observedAt = Date.now()
+        return parseCategory(category, market, book, receivedAtFromBook(book.data?.updateTimestampMs, observedAt), observedAt)
       }))
       for (const result of results) {
         if (result.status === 'fulfilled' && result.value) current.set(result.value.marketId, result.value)
@@ -798,10 +799,10 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     } catch {
       return
     }
-    this.handleStreamPayload(message, true)
+    this.handleStreamPayload(message, true, undefined, Date.now())
   }
 
-  private handleStreamPayload(message: PredictStreamMessage, officialSocket: boolean, pageUrl?: string): void {
+  private handleStreamPayload(message: PredictStreamMessage, officialSocket: boolean, pageUrl?: string, observedAt = Date.now()): void {
     if (!officialSocket) this.passiveFrameCount += 1
     if (message.type === 'R' && officialSocket) {
       const pending = typeof message.requestId === 'number' ? this.pendingSubscriptions.get(message.requestId) : undefined
@@ -880,7 +881,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         return
       }
       const book = { success: true, data: bookRecord as PredictBookResponse['data'] }
-      const parsed = parseCategory(context.category, context.market, book, receivedAtFromBook(book.data?.updateTimestampMs, Date.now()))
+      const parsed = parseCategory(context.category, context.market, book, receivedAtFromBook(book.data?.updateTimestampMs, observedAt), observedAt)
       if (!parsed) {
         if (!officialSocket) {
           this.passiveParseRejectedCount += 1
@@ -1017,11 +1018,11 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     const context = this.marketContexts.get(orderbookMatch[1])
     if (!context) return
     const book = body as PredictBookResponse
-    const parsed = parseCategory(context.category, context.market, book, receivedAtFromBook(book.data?.updateTimestampMs, receivedAt))
+    const parsed = parseCategory(context.category, context.market, book, receivedAtFromBook(book.data?.updateTimestampMs, receivedAt), receivedAt)
     if (parsed) this.applyCapturedWindow(parsed, receivedAt)
   }
 
-  private ingestCapturedWebSocketFrame(rawPayload: string, pageUrl?: string): void {
+  private ingestCapturedWebSocketFrame(rawPayload: string, pageUrl?: string, observedAt = Date.now()): void {
     if (!this.monitoringEnabled) return
     let message: PredictStreamMessage
     try {
@@ -1029,7 +1030,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     } catch {
       return
     }
-    this.handleStreamPayload(message, false, pageUrl)
+    this.handleStreamPayload(message, false, pageUrl, observedAt)
   }
 
   private mergePassiveMarketContexts(candidates: Array<{ category: PredictCategory; market: PredictMarket }>, now: number): void {

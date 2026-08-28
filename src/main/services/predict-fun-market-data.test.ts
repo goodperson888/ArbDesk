@@ -117,9 +117,10 @@ describe('PredictFunMarketData', () => {
 
     capture.emitFrame({
       type: 'M', topic: 'predictOrderbook/42',
-      data: { marketId: 42, updateTimestampMs: Date.now(), asks: [[0.58, 20]], bids: [[0.55, 30]] }
+      data: { marketId: 42, updateTimestampMs: Date.now() - 60_000, asks: [[0.58, 20]], bids: [[0.55, 30]] }
     })
     expect(source.getLatestWindows()[0].outcomes.UP?.bestAsk).toBe('0.58')
+    expect(source.getLatestWindows()[0].outcomes.UP?.observedAt).toBe(Date.now())
     expect(source.getStatus().message).toContain('未额外请求接口')
     expect(listener).toHaveBeenCalled()
     expect(fetchMock).not.toHaveBeenCalled()
