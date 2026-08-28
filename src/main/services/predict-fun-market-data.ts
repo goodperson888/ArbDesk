@@ -149,6 +149,23 @@ function isNonMarketGraphqlOperation(operationName: string | undefined): boolean
   return /match|event|log|activity|comment|notification|history|order|position/i.test(String(operationName ?? ''))
 }
 
+function hasCompleteGraphqlOutcomes(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false
+  const raw = value as { edges?: Array<{ node?: unknown }>; [key: string]: unknown }
+  const outcomes = Array.isArray(value)
+    ? value
+    : Array.isArray(raw.edges)
+      ? raw.edges.map((edge) => edge?.node).filter(Boolean)
+      : []
+  if (outcomes.length < 2) return false
+  const directions = new Set(outcomes.map((outcome) => {
+    if (!outcome || typeof outcome !== 'object') return undefined
+    const item = outcome as PredictOutcome
+    return predictOutcomeDirection(item)
+  }).filter(Boolean))
+  return directions.has('UP') && directions.has('DOWN')
+}
+
 function categoriesFromGraphql(body: unknown, hints?: PredictGraphqlCaptureHints): PredictCategory[] {
   const markets = new Map<string, { market: PredictGraphqlMarket; category: PredictGraphqlCategory }>()
   const visited = new Set<object>()
@@ -193,7 +210,13 @@ function categoriesFromGraphql(body: unknown, hints?: PredictGraphqlCaptureHints
     }
     const requestSlug = hints?.requestSlugs.find((slug) => /^btc-updown-(?:5|15)m-\d+$/i.test(slug))
     const requestTargetsMarket = !hints || hints.requestMarketIds.length === 0 || hints.requestMarketIds.includes(String(candidate.id))
-    if (candidate.id && candidate.outcomes && requestSlug && requestTargetsMarket && !isNonMarketGraphqlOperation(hints?.operationName)) {
+    // Some page versions only expose the current market through
+    // GetMatchEventLog. Treat that response as a directory source only when
+    // it contains both directional outcomes; account/order/activity payloads
+    // without a complete market shape remain excluded.
+    const operationLooksNonMarket = isNonMarketGraphqlOperation(hints?.operationName)
+    const completeOutcomes = hasCompleteGraphqlOutcomes(candidate.outcomes)
+    if (candidate.id && candidate.outcomes && requestSlug && requestTargetsMarket && (!operationLooksNonMarket || completeOutcomes)) {
       const category: PredictGraphqlCategory = {
         slug: requestSlug,
         status: candidate.tradingStatus ?? candidate.status,

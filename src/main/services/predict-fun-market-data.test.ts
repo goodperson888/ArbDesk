@@ -419,6 +419,34 @@ describe('PredictFunMarketData', () => {
     expect(source.getLatestWindows()).toEqual([])
   })
 
+  it('maps GetMatchEventLog when it carries the complete current market outcomes', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+    capture.emitResponse('https://predict.fun/graphql', {
+      data: { market: {
+        id: 1741179,
+        status: 'REGISTERED',
+        tradingStatus: 'OPEN',
+        outcomes: [
+          { name: 'Yes', indexSet: 1, onChainId: 'up-event-log' },
+          { name: 'No', indexSet: 2, onChainId: 'down-event-log' }
+        ]
+      }}
+    }, { operationName: 'GetMatchEventLog', requestSlugs: ['btc-updown-15m-1787877000'] })
+    capture.emitFrame({
+      type: 'M', topic: 'predictOrderbook/1741179',
+      data: { marketId: 1741179, updateTimestampMs: Date.now(), asks: [[0.61, 4]], bids: [[0.55, 5]] }
+    })
+
+    expect(source.getLatestWindows()).toHaveLength(1)
+    expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '1741179', durationMinutes: 15 })
+    expect(source.getLatestWindows()[0].outcomes.UP?.outcomeId).toBe('up-event-log')
+    expect(source.getLatestWindows()[0].outcomes.DOWN?.outcomeId).toBe('down-event-log')
+  })
+
   it('captures the official REST market detail endpoint when the page omits a market GraphQL query', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
