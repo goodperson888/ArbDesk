@@ -861,8 +861,10 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       this.emitMarketData()
       return
     }
-    if (path.endsWith('/graphql')) {
-      this.passiveGraphqlResponseCount += 1
+    const isGraphql = path.endsWith('/graphql')
+    const isMarketDetail = /^\/v1\/markets\/\d+$/.test(path)
+    if (isGraphql || isMarketDetail) {
+      if (isGraphql) this.passiveGraphqlResponseCount += 1
       if (event.operationName) this.passiveLastGraphqlOperation = event.operationName
       if (event.requestSlugs?.length) this.passiveLastGraphqlSlugs = event.requestSlugs.join(',')
       const fingerprints = graphqlMarketSchemaFingerprints(body)
@@ -879,7 +881,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         this.notifyPassiveDiagnostics()
         return
       }
-      this.passiveGraphqlMappedCount += 1
+      if (isGraphql) this.passiveGraphqlMappedCount += 1
       const categoriesBySlug = new Map((this.discovery?.categories ?? []).map((category) => [category.slug, category]))
       for (const category of capturedCategories) {
         const key = category.slug ?? category.description ?? `category:${category.startsAt ?? ''}:${category.endsAt ?? ''}`
@@ -906,7 +908,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       this.status = {
         connectionState: 'CONNECTED', marketCount: this.snapshot?.windows.length ?? 0, updatedAt: receivedAt,
         message: candidates.length > 0
-          ? `网页单页面已捕获新版 GraphQL 市场目录（${candidates.length}个 BTC 5m/15m 候选）；等待页面盘口推送`
+          ? `网页单页面已捕获${isGraphql ? '新版 GraphQL' : 'REST Market'}市场目录（${candidates.length}个 BTC 5m/15m 候选）；等待页面盘口推送`
           : '网页单页面已捕获 GraphQL，但没有匹配当前 BTC 5m/15m：页面可能只返回历史/其他资产市场'
       }
       this.emitMarketData()

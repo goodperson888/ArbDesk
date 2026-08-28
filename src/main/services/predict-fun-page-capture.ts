@@ -116,7 +116,7 @@ function isUsefulResponse(rawUrl: string): boolean {
   try {
     const url = new URL(rawUrl)
     const path = url.pathname
-    return path.includes('/v1/categories') || /^\/v1\/markets\/\d+\/orderbook$/.test(path) ||
+    return path.includes('/v1/categories') || /^\/v1\/markets\/\d+(?:\/orderbook)?$/.test(path) ||
       path.endsWith('/graphql')
   } catch {
     return false

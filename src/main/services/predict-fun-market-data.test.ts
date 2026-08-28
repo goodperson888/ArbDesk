@@ -379,6 +379,34 @@ describe('PredictFunMarketData', () => {
     expect(source.getLatestWindows()).toEqual([])
   })
 
+  it('captures the official REST market detail endpoint when the page omits a market GraphQL query', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+    capture.emitResponse('https://api.predict.fun/v1/markets/1760624', {
+      success: true,
+      data: {
+        id: 1760624,
+        categorySlug: 'btc-updown-15m-1787877000',
+        marketVariant: 'CRYPTO_UP_DOWN',
+        variantData: { type: 'CRYPTO_UP_DOWN', priceFeedSymbol: 'BTCUSDT' },
+        tradingStatus: 'OPEN',
+        status: 'REGISTERED',
+        outcomes: [
+          { name: 'Yes', indexSet: 1, onChainId: 'up-rest' },
+          { name: 'No', indexSet: 2, onChainId: 'down-rest' }
+        ]
+      }
+    })
+    capture.emitFrame({
+      type: 'M', topic: 'predictOrderbook/1760624',
+      data: { marketId: 1760624, updateTimestampMs: Date.now(), asks: [[0.62, 4]], bids: [[0.53, 5]] }
+    })
+    expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '1760624', durationMinutes: 15 })
+  })
+
   it('keeps the official API ahead of page capture when a key exists', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-21T11:32:00.000Z'))
