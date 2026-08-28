@@ -515,6 +515,15 @@ export interface PredictFunPageCaptureStatus {
   lastCaptureAt?: number
 }
 
+export interface PredictFunOrderCaptureSummary {
+  capturing: boolean
+  traceEntryCount: number
+  requestCount: number
+  responseCount: number
+  webSocketCount: number
+  message: string
+}
+
 export interface GatePageCaptureStatus {
   state: 'IDLE' | 'STARTING' | 'CONNECTED' | 'DISCONNECTED'
   message: string
@@ -674,6 +683,11 @@ export interface ArbAppApi {
   openPredictFunPage(): Promise<void>
   stopPredictFunPage(): Promise<void>
   getPredictFunPageCaptureStatus(): Promise<PredictFunPageCaptureStatus>
+  startPredictFunOrderCapture(): Promise<PredictFunOrderCaptureSummary>
+  stopPredictFunOrderCapture(): Promise<PredictFunOrderCaptureSummary>
+  getPredictFunOrderCaptureSummary(): Promise<PredictFunOrderCaptureSummary>
+  clearPredictFunOrderCapture(): Promise<PredictFunOrderCaptureSummary>
+  exportPredictFunOrderCapture(): Promise<string>
   getLimitlessCredentialSummary(): Promise<LimitlessCredentialSummary>
   updateLimitlessCredentials(request: UpdateLimitlessCredentialsRequest): Promise<LimitlessCredentialSummary>
   prepareLimitlessWithoutSubmitting(): Promise<VenuePreparationReport>

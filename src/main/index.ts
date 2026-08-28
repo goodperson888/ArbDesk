@@ -331,6 +331,21 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   ipcMain.handle('predict-fun:open-page', () => requireActiveLicense(() => predictFunMarketData.openPageCapture()))
   ipcMain.handle('predict-fun:stop-page', () => requireActiveLicense(() => { predictFunMarketData.stopPageCapture() }))
   ipcMain.handle('predict-fun:page-capture-status', () => requireActiveLicense(() => predictFunMarketData.getPageCaptureStatus()))
+  ipcMain.handle('predict-fun:start-order-capture', async () => requireActiveLicense(async () => {
+    const summary = predictFunPageCapture.startOrderCapture()
+    await predictFunMarketData.openPageCapture()
+    return summary
+  }))
+  ipcMain.handle('predict-fun:stop-order-capture', () => requireActiveLicense(() => predictFunPageCapture.stopOrderCapture()))
+  ipcMain.handle('predict-fun:order-capture-summary', () => requireActiveLicense(() => predictFunPageCapture.getOrderCaptureSummary()))
+  ipcMain.handle('predict-fun:clear-order-capture', () => requireActiveLicense(() => predictFunPageCapture.clearOrderCapture()))
+  ipcMain.handle('predict-fun:export-order-capture', () => requireActiveLicense(async () => {
+    const directory = join(app.getPath('userData'), 'data')
+    await mkdir(directory, { recursive: true })
+    const path = join(directory, 'predict-fun-order-capture-trace.json')
+    await writeFile(path, JSON.stringify({ exportedAt: Date.now(), summary: predictFunPageCapture.getOrderCaptureSummary(), trace: predictFunPageCapture.getOrderTrace() }, null, 2), 'utf8')
+    return path
+  }))
   ipcMain.handle('predict-fun:prepare-without-submit', () => requireActiveLicense(() => predictFunPreparation.prepare()))
   ipcMain.handle('predict-fun:update-credentials', (_event, request) => requireActiveLicense(async () => {
     const summary = await predictFunCredentials.update(request)

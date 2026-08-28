@@ -52,6 +52,36 @@ export interface PredictFunPageOrderResponse {
   body: string
 }
 
+export type PredictFunOrderTraceKind = 'REQUEST' | 'RESPONSE' | 'WEBSOCKET'
+
+export interface PredictFunOrderTraceEntry {
+  sequence: number
+  kind: PredictFunOrderTraceKind
+  endpoint: string
+  method?: string
+  direction?: 'SENT' | 'RECEIVED'
+  status?: number
+  resourceType?: string
+  bodyFormat?: 'JSON' | 'FORM' | 'TEXT' | 'EMPTY'
+  bodyBytes?: number
+  requestFields?: string[]
+  responseFields?: string[]
+  operationName?: string
+  /** JSON preview with credential-like values redacted; never replayable. */
+  bodyPreview?: string
+  pageUrl?: string
+  receivedAt: number
+}
+
+export interface PredictFunOrderCaptureSummary {
+  capturing: boolean
+  traceEntryCount: number
+  requestCount: number
+  responseCount: number
+  webSocketCount: number
+  message: string
+}
+
 export interface PredictFunPageCaptureSource {
   getStatus(): PredictFunPageCaptureStatus
   onResponse(listener: (event: PredictFunCapturedResponse) => void): () => void
@@ -59,6 +89,11 @@ export interface PredictFunPageCaptureSource {
   onStatus(listener: (status: PredictFunPageCaptureStatus) => void): () => void
   canExecutePageOrders?(durationMinutes?: 5 | 15): boolean
   executePageOrder?(intent: PredictFunPageOrderIntent): Promise<PredictFunPageOrderResponse>
+  startOrderCapture?(): PredictFunOrderCaptureSummary
+  stopOrderCapture?(): PredictFunOrderCaptureSummary
+  clearOrderCapture?(): PredictFunOrderCaptureSummary
+  getOrderCaptureSummary?(): PredictFunOrderCaptureSummary
+  getOrderTrace?(): PredictFunOrderTraceEntry[]
   start(show?: boolean): Promise<void>
   stop(): void
 }
@@ -71,7 +106,8 @@ interface CdpResponseReceived {
 
 interface CdpRequestWillBeSent {
   requestId?: string
-  request?: { url?: string; postData?: string }
+  type?: string
+  request?: { url?: string; method?: string; postData?: string }
 }
 
 interface PredictGraphqlRequestMetadata {
@@ -122,6 +158,7 @@ interface CdpWebSocketCreated {
 interface CdpWebSocketFrame {
   requestId?: string
   response?: { opcode?: number; payloadData?: string }
+  request?: { opcode?: number; payloadData?: string }
 }
 
 interface PredictPageMarketMetadata {
@@ -150,6 +187,55 @@ function isPredictOrderUrl(rawUrl: string): boolean {
   }
 }
 
+function isLikelyPredictOrderRequest(rawUrl: string, method: string | undefined, postData: string | undefined): boolean {
+  if (String(method ?? '').toUpperCase() !== 'POST' || !isPredictOrderUrl(rawUrl)) return false
+  try {
+    const path = new URL(rawUrl).pathname
+    if (/\/v1\/orders(?:\/|$)/i.test(path)) return true
+  } catch {
+    // Fall through to the GraphQL body check.
+  }
+  // GraphQL is also used for reads. Only capture mutations whose operation or
+  // payload contains an order/trade verb so the trace is useful and bounded.
+  return /\/graphql(?:$|\?)/i.test(rawUrl) && /mutation/i.test(postData ?? '') && /(order|trade|buy|place|create)/i.test(postData ?? '')
+}
+
+function traceEndpoint(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl)
+    url.search = ''
+    url.hash = ''
+    return url.toString()
+  } catch {
+    return rawUrl
+  }
+}
+
+function traceBody(body: string | undefined): { format: PredictFunOrderTraceEntry['bodyFormat']; bytes: number; fields: string[]; operationName?: string; preview?: string } {
+  if (!body) return { format: 'EMPTY', bytes: 0, fields: [] }
+  try {
+    const parsed = JSON.parse(body) as unknown
+    const fields = new Set<string>()
+    let operationName: string | undefined
+    const sensitive = (key: string): boolean => /authorization|cookie|secret|signature|private|password|csrf|xsrf|jwt|bearer|session|credential|apikey|accesskey|auth/i.test(key.replace(/[-_]/g, ''))
+    const redact = (value: unknown, key = ''): unknown => {
+      if (sensitive(key)) return '[REDACTED]'
+      if (Array.isArray(value)) return value.map((child) => redact(child))
+      if (!value || typeof value !== 'object') return value
+      return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([childKey, child]) => {
+        const field = key ? `${key}.${childKey}` : childKey
+        fields.add(field)
+        if (!operationName && /^(operationname|operation)$/i.test(childKey) && typeof child === 'string') operationName = child
+        return [childKey, redact(child, childKey)]
+      }))
+    }
+    const redacted = JSON.stringify(redact(parsed))
+    return { format: 'JSON', bytes: body.length, fields: [...fields].sort(), operationName, preview: redacted.length > 24_000 ? `${redacted.slice(0, 24_000)}…[TRUNCATED]` : redacted }
+  } catch {
+    return { format: 'TEXT', bytes: body.length, fields: [], preview: `[NON_JSON_BODY_OMITTED bytes=${body.length}]` }
+  }
+}
+
 function isUsefulResponse(rawUrl: string): boolean {
   if (!isPredictHost(rawUrl)) return false
   try {
@@ -171,6 +257,10 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   private socketUrls = new Map<string, string>()
   private socketPageUrls = new Map<string, string>()
   private graphqlRequests = new Map<string, PredictGraphqlRequestMetadata>()
+  private orderRequestIds = new Set<string>()
+  private orderCapturing = false
+  private orderTrace: PredictFunOrderTraceEntry[] = []
+  private orderTraceSequence = 0
   private responseCount = 0
   private webSocketFrameCount = 0
   private lastCaptureAt?: number
@@ -197,6 +287,57 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   canExecutePageOrders(durationMinutes?: 5 | 15): boolean {
     if (durationMinutes !== undefined && durationMinutes !== 5 && durationMinutes !== 15) return false
     return Boolean(this.window && !this.window.isDestroyed() && this.status.state === 'CONNECTED')
+  }
+
+  startOrderCapture(): PredictFunOrderCaptureSummary {
+    this.orderCapturing = true
+    this.orderRequestIds.clear()
+    this.orderTrace = []
+    this.orderTraceSequence = 0
+    return this.getOrderCaptureSummary()
+  }
+
+  stopOrderCapture(): PredictFunOrderCaptureSummary {
+    this.orderCapturing = false
+    this.orderRequestIds.clear()
+    return this.getOrderCaptureSummary()
+  }
+
+  clearOrderCapture(): PredictFunOrderCaptureSummary {
+    this.orderCapturing = false
+    this.orderRequestIds.clear()
+    this.orderTrace = []
+    this.orderTraceSequence = 0
+    return this.getOrderCaptureSummary()
+  }
+
+  getOrderCaptureSummary(): PredictFunOrderCaptureSummary {
+    return {
+      capturing: this.orderCapturing,
+      traceEntryCount: this.orderTrace.length,
+      requestCount: this.orderTrace.filter((entry) => entry.kind === 'REQUEST').length,
+      responseCount: this.orderTrace.filter((entry) => entry.kind === 'RESPONSE').length,
+      webSocketCount: this.orderTrace.filter((entry) => entry.kind === 'WEBSOCKET').length,
+      message: this.orderCapturing
+        ? '正在采集 Predict.fun 下单链路；请在已登录页面手动完成一笔最小订单'
+        : this.orderTrace.length
+          ? 'Predict.fun 下单链路已停止采集；可导出脱敏元数据'
+          : '尚未采集 Predict.fun 下单链路'
+    }
+  }
+
+  getOrderTrace(): PredictFunOrderTraceEntry[] {
+    return this.orderTrace.map((entry) => ({
+      ...entry,
+      requestFields: entry.requestFields ? [...entry.requestFields] : undefined,
+      responseFields: entry.responseFields ? [...entry.responseFields] : undefined
+    }))
+  }
+
+  private pushOrderTrace(entry: Omit<PredictFunOrderTraceEntry, 'sequence'>): void {
+    if (!this.orderCapturing) return
+    this.orderTrace.push({ sequence: ++this.orderTraceSequence, ...entry })
+    if (this.orderTrace.length > 200) this.orderTrace.splice(0, this.orderTrace.length - 200)
   }
 
   /**
@@ -283,16 +424,26 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
         return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
       }
       const text = (node) => (node.innerText || node.textContent || '').trim().replace(/\\s+/g, ' ')
-      const buttons = [...document.querySelectorAll('button')].filter(visible)
+      const getButtons = () => [...document.querySelectorAll('button')].filter(visible)
       const clickText = (matcher, exact = false) => {
-        const found = buttons.filter((button) => exact ? matcher.test(text(button)) : matcher.test(text(button)))
+        const found = getButtons().filter((button) => matcher.test(text(button)))
         const target = found[found.length - 1]
         if (!target) return false
+        if (target.disabled) return false
         target.click()
         return true
       }
+      const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+      // Predict.fun 1-Tap flow: edit the first shortcut, save it, select the
+      // outcome, then click that first shortcut. There is no separate final
+      // submit button in this mode.
       clickText(/^买入$/, true)
-      if (!clickText(new RegExp('^' + (${JSON.stringify(intent.direction === 'UP' ? '上涨' : '下跌')}) + '(?:\\\\s|$)', 'i'))) return false
+      const editButtons = () => getButtons().filter((button) => /^编辑$/.test(text(button)))
+      const mainEdit = editButtons().at(-1)
+      if (mainEdit) {
+        mainEdit.click()
+        await wait(180)
+      }
       const isAmountInput = (node) => {
         if (!visible(node)) return false
         const placeholder = (node.getAttribute('placeholder') || '').toLowerCase()
@@ -301,26 +452,33 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
         const descriptors = (node.type || '') + ' ' + (node.getAttribute('inputmode') || '') + ' ' + placeholder + ' ' + aria
         return node.tagName === 'TEXTAREA' || node.getAttribute('contenteditable') === 'true' || /number|decimal|amount|cost|金额|数量/.test(descriptors) || !placeholder
       }
-      let input = [...document.querySelectorAll('input,textarea,[contenteditable="true"]')].find(isAmountInput)
+      let input = [...document.querySelectorAll('input,textarea,[contenteditable="true"]')].filter(isAmountInput)[0]
       if (!input) {
-        const edit = buttons.find((button) => /^编辑$/.test(text(button)))
-        if (edit) edit.click()
-        await new Promise((resolve) => setTimeout(resolve, 250))
-        input = [...document.querySelectorAll('input,textarea,[contenteditable="true"]')].find(isAmountInput)
+        const rowEdit = editButtons()[0]
+        if (rowEdit) rowEdit.click()
+        await wait(180)
+        input = [...document.querySelectorAll('input,textarea,[contenteditable="true"]')].filter(isAmountInput)[0]
       }
-      if (input) {
+      if (!input) return false
+      {
         const value = ${JSON.stringify(cost)}
-        if ('value' in input) { input.value = value } else { input.textContent = value }
+        if ('value' in input) {
+          const setter = Object.getOwnPropertyDescriptor(input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value')?.set
+          setter?.call(input, value)
+        } else input.textContent = value
         input.dispatchEvent(new Event('input', { bubbles: true }))
         input.dispatchEvent(new Event('change', { bubbles: true }))
-      } else if (!clickText(new RegExp('^\\$' + (${JSON.stringify(cost)}) + '\\b'))) {
-        return false
       }
+      const save = getButtons().find((button) => /^保存$/.test(text(button)))
+      if (!save || save.disabled) return false
+      save.click()
+      await wait(160)
+      if (!clickText(new RegExp('^' + (${JSON.stringify(intent.direction === 'UP' ? '上涨' : '下跌')}) + '(?:\\\\s|$)', 'i'))) return false
       if (!${submit ? 'true' : 'false'}) return true
-      const submitButtons = [...document.querySelectorAll('button')].filter(visible).filter((button) => /^(?:买入|确认买入|下单)/.test(text(button)) && !/^买入$/.test(text(button)))
-      const submitButton = submitButtons[submitButtons.length - 1]
-      if (!submitButton || submitButton.disabled) return false
-      submitButton.click()
+      const quickAmounts = getButtons().filter((button) => /^\$\s*\d+(?:[,.]\d+)?$/.test(text(button)))
+      const firstShortcut = quickAmounts[0]
+      if (!firstShortcut || firstShortcut.disabled) return false
+      firstShortcut.click()
       return true
     })()`, true)
   }
@@ -565,6 +723,15 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
       if (method === 'Network.requestWillBeSent') {
         const event = rawParams as CdpRequestWillBeSent
         const url = event.request?.url ?? ''
+        if (event.requestId && isLikelyPredictOrderRequest(url, event.request?.method, event.request?.postData)) {
+          this.orderRequestIds.add(event.requestId)
+          const body = traceBody(event.request?.postData)
+          this.pushOrderTrace({
+            kind: 'REQUEST', endpoint: traceEndpoint(url), method: String(event.request?.method ?? 'POST').toUpperCase(), resourceType: event.type,
+            bodyFormat: body.format, bodyBytes: body.bytes, requestFields: body.fields, operationName: body.operationName,
+            bodyPreview: body.preview, pageUrl: traceEndpoint(window.webContents.getURL()), receivedAt: Date.now()
+          })
+        }
         if (event.requestId && isPredictHost(url) && url.includes('/graphql')) {
           const metadata = graphqlRequestMetadata(event.request?.postData)
           if (metadata) this.graphqlRequests.set(event.requestId, metadata)
@@ -588,10 +755,12 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
         if (requestId) {
           this.socketUrls.delete(requestId)
           this.socketPageUrls.delete(requestId)
+          this.orderRequestIds.delete(requestId)
         }
         return
       }
-      if (method === 'Network.webSocketFrameReceived') this.handleFrame(window, rawParams as CdpWebSocketFrame)
+      if (method === 'Network.webSocketFrameReceived') this.handleFrame(window, rawParams as CdpWebSocketFrame, 'RECEIVED')
+      if (method === 'Network.webSocketFrameSent') this.handleFrame(window, rawParams as CdpWebSocketFrame, 'SENT')
     })
     debug.on('detach', (_event, reason) => {
       if (!this.stopping) this.setStatus('DISCONNECTED', `Predict.fun 网络监听已断开：${reason}`)
@@ -601,12 +770,17 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   private async handleResponse(window: BrowserWindow, event: CdpResponseReceived): Promise<void> {
     const url = event.response?.url ?? ''
     if (!event.requestId || !isUsefulResponse(url) || !['XHR', 'Fetch'].includes(event.type ?? '')) return
+    const isOrderResponse = this.orderRequestIds.has(event.requestId)
+    if (isOrderResponse) this.orderRequestIds.delete(event.requestId)
     try {
       const result = await window.webContents.debugger.sendCommand('Network.getResponseBody', { requestId: event.requestId }) as {
         body?: string
         base64Encoded?: boolean
       }
-      if (!result.body) return
+      if (!result.body) {
+        if (isOrderResponse) this.pushOrderTrace({ kind: 'RESPONSE', endpoint: traceEndpoint(url), status: event.response?.status, resourceType: event.type, bodyFormat: 'EMPTY', bodyBytes: 0, responseFields: [], pageUrl: traceEndpoint(window.webContents.getURL()), receivedAt: Date.now() })
+        return
+      }
       const body = result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf8') : result.body
       const requestMetadata = this.graphqlRequests.get(event.requestId)
       this.graphqlRequests.delete(event.requestId)
@@ -619,6 +793,10 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
         requestSlugs: requestMetadata?.slugs,
         requestMarketIds: requestMetadata?.marketIds
       }
+      if (isOrderResponse) {
+        const bodyMeta = traceBody(body)
+        this.pushOrderTrace({ kind: 'RESPONSE', endpoint: traceEndpoint(url), status: event.response?.status, resourceType: event.type, bodyFormat: bodyMeta.format, bodyBytes: bodyMeta.bytes, responseFields: bodyMeta.fields, operationName: bodyMeta.operationName, bodyPreview: bodyMeta.preview, pageUrl: traceEndpoint(window.webContents.getURL()), receivedAt: Date.now() })
+      }
       this.responseCount += 1
       this.lastCaptureAt = captured.receivedAt
       this.setStatus('CONNECTED', this.captureStatusMessage())
@@ -628,11 +806,16 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     }
   }
 
-  private handleFrame(window: BrowserWindow, event: CdpWebSocketFrame): void {
-    if (!event.requestId || event.response?.opcode !== 1 || typeof event.response.payloadData !== 'string') return
+  private handleFrame(window: BrowserWindow, event: CdpWebSocketFrame, direction: 'SENT' | 'RECEIVED'): void {
+    const frame = event.response ?? event.request
+    if (!event.requestId || frame?.opcode !== 1 || typeof frame.payloadData !== 'string') return
     const url = this.socketUrls.get(event.requestId)
     if (!url) return
-    const payload = event.response.payloadData
+    const payload = frame.payloadData
+    if (this.orderCapturing && /order|trade|fill|mutation|execution|place/i.test(payload)) {
+      const body = traceBody(payload)
+      this.pushOrderTrace({ kind: 'WEBSOCKET', endpoint: traceEndpoint(url), direction, bodyFormat: body.format, bodyBytes: body.bytes, responseFields: body.fields, operationName: body.operationName, bodyPreview: body.preview, pageUrl: traceEndpoint(this.socketPageUrls.get(event.requestId) ?? window.webContents.getURL()), receivedAt: Date.now() })
+    }
     // Predict.fun pages also carry heartbeats, presence and UI telemetry.
     // Only forward likely orderbook frames to the JSON parser; no API key is
     // required for this passive page path.
