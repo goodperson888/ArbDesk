@@ -105,6 +105,7 @@ interface PredictGraphqlCategory {
   resolutionProvider?: string
   description?: string
   marketData?: PredictGraphqlMarketDataEntry[] | PredictGraphqlMarketDataEntry
+  outcomes?: { edges?: Array<{ node?: PredictOutcome }> } | PredictOutcome[]
   markets?: { edges?: Array<{ node?: PredictGraphqlMarket }> } | PredictGraphqlMarket[]
 }
 
@@ -183,6 +184,26 @@ function categoriesFromGraphql(body: unknown, hints?: PredictGraphqlCaptureHints
         : candidate.markets?.edges?.flatMap((edge) => edge.node ? [edge.node] : []) ?? []
       for (const node of marketNodes) {
         if (node.id) markets.set(String(node.id), { market: node, category: candidate })
+      }
+      // A few page GraphQL operations return the rolling category together
+      // with marketData.marketId but omit the nested `markets` connection.
+      // Keep that response useful by creating a display-only market shell;
+      // a later response carrying outcomes/fees is merged into this context.
+      if (marketNodes.length === 0) {
+        const marketData = marketDataEntries(candidate).find((entry) => /^\d+$/.test(String(entry.marketId ?? '')))
+        if (marketData?.marketId) {
+          markets.set(String(marketData.marketId), {
+            category: candidate,
+            market: {
+              id: Number(marketData.marketId),
+              tradingStatus: candidate.status,
+              status: candidate.status,
+              outcomes: Array.isArray(candidate.outcomes)
+                ? candidate.outcomes
+                : candidate.outcomes?.edges?.flatMap((edge) => edge.node ? [edge.node] : [])
+            }
+          })
+        }
       }
     }
     if (candidate.id && candidate.category && isCryptoCategory(candidate.category) &&
@@ -1016,6 +1037,19 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       const categories = [...categoriesBySlug.values()]
       this.discovery = { fetchedAt: receivedAt, categories }
       const candidates = selectCandidates(categories, receivedAt)
+      // Some page versions put a usable bestAsk directly on GraphQL
+      // outcomes but never open a WebSocket. Materialize those quotes so the
+      // UI can show the market instead of reporting "无市场" while the page
+      // itself is publishing prices through GraphQL.
+      const embeddedWindows = candidates.flatMap(({ category, market }) => {
+        const parsed = parseCategory(category, market, { success: true, data: {} }, receivedAt, receivedAt)
+        return parsed && Object.keys(parsed.outcomes).length > 0 ? [parsed] : []
+      })
+      if (embeddedWindows.length > 0) {
+        const current = new Map((this.snapshot?.windows ?? []).map((window) => [window.marketId, window]))
+        for (const window of embeddedWindows) current.set(window.marketId, window)
+        this.snapshot = { fetchedAt: receivedAt, windows: [...current.values()].sort((left, right) => left.startTime - right.startTime || left.durationMinutes - right.durationMinutes) }
+      }
       const activeContextExists = [...this.marketContexts.values()].some(({ category }) => categoryTimestamp(category.endsAt) > receivedAt)
       if (candidates.length === 0 && activeContextExists) {
         this.status = {

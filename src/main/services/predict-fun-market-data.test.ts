@@ -447,6 +447,54 @@ describe('PredictFunMarketData', () => {
     expect(source.getLatestWindows()[0].outcomes.DOWN?.outcomeId).toBe('down-event-log')
   })
 
+  it('builds a market context when a category response only exposes marketData.marketId', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+    capture.emitResponse('https://predict.fun/graphql', {
+      data: { category: {
+        id: 'btc-updown-15m-1787877000', slug: 'btc-updown-15m-1787877000',
+        startsAt: '2026-08-28T00:30:00.000Z', endsAt: '2026-08-28T00:45:00.000Z',
+        status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN',
+        marketData: { marketId: '1741179', priceFeedSymbol: 'BTCUSDT' }
+      } }
+    }, { operationName: 'GetMatchEventLog', requestSlugs: ['btc-updown-15m-1787877000'] })
+    capture.emitFrame({
+      type: 'M', topic: 'predictOrderbook/1741179',
+      data: { marketId: 1741179, updateTimestampMs: Date.now(), asks: [[0.61, 4]], bids: [[0.55, 5]] }
+    }, 'https://predict.fun/zh-cn/market/btc-updown-15m-1787877000')
+
+    expect(source.getLatestWindows()).toHaveLength(1)
+    expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '1741179', durationMinutes: 15 })
+  })
+
+  it('uses bestAsk values embedded in GraphQL outcomes when no page websocket frame arrives', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+    capture.emitResponse('https://predict.fun/graphql', {
+      data: { market: {
+        id: 1741179,
+        status: 'REGISTERED',
+        tradingStatus: 'OPEN',
+        categorySlug: 'btc-updown-15m-1787877000',
+        marketVariant: 'CRYPTO_UP_DOWN',
+        outcomes: [
+          { name: 'Yes', indexSet: 1, onChainId: 'up-embedded', bestAsk: { price: 0.61, size: 4 } },
+          { name: 'No', indexSet: 2, onChainId: 'down-embedded', bestAsk: { price: 0.39, size: 5 } }
+        ]
+      }}
+    }, { operationName: 'GetMatchEventLog', requestSlugs: ['btc-updown-15m-1787877000'] })
+
+    expect(source.getLatestWindows()).toHaveLength(1)
+    expect(source.getLatestWindows()[0].outcomes.UP).toMatchObject({ bestAsk: '0.61', askSize: '4' })
+    expect(source.getLatestWindows()[0].outcomes.DOWN).toMatchObject({ bestAsk: '0.39', askSize: '5' })
+  })
+
   it('captures the official REST market detail endpoint when the page omits a market GraphQL query', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
