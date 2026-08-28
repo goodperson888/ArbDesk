@@ -1325,22 +1325,22 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   }
 
   async function startPredictFunOrderCapture(): Promise<void> {
-    const result = await run(() => window.arbApp.startPredictFunOrderCapture(), 'Predict.fun 捕获模式已开启；请在已登录页面手动完成一次最小订单，程序不会自动提交')
+    const result = await run(() => window.arbApp.startPredictFunOrderCapture(), 'Predict.fun 行情/下单捕获已开启；行情排查只需停留当前市场约 20 秒，无需下单')
     if (result) setPredictFunOrderCapture(result)
   }
 
   async function stopPredictFunOrderCapture(): Promise<void> {
-    const result = await run(() => window.arbApp.stopPredictFunOrderCapture(), 'Predict.fun 链路采集已停止；可导出脱敏元数据')
+    const result = await run(() => window.arbApp.stopPredictFunOrderCapture(), 'Predict.fun 行情/下单链路采集已停止；可导出脱敏元数据')
     if (result) setPredictFunOrderCapture(result)
   }
 
   async function clearPredictFunOrderCapture(): Promise<void> {
-    const result = await run(() => window.arbApp.clearPredictFunOrderCapture(), 'Predict.fun 订单捕获结构已清除')
+    const result = await run(() => window.arbApp.clearPredictFunOrderCapture(), 'Predict.fun 行情/下单捕获结构已清除')
     if (result) setPredictFunOrderCapture(result)
   }
 
   async function exportPredictFunOrderCapture(): Promise<void> {
-    const path = await run(() => window.arbApp.exportPredictFunOrderCapture(), '已导出脱敏 Predict.fun 订单链路，可把该文件发给我分析')
+    const path = await run(() => window.arbApp.exportPredictFunOrderCapture(), '已导出脱敏 Predict.fun 行情/下单链路，可把该文件发给我分析')
     if (path) setMessage(`Predict.fun 脱敏订单链路已导出：${path}`)
   }
 
@@ -2397,16 +2397,16 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <button className="wide-secondary" onClick={() => void stopPredictFunPage()} disabled={busy}><Square aria-hidden="true" />停止 Predict.fun 监听并释放页面</button>
                 <div className="credential-notice"><Network aria-hidden="true" /><span>未配置 API Key 时，软件只被动监听这一个网页自身的 REST 响应和 WebSocket 帧；开启实盘后会在同一已登录页面按当前 5m/15m 市场模拟点击买入，不复制网页 Key，也不重放捕获请求。</span></div>
                 {predictFunPageStatus && <div className="browser-status-detail"><span>页面</span><p>{predictFunPageStatus.message}</p></div>}
-                {predictFunOrderCapture && <div className="browser-status-detail"><span>订单捕获</span><p>{predictFunOrderCapture.message} · 链路 {predictFunOrderCapture.traceEntryCount}（请求 {predictFunOrderCapture.requestCount} / 响应 {predictFunOrderCapture.responseCount} / WS {predictFunOrderCapture.webSocketCount}）</p></div>}
+                {predictFunOrderCapture && <div className="browser-status-detail"><span>行情/订单捕获</span><p>{predictFunOrderCapture.message} · 链路 {predictFunOrderCapture.traceEntryCount}（请求 {predictFunOrderCapture.requestCount} / 响应 {predictFunOrderCapture.responseCount} / WS {predictFunOrderCapture.webSocketCount}）</p></div>}
                 {snapshot.multiVenueBoard.platforms.filter((platform) => platform.id === 'LIMITLESS' || platform.id === 'PREDICT_FUN' || platform.id === 'GATE' || platform.id === 'KALSHI').map((platform) => (
                   <div className="browser-status-detail" key={platform.id}><span>{platform.id === 'LIMITLESS' ? 'LIMIT' : platform.id === 'PREDICT_FUN' ? 'PRED' : platform.id === 'GATE' ? 'GATE' : 'KALSHI'}</span><p>{platform.integrationState === 'PLANNED' ? '暂不纳入短周期扫描' : platform.connectionState === 'CONNECTED' ? '行情在线' : platform.connectionState === 'NOT_CONFIGURED' ? '等待网页行情或官方Key' : '连接异常'} · {platform.id === 'PREDICT_FUN' && snapshot.settings.predictFunLiveEnabled ? '实盘下单已开启' : platform.integrationState === 'READ_ONLY' ? '只读' : platform.integrationState}</p></div>
                 ))}
                 {predictFunCredentials?.message && <div className="browser-status-detail"><span>PRED</span><p>{predictFunCredentials.message}{predictFunCredentials.apiKeyMasked ? ` · ${predictFunCredentials.apiKeyMasked}` : ''}{predictFunCredentials.signerAddress ? ` · signer ${shortAddress(predictFunCredentials.signerAddress)}` : ''}</p></div>}
                 <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>Predict.fun 双腿执行已接入：API 身份和页面控件二选一；首次建议用小额、无自动重试方式验证 5m/15m 各一单。</span></div>
-                <button className="wide-secondary" onClick={() => void startPredictFunOrderCapture()} disabled={busy}><ShieldAlert aria-hidden="true" />开启 Predict.fun 订单捕获（只等你手动下单）</button>
+                <button className="wide-secondary" onClick={() => void startPredictFunOrderCapture()} disabled={busy}><ShieldAlert aria-hidden="true" />开启 Predict.fun 行情/订单捕获</button>
                 {predictFunOrderCapture?.capturing && <button className="wide-secondary" onClick={() => void stopPredictFunOrderCapture()} disabled={busy}><Square aria-hidden="true" />停止 Predict.fun 链路采集</button>}
-                <button className="wide-secondary" onClick={() => void exportPredictFunOrderCapture()} disabled={busy || !predictFunOrderCapture?.traceEntryCount}><Download aria-hidden="true" />导出脱敏 Predict.fun 订单链路</button>
-                {predictFunOrderCapture?.traceEntryCount ? <button className="wide-secondary" onClick={() => void clearPredictFunOrderCapture()} disabled={busy}><Trash2 aria-hidden="true" />清除 Predict.fun 订单捕获</button> : null}
+                <button className="wide-secondary" onClick={() => void exportPredictFunOrderCapture()} disabled={busy || !predictFunOrderCapture?.traceEntryCount}><Download aria-hidden="true" />导出脱敏 Predict.fun 行情/订单链路</button>
+                {predictFunOrderCapture?.traceEntryCount ? <button className="wide-secondary" onClick={() => void clearPredictFunOrderCapture()} disabled={busy}><Trash2 aria-hidden="true" />清除 Predict.fun 行情/订单捕获</button> : null}
                 <button className="wide-secondary" onClick={() => void togglePredictFunLive()} disabled={busy}>{snapshot.settings.predictFunLiveEnabled ? <Square aria-hidden="true" /> : <ShieldCheck aria-hidden="true" />}{snapshot.settings.predictFunLiveEnabled ? '关闭 Predict.fun 实盘下单' : '开启 Predict.fun 实盘下单'}</button>
                 <button className="wide-secondary safe-preparation-button" onClick={() => void preparePredictFunWithoutSubmitting()} disabled={busy || !predictFunCredentials?.tradingConfigured}><ShieldCheck aria-hidden="true" />完整联调 Predict.fun（绝不下单）</button>
                 {predictFunPreparation && <PreparationReportView report={predictFunPreparation} />}

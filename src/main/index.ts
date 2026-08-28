@@ -342,7 +342,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   ipcMain.handle('predict-fun:export-order-capture', () => requireActiveLicense(async () => {
     const directory = join(app.getPath('userData'), 'data')
     await mkdir(directory, { recursive: true })
-    const path = join(directory, 'predict-fun-order-capture-trace.json')
+    const path = join(directory, 'predict-fun-network-capture-trace.json')
     await writeFile(path, JSON.stringify({ exportedAt: Date.now(), summary: predictFunPageCapture.getOrderCaptureSummary(), trace: predictFunPageCapture.getOrderTrace() }, null, 2), 'utf8')
     return path
   }))

@@ -244,10 +244,22 @@ function isUsefulResponse(rawUrl: string): boolean {
     const url = new URL(rawUrl)
     const path = url.pathname
     return path.includes('/v1/categories') || /(?:^|\/)markets(?:\/|$)/i.test(path) ||
+      /(?:^|\/)(?:orderbooks?|books?|prices?|quotes?|market-data|events?)(?:\/|$)/i.test(path) ||
       path.endsWith('/graphql')
   } catch {
     return false
   }
+}
+
+function isMarketDiagnosticRequest(rawUrl: string, operationName: string | undefined): boolean {
+  if (!isUsefulResponse(rawUrl)) return false
+  let path = ''
+  try { path = new URL(rawUrl).pathname } catch { return false }
+  if (!path.endsWith('/graphql')) return true
+  const operation = String(operationName ?? '')
+  if (!operation) return false
+  if (/portfolio|account|balance|position|wallet|auth|user|order/i.test(operation)) return false
+  return /market|match|event|category|book|price|quote/i.test(operation)
 }
 
 export class PredictFunPageCapture implements PredictFunPageCaptureSource {
@@ -264,6 +276,7 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   private socketPageUrls = new Map<string, string>()
   private graphqlRequests = new Map<string, PredictGraphqlRequestMetadata>()
   private orderRequestIds = new Set<string>()
+  private marketDiagnosticRequestIds = new Set<string>()
   private orderCapturing = false
   private orderTrace: PredictFunOrderTraceEntry[] = []
   private orderTraceSequence = 0
@@ -301,6 +314,7 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   startOrderCapture(): PredictFunOrderCaptureSummary {
     this.orderCapturing = true
     this.orderRequestIds.clear()
+    this.marketDiagnosticRequestIds.clear()
     this.orderTrace = []
     this.orderTraceSequence = 0
     return this.getOrderCaptureSummary()
@@ -309,12 +323,14 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   stopOrderCapture(): PredictFunOrderCaptureSummary {
     this.orderCapturing = false
     this.orderRequestIds.clear()
+    this.marketDiagnosticRequestIds.clear()
     return this.getOrderCaptureSummary()
   }
 
   clearOrderCapture(): PredictFunOrderCaptureSummary {
     this.orderCapturing = false
     this.orderRequestIds.clear()
+    this.marketDiagnosticRequestIds.clear()
     this.orderTrace = []
     this.orderTraceSequence = 0
     return this.getOrderCaptureSummary()
@@ -328,10 +344,10 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
       responseCount: this.orderTrace.filter((entry) => entry.kind === 'RESPONSE').length,
       webSocketCount: this.orderTrace.filter((entry) => entry.kind === 'WEBSOCKET').length,
       message: this.orderCapturing
-        ? '正在采集 Predict.fun 下单链路；请在已登录页面手动完成一笔最小订单'
+        ? '正在采集 Predict.fun 行情/下单链路；行情排查只需停留当前市场约 20 秒，无需下单'
         : this.orderTrace.length
-          ? 'Predict.fun 下单链路已停止采集；可导出脱敏元数据'
-          : '尚未采集 Predict.fun 下单链路'
+          ? 'Predict.fun 行情/下单链路已停止采集；可导出脱敏元数据'
+          : '尚未采集 Predict.fun 行情/下单链路'
     }
   }
 
@@ -680,14 +696,19 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
       session.on('Network.requestWillBeSent', (raw) => {
         const event = raw as CdpRequestWillBeSent
         const url = event.request?.url ?? ''
+        const graphqlMetadata = event.requestId && isPredictHost(url) && url.includes('/graphql')
+          ? graphqlRequestMetadata(event.request?.postData)
+          : undefined
+        if (event.requestId && graphqlMetadata) this.graphqlRequests.set(event.requestId, graphqlMetadata)
         if (event.requestId && isLikelyPredictOrderRequest(url, event.request?.method, event.request?.postData)) {
           this.orderRequestIds.add(event.requestId)
           const body = traceBody(event.request?.postData)
           this.pushOrderTrace({ kind: 'REQUEST', endpoint: traceEndpoint(url), method: String(event.request?.method ?? 'POST').toUpperCase(), resourceType: event.type, bodyFormat: body.format, bodyBytes: body.bytes, requestFields: body.fields, operationName: body.operationName, bodyPreview: body.preview, pageUrl: traceEndpoint(page.url()), receivedAt: Date.now() })
         }
-        if (event.requestId && isPredictHost(url) && url.includes('/graphql')) {
-          const metadata = graphqlRequestMetadata(event.request?.postData)
-          if (metadata) this.graphqlRequests.set(event.requestId, metadata)
+        if (this.orderCapturing && event.requestId && isMarketDiagnosticRequest(url, graphqlMetadata?.operationName)) {
+          this.marketDiagnosticRequestIds.add(event.requestId)
+          const body = traceBody(event.request?.postData)
+          this.pushOrderTrace({ kind: 'REQUEST', endpoint: traceEndpoint(url), method: String(event.request?.method ?? 'GET').toUpperCase(), resourceType: event.type, bodyFormat: body.format, bodyBytes: body.bytes, requestFields: body.fields, operationName: graphqlMetadata?.operationName ?? body.operationName, bodyPreview: body.preview, pageUrl: traceEndpoint(page.url()), receivedAt: Date.now() })
         }
       })
       session.on('Network.responseReceived', (raw) => { void this.handleFingerprintResponse(session, page, raw as CdpResponseReceived) })
@@ -742,6 +763,8 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     if (!event.requestId || !isUsefulResponse(url) || !['XHR', 'Fetch'].includes(event.type ?? '')) return
     const isOrderResponse = this.orderRequestIds.has(event.requestId)
     if (isOrderResponse) this.orderRequestIds.delete(event.requestId)
+    const isMarketDiagnosticResponse = this.marketDiagnosticRequestIds.has(event.requestId)
+    if (isMarketDiagnosticResponse) this.marketDiagnosticRequestIds.delete(event.requestId)
     try {
       const result = await session.send('Network.getResponseBody', { requestId: event.requestId }) as { body?: string; base64Encoded?: boolean }
       const body = result.base64Encoded ? Buffer.from(result.body ?? '', 'base64').toString('utf8') : (result.body ?? '')
@@ -752,6 +775,10 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
       if (!body) return
       const requestMetadata = this.graphqlRequests.get(event.requestId)
       this.graphqlRequests.delete(event.requestId)
+      if (isMarketDiagnosticResponse) {
+        const meta = traceBody(body)
+        this.pushOrderTrace({ kind: 'RESPONSE', endpoint: traceEndpoint(url), status: event.response?.status, resourceType: event.type, bodyFormat: meta.format, bodyBytes: meta.bytes, responseFields: meta.fields, operationName: requestMetadata?.operationName ?? meta.operationName, bodyPreview: meta.preview, pageUrl: traceEndpoint(page.url()), receivedAt: Date.now() })
+      }
       const captured: PredictFunCapturedResponse = { url, body, receivedAt: Date.now(), pageUrl: page.url(), operationName: requestMetadata?.operationName, requestSlugs: requestMetadata?.slugs, requestMarketIds: requestMetadata?.marketIds }
       this.responseCount += 1
       this.lastCaptureAt = captured.receivedAt
@@ -769,6 +796,10 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     if (!url) return
     const payload = frame.payloadData
     if (this.orderCapturing && /order|trade|fill|mutation|execution|place/i.test(payload)) {
+      const body = traceBody(payload)
+      this.pushOrderTrace({ kind: 'WEBSOCKET', endpoint: traceEndpoint(url), direction, bodyFormat: body.format, bodyBytes: body.bytes, responseFields: body.fields, operationName: body.operationName, bodyPreview: body.preview, pageUrl: traceEndpoint(pageUrl), receivedAt: Date.now() })
+    }
+    if (this.orderCapturing && /predictOrderbook|predict(?:Trading|Market)Status|order[._:/-]?book|price|quote/i.test(payload)) {
       const body = traceBody(payload)
       this.pushOrderTrace({ kind: 'WEBSOCKET', endpoint: traceEndpoint(url), direction, bodyFormat: body.format, bodyBytes: body.bytes, responseFields: body.fields, operationName: body.operationName, bodyPreview: body.preview, pageUrl: traceEndpoint(pageUrl), receivedAt: Date.now() })
     }
@@ -886,6 +917,10 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
       if (method === 'Network.requestWillBeSent') {
         const event = rawParams as CdpRequestWillBeSent
         const url = event.request?.url ?? ''
+        const graphqlMetadata = event.requestId && isPredictHost(url) && url.includes('/graphql')
+          ? graphqlRequestMetadata(event.request?.postData)
+          : undefined
+        if (event.requestId && graphqlMetadata) this.graphqlRequests.set(event.requestId, graphqlMetadata)
         if (event.requestId && isLikelyPredictOrderRequest(url, event.request?.method, event.request?.postData)) {
           this.orderRequestIds.add(event.requestId)
           const body = traceBody(event.request?.postData)
@@ -895,9 +930,14 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
             bodyPreview: body.preview, pageUrl: traceEndpoint(window.webContents.getURL()), receivedAt: Date.now()
           })
         }
-        if (event.requestId && isPredictHost(url) && url.includes('/graphql')) {
-          const metadata = graphqlRequestMetadata(event.request?.postData)
-          if (metadata) this.graphqlRequests.set(event.requestId, metadata)
+        if (this.orderCapturing && event.requestId && isMarketDiagnosticRequest(url, graphqlMetadata?.operationName)) {
+          this.marketDiagnosticRequestIds.add(event.requestId)
+          const body = traceBody(event.request?.postData)
+          this.pushOrderTrace({
+            kind: 'REQUEST', endpoint: traceEndpoint(url), method: String(event.request?.method ?? 'GET').toUpperCase(), resourceType: event.type,
+            bodyFormat: body.format, bodyBytes: body.bytes, requestFields: body.fields, operationName: graphqlMetadata?.operationName ?? body.operationName,
+            bodyPreview: body.preview, pageUrl: traceEndpoint(window.webContents.getURL()), receivedAt: Date.now()
+          })
         }
         return
       }
@@ -935,6 +975,8 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     if (!event.requestId || !isUsefulResponse(url) || !['XHR', 'Fetch'].includes(event.type ?? '')) return
     const isOrderResponse = this.orderRequestIds.has(event.requestId)
     if (isOrderResponse) this.orderRequestIds.delete(event.requestId)
+    const isMarketDiagnosticResponse = this.marketDiagnosticRequestIds.has(event.requestId)
+    if (isMarketDiagnosticResponse) this.marketDiagnosticRequestIds.delete(event.requestId)
     try {
       const result = await window.webContents.debugger.sendCommand('Network.getResponseBody', { requestId: event.requestId }) as {
         body?: string
@@ -960,6 +1002,10 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
         const bodyMeta = traceBody(body)
         this.pushOrderTrace({ kind: 'RESPONSE', endpoint: traceEndpoint(url), status: event.response?.status, resourceType: event.type, bodyFormat: bodyMeta.format, bodyBytes: bodyMeta.bytes, responseFields: bodyMeta.fields, operationName: bodyMeta.operationName, bodyPreview: bodyMeta.preview, pageUrl: traceEndpoint(window.webContents.getURL()), receivedAt: Date.now() })
       }
+      if (isMarketDiagnosticResponse) {
+        const bodyMeta = traceBody(body)
+        this.pushOrderTrace({ kind: 'RESPONSE', endpoint: traceEndpoint(url), status: event.response?.status, resourceType: event.type, bodyFormat: bodyMeta.format, bodyBytes: bodyMeta.bytes, responseFields: bodyMeta.fields, operationName: requestMetadata?.operationName ?? bodyMeta.operationName, bodyPreview: bodyMeta.preview, pageUrl: traceEndpoint(window.webContents.getURL()), receivedAt: Date.now() })
+      }
       this.responseCount += 1
       this.lastCaptureAt = captured.receivedAt
       this.setStatus('CONNECTED', this.captureStatusMessage())
@@ -976,6 +1022,10 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     if (!url) return
     const payload = frame.payloadData
     if (this.orderCapturing && /order|trade|fill|mutation|execution|place/i.test(payload)) {
+      const body = traceBody(payload)
+      this.pushOrderTrace({ kind: 'WEBSOCKET', endpoint: traceEndpoint(url), direction, bodyFormat: body.format, bodyBytes: body.bytes, responseFields: body.fields, operationName: body.operationName, bodyPreview: body.preview, pageUrl: traceEndpoint(this.socketPageUrls.get(event.requestId) ?? window.webContents.getURL()), receivedAt: Date.now() })
+    }
+    if (this.orderCapturing && /predictOrderbook|predict(?:Trading|Market)Status|order[._:/-]?book|price|quote/i.test(payload)) {
       const body = traceBody(payload)
       this.pushOrderTrace({ kind: 'WEBSOCKET', endpoint: traceEndpoint(url), direction, bodyFormat: body.format, bodyBytes: body.bytes, responseFields: body.fields, operationName: body.operationName, bodyPreview: body.preview, pageUrl: traceEndpoint(this.socketPageUrls.get(event.requestId) ?? window.webContents.getURL()), receivedAt: Date.now() })
     }
