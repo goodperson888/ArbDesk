@@ -23,6 +23,6 @@ export function multiVenueReceiptStatusLabel(
   return '执行中'
 }
 
-export function multiVenueExecuteLabel(unprotected: boolean, kalshiDirection: 'UP' | 'DOWN'): string {
-  return unprotected ? '极速无保护 · 同量双边提交' : `执行双腿（${kalshiDirection} → Kalshi）`
+export function multiVenueExecuteLabel(unprotected: boolean, firstDirection: 'UP' | 'DOWN', secondVenue = 'Kalshi'): string {
+  return unprotected ? '极速无保护 · 同量双边提交' : `执行双腿（${firstDirection} → ${secondVenue}）`
 }

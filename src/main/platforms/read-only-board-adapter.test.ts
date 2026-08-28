@@ -42,7 +42,7 @@ describe('read-only multi-venue board adapter', () => {
 
     expect(rows).toHaveLength(2)
     expect(rows[0]).toMatchObject({ edgeKind: 'GROSS_ONLY', status: 'BLOCKED', executionProvider: 'MULTI_VENUE', potentialProfit: '0.000000' })
-    expect(rows[0].blockReasons).toContain('新平台当前只读，尚未开放该路线下单')
+    expect(rows[0].blockReasons).toContain('Limitless 当前只读，尚未开放实盘执行')
   })
 
   it('does not duplicate the legacy MEXC plus Polymarket route', () => {

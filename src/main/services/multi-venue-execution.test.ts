@@ -116,6 +116,50 @@ describe('multi-venue Kalshi execution', () => {
     expect((mocked.kalshi.placeOrder.mock.calls[0] as unknown as [Record<string, string>])[0]).toMatchObject({ quantity: '13.00' })
   })
 
+  it('executes a validated Polymarket↔Gate pair without invoking Kalshi credentials', async () => {
+    const mocked = deps()
+    mocked.polymarket.hedge.mockResolvedValueOnce({ venue: 'POLYMARKET', direction: 'UP', quantity: '13.00', averagePrice: '0.40', orderId: 'poly-gate-poly', filledAt: Date.now() })
+    mocked.gate.submit.mockResolvedValueOnce({ orderId: 'gate-poly-gate', status: 'FILLED' as const, filledQuantity: '13.00', averagePrice: '0.40' })
+    const executionRequest: MultiVenueExecutionRequest = {
+      comparisonId: 'poly-gate-1', quantity: '13.00', startTime: Date.now() - 10_000, endTime: Date.now() + 60_000, confirmed: true,
+      legs: [
+        { venueId: 'POLYMARKET', marketId: 'poly-event', outcomeId: 'poly-token', direction: 'UP', price: '0.40', availableQuantity: '13', quoteAgeMs: 100 },
+        { venueId: 'GATE', marketId: 'gate-event', outcomeId: 'gate-token', direction: 'DOWN', price: '0.40', availableQuantity: '13', quoteAgeMs: 100 }
+      ]
+    }
+    const service = new MultiVenueExecutionService({
+      ...mocked, settings: () => settings(), liveExecutionEnabled: true,
+      comparisonProvider: () => comparisonForRequest(executionRequest),
+      kalshiCredentialsReady: vi.fn(async () => { throw new Error('Kalshi credentials should not be read for this pair') })
+    } as never)
+
+    const receipt = await service.execute(executionRequest)
+    expect(receipt.status).toBe('HEDGED')
+    expect(mocked.polymarket.hedge).toHaveBeenCalledTimes(1)
+    expect(mocked.gate.submit).toHaveBeenCalledTimes(1)
+    expect(mocked.kalshi.placeOrder).not.toHaveBeenCalled()
+  })
+
+  it('rejects Predict.fun before any credential lookup or order submission', async () => {
+    const mocked = deps()
+    const executionRequest: MultiVenueExecutionRequest = {
+      comparisonId: 'predict-gate-1', quantity: '13.00', startTime: Date.now() - 10_000, endTime: Date.now() + 60_000, confirmed: true,
+      legs: [
+        { venueId: 'PREDICT_FUN', marketId: 'predict-event', outcomeId: 'predict-token', direction: 'UP', price: '0.40', availableQuantity: '13', quoteAgeMs: 100 },
+        { venueId: 'GATE', marketId: 'gate-event', outcomeId: 'gate-token', direction: 'DOWN', price: '0.40', availableQuantity: '13', quoteAgeMs: 100 }
+      ]
+    }
+    const service = new MultiVenueExecutionService({
+      ...mocked, settings: () => settings(), liveExecutionEnabled: true,
+      comparisonProvider: () => comparisonForRequest(executionRequest),
+      kalshiCredentialsReady: vi.fn(async () => { throw new Error('Kalshi credentials should not be read') })
+    } as never)
+
+    await expect(service.execute(executionRequest)).rejects.toThrow('Predict.fun')
+    expect(mocked.gate.submit).not.toHaveBeenCalled()
+    expect(mocked.kalshi.placeOrder).not.toHaveBeenCalled()
+  })
+
   it('uses the global unprotected setting to start equal Gate and Kalshi submissions in parallel', async () => {
     const mocked = deps()
     type GateResult = Awaited<ReturnType<typeof mocked.gate.submit>>

@@ -67,7 +67,7 @@ import type {
   SettlementDistanceRule,
   VenuePreparationReport
 } from '../../shared/types'
-import type { MultiVenueComparison, MultiVenueComparisonStatus, MultiVenueExecutionCommand, MultiVenueExecutionReceipt, MultiVenueExecutionSession, VenueCycleDataState, VenueDescriptor } from '../../shared/multi-venue'
+import { isMultiVenueExecutionVenue, type MultiVenueComparison, type MultiVenueComparisonStatus, type MultiVenueExecutionCommand, type MultiVenueExecutionReceipt, type MultiVenueExecutionSession, type VenueCycleDataState, type VenueDescriptor } from '../../shared/multi-venue'
 import type { EntryGateCheck } from '../../shared/entry-gates'
 import { defaultSettlementDistanceRules } from '../../shared/defaults'
 import { buildMultiVenueEntryGateReport, gateDurationExecutionReady } from './multi-venue-entry-gates'
@@ -755,14 +755,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     () => snapshot?.multiVenueBoard.comparisons.find((comparison) => comparison.id === selectedComparisonId),
     [selectedComparisonId, snapshot?.multiVenueBoard.comparisons]
   )
-  const selectedKalshiLeg = useMemo(
-    () => selectedComparison?.legs.find((leg) => leg.venueId === 'KALSHI'),
-    [selectedComparison]
-  )
-  const selectedOtherVenueLeg = useMemo(
-    () => selectedComparison?.legs.find((leg) => leg.venueId !== 'KALSHI'),
-    [selectedComparison]
-  )
   const selectedGateLeg = useMemo(
     () => selectedComparison?.legs.find((leg) => leg.venueId === 'GATE'),
     [selectedComparison]
@@ -796,13 +788,12 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const unprotectedCapitalQuantity = multiVenueAllInCost > 0
     ? Number(snapshot?.settings.maxCapitalPerTrade ?? 0) / multiVenueAllInCost
     : 0
-  const multiVenueMaxQuantity = selectedComparison && selectedKalshiLeg && selectedOtherVenueLeg
+  const multiVenueMaxQuantity = selectedComparison?.executionProvider === 'MULTI_VENUE' && selectedComparison.legs.length === 2
     ? Math.floor((unprotectedMode
       ? unprotectedCapitalQuantity
       : Math.min(
           Number(selectedComparison.executableQuantity),
-          Number(selectedKalshiLeg.availableQuantity),
-          Number(selectedOtherVenueLeg.availableQuantity)
+          ...selectedComparison.legs.map((leg) => Number(leg.availableQuantity))
         )) * 100) / 100
     : 0
   const multiVenueRequestedQuantity = Number(multiVenueQuantity)
@@ -827,7 +818,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     const reports = new Map<string, ReturnType<typeof buildMultiVenueEntryGateReport>>()
     if (!snapshot) return reports
     for (const comparison of visibleComparisons) {
-      if (comparison.executionProvider !== 'MULTI_VENUE' || !comparison.legs.some((leg) => leg.venueId === 'KALSHI')) continue
+      if (comparison.executionProvider !== 'MULTI_VENUE') continue
       reports.set(comparison.id, buildMultiVenueEntryGateReport({
         comparison,
         quantity: multiVenueQuantity,
@@ -1001,7 +992,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     { id: 'execution-idle', passed: executionSessionIdle && !busy, label: executionSessionIdle ? (recoveryPending ? '上组待恢复（不阻塞新开仓，可在历史中补单）' : busy ? '当前操作正在执行' : '当前无执行中操作') : `已有执行中套利组（${snapshot.activeSession?.state ?? '未知状态'}）`, locked: true }
   ] : []
 
-  const multiVenueGateReport = selectedComparison && snapshot && selectedKalshiLeg
+  const multiVenueGateReport = selectedComparison?.executionProvider === 'MULTI_VENUE' && snapshot
     ? buildMultiVenueEntryGateReport({
       comparison: selectedComparison,
       quantity: multiVenueQuantity,
@@ -1358,42 +1349,13 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   }
 
   async function executeSelectedMultiVenue(): Promise<void> {
-    if (!snapshot || !selectedComparison || !selectedKalshiLeg?.marketId) return
+    if (!snapshot || !selectedComparison || selectedComparison.executionProvider !== 'MULTI_VENUE' || selectedComparison.legs.length !== 2) return
+    if (!selectedComparison.legs.every((leg) => isMultiVenueExecutionVenue(leg.venueId))) {
+      setMessage('Predict.fun 与 Limitless 当前只读，暂不支持真实双腿下单')
+      return
+    }
     if (!multiVenueGateReport?.allowed) {
       setMessage(multiVenueGateReport?.firstBlockReason ?? '当前双腿入场条件未通过')
-      return
-    }
-    const otherLeg = selectedComparison.legs.find((leg) => leg.venueId !== 'KALSHI')
-    if (!otherLeg || (otherLeg.venueId !== 'MEXC' && otherLeg.venueId !== 'POLYMARKET' && otherLeg.venueId !== 'GATE' && otherLeg.venueId !== 'PREDICT_FUN')) {
-      setMessage('当前机会没有可真实执行的第二平台；仍是观察机会')
-      return
-    }
-    if (!kalshiCredentials) {
-      setMessage('正在读取 Kalshi 凭据状态，请稍后再试；本次未发送订单')
-      return
-    }
-    if (!kalshiCredentials.configured) {
-      setMessage('请先在设置中保存 Kalshi API Key ID 与 RSA 私钥')
-      return
-    }
-    if (!snapshot.settings.kalshiLiveEnabled || snapshot.settings.mode !== 'ASSISTED') {
-      setMessage('请先切换到人工监督模式，并开启 Kalshi 实盘开关')
-      return
-    }
-    if (otherLeg.venueId === 'MEXC' && !snapshot.settings.mexcAutomationEnabled) {
-      setMessage('MEXC↔Kalshi 双腿执行需要开启 MEXC 自动提交')
-      return
-    }
-    if (otherLeg.venueId === 'POLYMARKET' && !snapshot.settings.polymarketLiveEnabled) {
-      setMessage('Polymarket↔Kalshi 双腿执行需要开启 Polymarket 实盘对冲')
-      return
-    }
-    if (otherLeg.venueId === 'GATE' && !snapshot.settings.gateLiveEnabled) {
-      setMessage('Gate↔Kalshi 双腿执行需要开启 Gate 实盘下单')
-      return
-    }
-    if (otherLeg.venueId === 'PREDICT_FUN' && !snapshot.settings.predictFunLiveEnabled) {
-      setMessage('Predict.fun↔Kalshi 双腿执行需要开启 Predict.fun 实盘下单')
       return
     }
     const requestedQuantity = Number(multiVenueQuantity)
@@ -1964,7 +1926,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                     <small>计划 {Number.isFinite(multiVenueRequestedQuantity) ? multiVenueRequestedQuantity.toFixed(2) : '—'} 份 · 预计 ${Number.isFinite(multiVenueRequestedQuantity) && Number(leg.price) > 0 ? (multiVenueRequestedQuantity * Number(leg.price)).toFixed(2) : '—'}</small>
                   </div>)}
                 </div>
-                {selectedKalshiLeg && <div className="kalshi-live-ticket">
+                {selectedComparison.executionProvider === 'MULTI_VENUE' && <div className="kalshi-live-ticket">
                   {multiVenueReceipt && multiVenueReceipt.comparisonId === selectedComparison.id && <div className="browser-status-detail"><span>双腿</span><p>{multiVenueReceipt.message} · {multiVenueReceiptStatusLabel(multiVenueReceipt.status)}</p></div>}
                 </div>}
               </section>
@@ -2063,11 +2025,11 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <div className="multi-venue-plan-summary">
                   {selectedComparison.legs.map((leg) => <div key={`plan-${leg.venueId}`}><span>{leg.venueLabel} {leg.direction}</span><strong>{Number.isFinite(multiVenueRequestedQuantity) ? `${multiVenueRequestedQuantity.toFixed(2)}份` : '—'}</strong><small>{Number.isFinite(multiVenueRequestedQuantity) && Number(leg.price) > 0 ? `$${(multiVenueRequestedQuantity * Number(leg.price)).toFixed(2)}` : '金额待报价'}</small></div>)}
                 </div>
-                {selectedKalshiLeg && multiVenueGateReport && <>
+                {multiVenueGateReport && selectedComparison.legs.length === 2 && <>
                   <div className="execute-action-row">
                     <button className={`execute-button ${unprotectedMode || multiVenueGateReport.ignoredCount > 0 ? 'risk-override' : ''}`} onClick={() => void executeSelectedMultiVenue()} disabled={busy || !multiVenueGateReport.allowed}>
                       {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <Zap aria-hidden="true" />}
-                      {multiVenueExecuteLabel(unprotectedMode, selectedKalshiLeg.direction)}
+                      {multiVenueExecuteLabel(unprotectedMode, selectedComparison.legs[0].direction, selectedComparison.legs[1].venueLabel)}
                     </button>
                     <ExecutionConditionsHelp checks={multiVenueGateReport.checks} busy={busy} onToggle={(condition) => void toggleManualExecutionCondition(condition)} />
                   </div>
@@ -2417,9 +2379,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   <div className="browser-status-detail" key={platform.id}><span>{platform.id === 'LIMITLESS' ? 'LIMIT' : platform.id === 'PREDICT_FUN' ? 'PRED' : platform.id === 'GATE' ? 'GATE' : 'KALSHI'}</span><p>{platform.integrationState === 'PLANNED' ? '暂不纳入短周期扫描' : platform.connectionState === 'CONNECTED' ? '行情在线' : platform.connectionState === 'NOT_CONFIGURED' ? '等待网页行情或官方Key' : '连接异常'} · {platform.id === 'PREDICT_FUN' && snapshot.settings.predictFunLiveEnabled ? '实盘下单已开启' : platform.integrationState === 'READ_ONLY' ? '只读' : platform.integrationState}</p></div>
                 ))}
                 {predictFunCredentials?.message && <div className="browser-status-detail"><span>PRED</span><p>{predictFunCredentials.message}{predictFunCredentials.apiKeyMasked ? ` · ${predictFunCredentials.apiKeyMasked}` : ''}{predictFunCredentials.signerAddress ? ` · signer ${shortAddress(predictFunCredentials.signerAddress)}` : ''}</p></div>}
-                <button className={`wide-secondary ${snapshot.settings.predictFunLiveEnabled ? 'live-toggle enabled' : ''}`} onClick={() => void togglePredictFunLive()} disabled={busy || (!snapshot.settings.predictFunLiveEnabled && !predictFunCredentials?.tradingConfigured)}>
-                  <ShieldCheck aria-hidden="true" />{snapshot.settings.predictFunLiveEnabled ? '关闭 Predict.fun 实盘下单' : '开启 Predict.fun 实盘下单'}
-                </button>
+                <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>Predict.fun 当前仅接入行情与盘口监听，实盘下单尚未开放；不会进入真实双腿执行。</span></div>
                 <button className="wide-secondary safe-preparation-button" onClick={() => void preparePredictFunWithoutSubmitting()} disabled={busy || !predictFunCredentials?.tradingConfigured}><ShieldCheck aria-hidden="true" />完整联调 Predict.fun（绝不下单）</button>
                 {predictFunPreparation && <PreparationReportView report={predictFunPreparation} />}
                   </div>
@@ -2469,7 +2429,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   <div className="credential-platform-body">
                 <div className="credential-route-card">
                   <strong>Kalshi 行情、账户与人工实盘入口</strong>
-                  <span>Kalshi 当前只接入 KXBTC15M 15分钟市场；5分钟市场不纳入扫描。真实执行仅支持 MEXC↔Kalshi 或 Polymarket↔Kalshi 双腿流程，默认关闭，不会自动下单。</span>
+                  <span>Kalshi 当前只接入 KXBTC15M 15分钟市场；5分钟市场不纳入扫描。真实执行可与 MEXC、Polymarket、Gate 组成已验证双腿组合，默认关闭，不会自动下单。</span>
                 </div>
                 <label className="settings-field" htmlFor="kalshi-api-key-id">Kalshi API Key ID（首次必填）
                   <input id="kalshi-api-key-id" type={revealPlatformSecrets ? 'text' : 'password'} value={kalshiApiKeyId} onChange={(event) => setKalshiApiKeyId(event.target.value)} placeholder={kalshiCredentials?.apiKeyIdMasked ? `已保存 ${kalshiCredentials.apiKeyIdMasked}；留空不修改` : 'Kalshi API Keys → Key ID'} spellCheck={false} autoComplete="new-password" />

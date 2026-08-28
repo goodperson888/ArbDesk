@@ -82,4 +82,27 @@ describe('multi venue entry gate adapter', () => {
     expect(report({ gateReady: false }).firstBlockReason).toContain('Gate')
     expect(report({ settings: settings({ mode: 'SIMULATION' }) }).firstBlockReason).toContain('人工监督')
   })
+
+  it('允许 Polymarket↔Gate 复用同一套双腿门禁，且不要求 Kalshi 凭据', () => {
+    const polyGate = comparison({
+      id: 'poly-gate',
+      legs: [
+        { venueId: 'POLYMARKET', venueLabel: 'Polymarket', marketId: 'poly-market', outcomeId: 'poly-up', direction: 'UP', price: '0.40', availableQuantity: '20', quoteAgeMs: 100 },
+        { venueId: 'GATE', venueLabel: 'Gate', marketId: 'gate-market', outcomeId: 'gate-down', direction: 'DOWN', price: '0.50', availableQuantity: '20', quoteAgeMs: 100 }
+      ]
+    })
+    const result = report({ comparison: polyGate, kalshiReady: false, settings: settings({ manualExecutionConditions: { ...defaultManualExecutionConditions(), feeVerification: false } }) })
+    expect(result.checks.find((check) => check.id === 'kalshi-credentials')).toBeUndefined()
+    expect(result.allowed).toBe(true)
+  })
+
+  it('明确阻止 Predict.fun 进入真实双腿门禁', () => {
+    const predict = comparison({
+      legs: [
+        { venueId: 'PREDICT_FUN', venueLabel: 'Predict.fun', marketId: 'predict-market', outcomeId: 'predict-up', direction: 'UP', price: '0.40', availableQuantity: '20', quoteAgeMs: 100 },
+        { venueId: 'GATE', venueLabel: 'Gate', marketId: 'gate-market', outcomeId: 'gate-down', direction: 'DOWN', price: '0.50', availableQuantity: '20', quoteAgeMs: 100 }
+      ]
+    })
+    expect(report({ comparison: predict }).firstBlockReason).toContain('Predict.fun')
+  })
 })

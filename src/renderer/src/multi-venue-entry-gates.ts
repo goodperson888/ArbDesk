@@ -1,6 +1,6 @@
 import type { EntryGateReport, EntryGateReadiness } from '../../shared/entry-gates'
 import { evaluateEntryGates } from '../../shared/entry-gates'
-import type { MultiVenueComparison } from '../../shared/multi-venue'
+import { isMultiVenueExecutionVenue, type MultiVenueComparison } from '../../shared/multi-venue'
 import type { GateOrderCaptureSummary, RiskSettings } from '../../shared/types'
 
 export interface MultiVenueEntryGateArgs {
@@ -9,7 +9,7 @@ export interface MultiVenueEntryGateArgs {
   settings: RiskSettings
   now: number
   executionIdle: boolean
-  kalshiReady: boolean
+  kalshiReady?: boolean
   gateReady: boolean
 }
 
@@ -20,21 +20,46 @@ export function gateDurationExecutionReady(summary: GateOrderCaptureSummary | un
 
 export function buildMultiVenueEntryGateReport(args: MultiVenueEntryGateArgs): EntryGateReport {
   const unprotected = args.settings.mode === 'ASSISTED' && args.settings.unprotectedExecutionEnabled === true
-  const kalshi = args.comparison.legs.find((leg) => leg.venueId === 'KALSHI')
-  const other = args.comparison.legs.find((leg) => leg.venueId !== 'KALSHI')
-  const supportedRoute = Boolean(kalshi && other && ['MEXC', 'POLYMARKET', 'GATE'].includes(other.venueId))
-  const otherLiveReady = other?.venueId === 'MEXC'
-    ? args.settings.mexcAutomationEnabled
-    : other?.venueId === 'POLYMARKET'
-      ? args.settings.polymarketLiveEnabled
-      : other?.venueId === 'GATE' && args.settings.gateLiveEnabled
+  const supportedRoute = args.comparison.legs.length === 2 && args.comparison.legs.every((leg) => isMultiVenueExecutionVenue(leg.venueId))
+  const unsupportedVenue = args.comparison.legs.find((leg) => !isMultiVenueExecutionVenue(leg.venueId))?.venueId
+  const unsupportedReason = unsupportedVenue === 'PREDICT_FUN'
+    ? 'Predict.fun 当前只读，尚未开放实盘执行'
+    : unsupportedVenue === 'LIMITLESS'
+      ? 'Limitless 当前只读，尚未开放实盘执行'
+      : '当前路线尚未接入真实执行'
+  const liveReady = (venueId: string): boolean => venueId === 'MEXC'
+    ? args.settings.mexcAutomationEnabled === true
+    : venueId === 'POLYMARKET'
+      ? args.settings.polymarketLiveEnabled === true
+      : venueId === 'GATE'
+        ? args.settings.gateLiveEnabled === true
+        : venueId === 'KALSHI'
+          ? args.settings.kalshiLiveEnabled === true
+          : false
   const readiness: EntryGateReadiness[] = [
-    { id: 'supported-route', label: supportedRoute ? '双腿路线已接入' : '当前路线尚未接入真实执行', passed: supportedRoute, blockReason: '当前路线尚未接入真实双腿执行' },
+    { id: 'supported-route', label: supportedRoute ? '双腿路线已接入' : unsupportedReason, passed: supportedRoute, blockReason: unsupportedReason },
     { id: 'assisted-mode', label: args.settings.mode === 'ASSISTED' ? '已进入人工监督模式' : '尚未进入人工监督模式', passed: args.settings.mode === 'ASSISTED', blockReason: '请先切换到人工监督模式' },
-    { id: 'kalshi-credentials', label: args.kalshiReady ? 'Kalshi 本地身份已配置' : 'Kalshi 本地身份未配置', passed: args.kalshiReady, blockReason: '请先配置 Kalshi API Key ID 与 RSA 私钥' },
-    { id: 'kalshi-live', label: args.settings.kalshiLiveEnabled ? 'Kalshi 实盘开关已开启' : 'Kalshi 实盘开关未开启', passed: args.settings.kalshiLiveEnabled === true, blockReason: '请先开启 Kalshi 人工实盘下单开关' },
-    ...(other?.venueId === 'GATE' ? [{ id: 'gate-capture', label: `Gate ${args.comparison.durationMinutes}m 下单页面${args.gateReady ? '已接管' : '未接管'}`, passed: args.gateReady, blockReason: `Gate ${args.comparison.durationMinutes}m 下单页面未接管` }] : []),
-    { id: 'first-leg-live', label: `${other?.venueLabel ?? '第一平台'}实盘${otherLiveReady ? '已开启' : '未开启'}`, passed: Boolean(otherLiveReady), blockReason: `请先开启 ${other?.venueLabel ?? '第一平台'} 实盘下单` }
+    ...args.comparison.legs.flatMap((leg) => {
+      const items: EntryGateReadiness[] = [{
+        id: `${leg.venueId.toLowerCase()}-live`,
+        label: `${leg.venueLabel} 实盘开关${liveReady(leg.venueId) ? '已开启' : '未开启'}`,
+        passed: liveReady(leg.venueId),
+        blockReason: `请先开启 ${leg.venueLabel} 实盘下单`
+      }]
+      if (leg.venueId === 'KALSHI') items.push({
+        id: 'kalshi-credentials',
+        label: args.kalshiReady ? 'Kalshi 本地身份已配置' : 'Kalshi 本地身份未配置',
+        passed: args.kalshiReady === true,
+        blockReason: '请先配置 Kalshi API Key ID 与 RSA 私钥'
+      })
+      if (leg.venueId === 'GATE') items.push({
+        id: 'gate-capture',
+        label: `Gate ${args.comparison.durationMinutes}m 下单页面${args.gateReady ? '已接管' : '未接管'}`,
+        passed: args.gateReady,
+        blockReason: `Gate ${args.comparison.durationMinutes}m 下单页面未接管`
+      })
+      return items
+    })
   ]
 
   return evaluateEntryGates({

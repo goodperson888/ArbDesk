@@ -10,6 +10,7 @@ describe('Windows package workflow', () => {
     expect(workflow).toContain('market_profile:')
     expect(workflow).toContain('type: choice')
     expect(workflow).toContain('- btc-gate-kalshi')
+    expect(workflow).toContain('- btc-executable-all')
     expect(workflow).toContain('- btc-all')
     expect(workflow).toContain('MARKET_PROFILE: ${{ inputs.market_profile }}')
     expect(workflow).not.toContain('path: release/btc-gate-kalshi/*.exe')

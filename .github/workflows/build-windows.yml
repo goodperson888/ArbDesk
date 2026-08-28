@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - btc-gate-kalshi
+          - btc-executable-all
           - btc-all
 
 permissions:

@@ -7,6 +7,7 @@ import type {
   MultiVenueExecutionReceipt,
   MultiVenueExecutionRequest
 } from '../../shared/multi-venue'
+import { isMultiVenueExecutionVenue } from '../../shared/multi-venue'
 import { evaluateEntryGates } from '../../shared/entry-gates'
 import type { MexcBrowserManager } from './mexc-browser'
 import type { PolymarketLiveBroker } from './polymarket-live'
@@ -35,16 +36,33 @@ interface PairExecutionDependencies {
   executionSessionStore?: ExecutionSessionStore
 }
 
+const leadPriority: Record<string, number> = {
+  MEXC: 10,
+  POLYMARKET: 20,
+  GATE: 30,
+  KALSHI: 40
+}
+
 function pairFor(legs: MultiVenueExecutionLegRequest[]): { first: MultiVenueExecutionLegRequest; second: MultiVenueExecutionLegRequest } {
-  const kalshi = legs.find((leg) => leg.venueId === 'KALSHI')
-  const other = legs.find((leg) => leg.venueId !== 'KALSHI')
-  if (!kalshi || !other || !['MEXC', 'POLYMARKET', 'GATE', 'PREDICT_FUN'].includes(other.venueId)) {
-    throw new Error('当前双腿执行需要 MEXC、Polymarket、Predict.fun 或 Gate 与 Kalshi 组成已验证路线')
+  if (legs.length !== 2 || legs[0].venueId === legs[1].venueId || legs.some((leg) => !isMultiVenueExecutionVenue(leg.venueId))) {
+    throw new Error('当前双腿执行仅开放 MEXC、Polymarket、Gate、Kalshi 的已验证平台组合；Predict.fun 与 Limitless 暂为只读')
   }
-  // Keep the mature route ordering: MEXC's web order is the lead leg and
-  // Polymarket's FAK is the lead leg for the direct-API route. Kalshi is always
-  // submitted only after the first leg has an actual fill.
-  return { first: other, second: kalshi }
+  // Prefer a direct API leg as the lead where possible. Gate remains ahead of
+  // Kalshi to preserve the existing Gate↔Kalshi route semantics.
+  const [left, right] = legs
+  return (leadPriority[left.venueId] ?? 999) <= (leadPriority[right.venueId] ?? 999)
+    ? { first: left, second: right }
+    : { first: right, second: left }
+}
+
+function liveReadyForVenue(venueId: string, settings: RiskSettings): boolean {
+  switch (venueId) {
+    case 'MEXC': return settings.mexcAutomationEnabled === true
+    case 'POLYMARKET': return settings.polymarketLiveEnabled === true
+    case 'GATE': return settings.gateLiveEnabled === true
+    case 'KALSHI': return settings.kalshiLiveEnabled === true
+    default: return false
+  }
 }
 
 export class MultiVenueExecutionService {
@@ -78,18 +96,37 @@ export class MultiVenueExecutionService {
         { ...comparison.legs[1] }
       ]
       const { first, second } = pairFor(requestLegs)
-      const otherLiveReady = first.venueId === 'MEXC'
-        ? settings.mexcAutomationEnabled
-        : first.venueId === 'POLYMARKET'
-          ? settings.polymarketLiveEnabled
-          : first.venueId === 'GATE'
-            ? settings.gateLiveEnabled
-            : first.venueId === 'PREDICT_FUN' && settings.predictFunLiveEnabled
-      const kalshiCredentialsReady = await this.dependencies.kalshiCredentialsReady()
       const gateDuration = comparison.durationMinutes === 5 || comparison.durationMinutes === 15
         ? comparison.durationMinutes
         : undefined
-      const gateExecutionReady = first.venueId !== 'GATE' || Boolean(gateDuration && this.dependencies.gateExecutionReady(gateDuration))
+      const hasKalshi = requestLegs.some((leg) => leg.venueId === 'KALSHI')
+      const hasGate = requestLegs.some((leg) => leg.venueId === 'GATE')
+      const kalshiCredentialsReady = hasKalshi ? await this.dependencies.kalshiCredentialsReady() : true
+      const gateExecutionReady = !hasGate || Boolean(gateDuration && this.dependencies.gateExecutionReady(gateDuration))
+      const readiness = [] as Array<{ id: string; label: string; passed: boolean; blockReason: string }>
+      if (hasKalshi) readiness.push({
+        id: 'kalshi-credentials',
+        label: 'Kalshi 本地身份已配置',
+        passed: kalshiCredentialsReady,
+        blockReason: '请先配置 Kalshi API Key ID 与 RSA 私钥'
+      })
+      readiness.push(...requestLegs.flatMap((leg) => {
+        const venueLabel = comparison.legs.find((candidate) => candidate.venueId === leg.venueId)?.venueLabel ?? leg.venueId
+        const liveReady = liveReadyForVenue(leg.venueId, settings)
+        const items = [{
+          id: `${leg.venueId.toLowerCase()}-live`,
+          label: `${venueLabel} 实盘开关已开启`,
+          passed: liveReady,
+          blockReason: `请先开启 ${venueLabel} 实盘下单开关`
+        }]
+        if (leg.venueId === 'GATE') items.push({
+          id: 'gate-capture',
+          label: `Gate ${gateDuration ?? comparison.durationMinutes}m 下单页面${gateExecutionReady ? '已接管' : '未接管'}`,
+          passed: gateExecutionReady,
+          blockReason: `Gate ${gateDuration ?? comparison.durationMinutes}m 下单页面未接管`
+        })
+        return items
+      }))
       const gateReport = evaluateEntryGates({
         mode: 'MANUAL', quantity: command.quantity, allInCostPerShare: comparison.allInCostPerShare,
         conditionalReturnPct: comparison.conditionalReturnPct, edgeKind: comparison.edgeKind,
@@ -108,12 +145,7 @@ export class MultiVenueExecutionService {
           : settings.manualExecutionConditions,
         executionIdle: true,
         depthLimitApplicable: !unprotected,
-        readiness: [
-          { id: 'kalshi-credentials', label: 'Kalshi 本地身份已配置', passed: kalshiCredentialsReady, blockReason: '请先配置 Kalshi API Key ID 与 RSA 私钥' },
-          { id: 'kalshi-live', label: 'Kalshi 实盘开关已开启', passed: settings.kalshiLiveEnabled === true, blockReason: '请先开启 Kalshi 人工实盘下单开关' },
-          { id: 'gate-capture', label: `Gate ${gateDuration ?? comparison.durationMinutes}m 下单页面${gateExecutionReady ? '已接管' : '未接管'}`, passed: gateExecutionReady, blockReason: `Gate ${gateDuration ?? comparison.durationMinutes}m 下单页面未接管` },
-          { id: `${first.venueId.toLowerCase()}-live`, label: `${first.venueId} 首腿实盘已就绪`, passed: Boolean(otherLiveReady), blockReason: `${first.venueId} 首腿实盘尚未开启` }
-        ],
+        readiness,
         legs: requestLegs.map((leg) => ({
           ...leg,
           venueLabel: comparison.legs.find((candidate) => candidate.venueId === leg.venueId)?.venueLabel ?? leg.venueId,

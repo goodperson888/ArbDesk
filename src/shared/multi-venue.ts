@@ -1,5 +1,17 @@
 export type VenueId = string
 
+/**
+ * Venues that have a validated real-order transport in the current product.
+ * Predict.fun and Limitless remain observable only until their order flows are
+ * validated independently; keeping this allow-list in shared code prevents a
+ * UI route from being accidentally treated as executable by the main process.
+ */
+export const MULTI_VENUE_EXECUTION_VENUES = ['MEXC', 'POLYMARKET', 'GATE', 'KALSHI'] as const
+
+export function isMultiVenueExecutionVenue(venueId: VenueId): boolean {
+  return (MULTI_VENUE_EXECUTION_VENUES as readonly string[]).includes(venueId.toUpperCase())
+}
+
 export type CanonicalEventCategory = 'CRYPTO' | 'SPORTS' | 'POLITICS' | 'FINANCE' | 'OTHER'
 export type CanonicalDirection = 'UP' | 'DOWN'
 
