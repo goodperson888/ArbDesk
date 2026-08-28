@@ -495,6 +495,39 @@ describe('PredictFunMarketData', () => {
     expect(source.getLatestWindows()[0].outcomes.DOWN).toMatchObject({ bestAsk: '0.39', askSize: '5' })
   })
 
+  it('binds a current-page marketId-only GraphQL response to the rolling slug', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+    capture.emitResponse('https://predict.fun/graphql', {
+      data: { matchEventLog: { marketId: 1741179 } }
+    }, { operationName: 'GetMatchEventLog', requestSlugs: ['btc-updown-15m-1787877000'] })
+    capture.emitFrame({
+      type: 'M', topic: 'predictOrderbook/1741179',
+      data: { marketId: 1741179, updateTimestampMs: Date.now(), asks: [[0.61, 4]], bids: [[0.55, 5]] }
+    })
+
+    expect(source.getLatestWindows()).toHaveLength(1)
+    expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '1741179', durationMinutes: 15 })
+  })
+
+  it('does not use portfolio marketIds as the current market directory', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+    capture.emitResponse('https://predict.fun/graphql', {
+      data: { portfolio: { marketId: 1741179, outcomes: [
+        { name: 'Yes', indexSet: 1, onChainId: 'up-portfolio' },
+        { name: 'No', indexSet: 2, onChainId: 'down-portfolio' }
+      ] } }
+    }, { operationName: 'GetPortfolioSummary', requestSlugs: ['btc-updown-15m-1787877000'] })
+    expect(source.getLatestWindows()).toEqual([])
+  })
+
   it('captures the official REST market detail endpoint when the page omits a market GraphQL query', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))

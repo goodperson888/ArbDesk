@@ -102,6 +102,7 @@ interface PredictGraphqlCategory {
   endsAt?: string
   status?: string
   marketVariant?: string
+  variantData?: PredictVariant
   resolutionProvider?: string
   description?: string
   marketData?: PredictGraphqlMarketDataEntry[] | PredictGraphqlMarketDataEntry
@@ -147,7 +148,7 @@ interface PredictGraphqlCaptureHints {
 }
 
 function isNonMarketGraphqlOperation(operationName: string | undefined): boolean {
-  return /match|event|log|activity|comment|notification|history|order|position/i.test(String(operationName ?? ''))
+  return /match|event|log|activity|comment|notification|history|order|position|portfolio|account|balance/i.test(String(operationName ?? ''))
 }
 
 function hasCompleteGraphqlOutcomes(value: unknown): boolean {
@@ -165,6 +166,25 @@ function hasCompleteGraphqlOutcomes(value: unknown): boolean {
     return predictOutcomeDirection(item)
   }).filter(Boolean))
   return directions.has('UP') && directions.has('DOWN')
+}
+
+function numericMarketIdsFromGraphql(value: unknown): string[] {
+  const ids = new Set<string>()
+  const visited = new Set<object>()
+  const walk = (current: unknown, depth: number): void => {
+    if (!current || typeof current !== 'object' || depth > 12 || visited.has(current)) return
+    visited.add(current)
+    if (Array.isArray(current)) {
+      for (const entry of current) walk(entry, depth + 1)
+      return
+    }
+    for (const [key, entry] of Object.entries(current as Record<string, unknown>)) {
+      if (/^market_?id$/i.test(key) && /^\d{4,}$/.test(String(entry))) ids.add(String(entry))
+      walk(entry, depth + 1)
+    }
+  }
+  walk(value, 0)
+  return [...ids]
 }
 
 function categoriesFromGraphql(body: unknown, hints?: PredictGraphqlCaptureHints): PredictCategory[] {
@@ -252,6 +272,28 @@ function categoriesFromGraphql(body: unknown, hints?: PredictGraphqlCaptureHints
     }
   }
   walk(body, 0)
+  const requestSlug = hints?.requestSlugs.find((slug) => /^btc-updown-(?:5|15)m-\d+$/i.test(slug))
+  // GetMatchEventLog and similar page operations sometimes expose only a
+  // nested numeric marketId, without the surrounding Market object. When the
+  // request is tied to the current rolling BTC slug, retain a synthetic
+  // display context so the following page book/quote payload can bind to it.
+  if (markets.size === 0 && requestSlug && !/portfolio|account|balance|position|order/i.test(String(hints?.operationName ?? ''))) {
+    for (const marketId of numericMarketIdsFromGraphql(body)) {
+      markets.set(marketId, {
+        category: {
+          slug: requestSlug, status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN',
+          variantData: { type: 'CRYPTO_UP_DOWN', priceFeedSymbol: 'BTCUSDT' }
+        },
+        market: {
+          id: Number(marketId), tradingStatus: 'OPEN', decimalPrecision: 2,
+          outcomes: [
+            { name: 'Up', index: 1, onChainId: `predict-page:${marketId}:up` },
+            { name: 'Down', index: 2, onChainId: `predict-page:${marketId}:down` }
+          ]
+        }
+      })
+    }
+  }
   return [...markets.values()].flatMap(({ market, category }) => {
     // The page's GraphQL Market.id is not guaranteed to be the numeric ID
     // used by the orderbook topic. Crypto categories expose that transport ID
