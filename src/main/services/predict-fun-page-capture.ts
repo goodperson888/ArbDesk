@@ -20,6 +20,10 @@ export interface PredictFunCapturedResponse {
   url: string
   body: string
   receivedAt: number
+  pageUrl?: string
+  operationName?: string
+  requestSlugs?: string[]
+  requestMarketIds?: string[]
 }
 
 export interface PredictFunCapturedWebSocketFrame {
@@ -41,6 +45,51 @@ interface CdpResponseReceived {
   requestId?: string
   type?: string
   response?: { url?: string; mimeType?: string; status?: number }
+}
+
+interface CdpRequestWillBeSent {
+  requestId?: string
+  request?: { url?: string; postData?: string }
+}
+
+interface PredictGraphqlRequestMetadata {
+  operationName?: string
+  slugs: string[]
+  marketIds: string[]
+}
+
+function graphqlRequestMetadata(postData: string | undefined): PredictGraphqlRequestMetadata | undefined {
+  if (!postData) return undefined
+  try {
+    const body = JSON.parse(postData) as unknown
+    const operations = Array.isArray(body) ? body : [body]
+    const slugs = new Set<string>()
+    const marketIds = new Set<string>()
+    let operationName: string | undefined
+    const walk = (value: unknown, parentKey = '', depth = 0): void => {
+      if (depth > 8 || value === null || value === undefined) return
+      if (typeof value === 'string' || typeof value === 'number') {
+        if (/^(?:category)?slug$/i.test(parentKey) && /^btc-updown-(?:5|15)m-\d+$/i.test(String(value))) slugs.add(String(value))
+        if (/^marketId$/i.test(parentKey) && /^\d+$/.test(String(value))) marketIds.add(String(value))
+        return
+      }
+      if (Array.isArray(value)) {
+        for (const entry of value) walk(entry, parentKey, depth + 1)
+        return
+      }
+      if (typeof value !== 'object') return
+      for (const [key, entry] of Object.entries(value as Record<string, unknown>)) walk(entry, key, depth + 1)
+    }
+    for (const operation of operations) {
+      if (!operation || typeof operation !== 'object') continue
+      const record = operation as Record<string, unknown>
+      if (!operationName && typeof record.operationName === 'string') operationName = record.operationName
+      walk(record.variables)
+    }
+    return { operationName, slugs: [...slugs], marketIds: [...marketIds] }
+  } catch {
+    return undefined
+  }
 }
 
 interface CdpWebSocketCreated {
@@ -81,6 +130,7 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   private destroying = false
   private status: PredictFunPageCaptureStatus = { state: 'IDLE', message: 'Predict.fun 网页被动行情尚未启动' }
   private socketUrls = new Map<string, string>()
+  private graphqlRequests = new Map<string, PredictGraphqlRequestMetadata>()
   private responseCount = 0
   private webSocketFrameCount = 0
   private lastCaptureAt?: number
@@ -279,6 +329,15 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
       this.setStatus('DISCONNECTED', `无法启用 Predict.fun 网络监听：${error instanceof Error ? error.message : String(error)}`)
     })
     debug.on('message', (_event, method, rawParams) => {
+      if (method === 'Network.requestWillBeSent') {
+        const event = rawParams as CdpRequestWillBeSent
+        const url = event.request?.url ?? ''
+        if (event.requestId && isPredictHost(url) && url.includes('/graphql')) {
+          const metadata = graphqlRequestMetadata(event.request?.postData)
+          if (metadata) this.graphqlRequests.set(event.requestId, metadata)
+        }
+        return
+      }
       if (method === 'Network.responseReceived') {
         void this.handleResponse(window, rawParams as CdpResponseReceived)
         return
@@ -312,7 +371,17 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
       }
       if (!result.body) return
       const body = result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf8') : result.body
-      const captured = { url, body, receivedAt: Date.now() }
+      const requestMetadata = this.graphqlRequests.get(event.requestId)
+      this.graphqlRequests.delete(event.requestId)
+      const captured: PredictFunCapturedResponse = {
+        url,
+        body,
+        receivedAt: Date.now(),
+        pageUrl: window.webContents.getURL(),
+        operationName: requestMetadata?.operationName,
+        requestSlugs: requestMetadata?.slugs,
+        requestMarketIds: requestMetadata?.marketIds
+      }
       this.responseCount += 1
       this.lastCaptureAt = captured.receivedAt
       this.setStatus('CONNECTED', this.captureStatusMessage())

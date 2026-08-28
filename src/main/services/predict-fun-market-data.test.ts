@@ -32,8 +32,8 @@ class FakePredictPageCapture implements PredictFunPageCaptureSource {
     this.statusListeners.push(listener)
     return () => { this.statusListeners = this.statusListeners.filter((candidate) => candidate !== listener) }
   }
-  emitResponse(url: string, body: unknown): void {
-    for (const listener of this.responseListeners) listener({ url, body: JSON.stringify(body), receivedAt: Date.now() })
+  emitResponse(url: string, body: unknown, metadata: Partial<PredictFunCapturedResponse> = {}): void {
+    for (const listener of this.responseListeners) listener({ url, body: JSON.stringify(body), receivedAt: Date.now(), ...metadata })
   }
   emitFrame(message: unknown): void {
     for (const listener of this.frameListeners) listener({ url: 'wss://ws.predict.fun/ws', payload: JSON.stringify(message), receivedAt: Date.now() })
@@ -337,6 +337,33 @@ describe('PredictFunMarketData', () => {
     expect(source.getStatus().message).toContain('GraphQL目录 1/1')
     expect(source.getStatus().message).toContain('categorySlug')
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('maps the compact page Market response when the GraphQL request carries the rolling slug', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+
+    capture.emitResponse('https://predict.fun/graphql', {
+      data: { market: {
+        id: 1741179,
+        status: 'REGISTERED',
+        tradingStatus: 'OPEN',
+        outcomes: [
+          { name: 'Yes', indexSet: 1, onChainId: 'up-compact' },
+          { name: 'No', indexSet: 2, onChainId: 'down-compact' }
+        ]
+      }}
+    }, { operationName: 'MarketBySlug', requestSlugs: ['btc-updown-15m-1787877000'] })
+    capture.emitFrame({
+      type: 'M', topic: 'predictOrderbook/1741179',
+      data: { marketId: 1741179, updateTimestampMs: Date.now(), asks: [[0.61, 4]], bids: [[0.55, 5]] }
+    })
+
+    expect(source.getLatestWindows()).toHaveLength(1)
+    expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '1741179', durationMinutes: 15 })
   })
 
   it('keeps the official API ahead of page capture when a key exists', async () => {

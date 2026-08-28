@@ -1,7 +1,7 @@
 import type { Direction, OrderBookLevel, PredictFunPageCaptureStatus } from '../../shared/types'
 import type { ReadOnlyOutcomeQuote, ReadOnlyVenueSource, ReadOnlyVenueStatus, ReadOnlyWindowQuote } from '../platforms/read-only-types'
 import WebSocket, { type ClientOptions, type RawData } from 'ws'
-import type { PredictFunPageCaptureSource } from './predict-fun-page-capture'
+import type { PredictFunCapturedResponse, PredictFunPageCaptureSource } from './predict-fun-page-capture'
 
 const MAINNET_API = 'https://api.predict.fun'
 const DISCOVERY_CACHE_MS = 15_000
@@ -139,7 +139,12 @@ function marketDataEntries(category: PredictGraphqlCategory): PredictGraphqlMark
   return Array.isArray(category.marketData) ? category.marketData : [category.marketData]
 }
 
-function categoriesFromGraphql(body: unknown): PredictCategory[] {
+interface PredictGraphqlCaptureHints {
+  requestSlugs: string[]
+  requestMarketIds: string[]
+}
+
+function categoriesFromGraphql(body: unknown, hints?: PredictGraphqlCaptureHints): PredictCategory[] {
   const markets = new Map<string, { market: PredictGraphqlMarket; category: PredictGraphqlCategory }>()
   const visited = new Set<object>()
   const walk = (value: unknown, depth: number): void => {
@@ -180,6 +185,17 @@ function categoriesFromGraphql(body: unknown): PredictCategory[] {
         }
       }
       if (isCryptoCategory(category)) markets.set(String(candidate.id), { market: candidate, category })
+    }
+    const requestSlug = hints?.requestSlugs.find((slug) => /^btc-updown-(?:5|15)m-\d+$/i.test(slug))
+    const requestTargetsMarket = !hints || hints.requestMarketIds.length === 0 || hints.requestMarketIds.includes(String(candidate.id))
+    if (candidate.id && candidate.outcomes && requestSlug && requestTargetsMarket) {
+      const category: PredictGraphqlCategory = {
+        slug: requestSlug,
+        status: candidate.tradingStatus ?? candidate.status,
+        marketVariant: 'CRYPTO_UP_DOWN',
+        marketData: { marketId: String(candidate.id), priceFeedSymbol: 'BTCUSDT' }
+      }
+      markets.set(String(candidate.id), { market: candidate, category })
     }
     for (const [key, entry] of Object.entries(candidate)) {
       if (key === 'timeseries' || key === 'assetOhlc' || key === 'statistics' || key === 'description') continue
@@ -451,6 +467,8 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private passiveGraphqlResponseCount = 0
   private passiveGraphqlMappedCount = 0
   private passiveLastGraphqlSchema = ''
+  private passiveLastGraphqlOperation = ''
+  private passiveLastGraphqlSlugs = ''
   private passiveLastReason = ''
   private lastPassiveDiagnosticNotifyAt = 0
   private lastDirectoryAt = 0
@@ -466,7 +484,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       pageCapture?: PredictFunPageCaptureSource
     } = {}
   ) {
-    options.pageCapture?.onResponse((event) => this.ingestCapturedResponse(event.url, event.body, event.receivedAt))
+    options.pageCapture?.onResponse((event) => this.ingestCapturedResponse(event))
     options.pageCapture?.onWebSocketFrame((event) => this.ingestCapturedWebSocketFrame(event.payload))
     options.pageCapture?.onStatus((captureStatus) => {
       if (this.socketApiKey) return
@@ -794,8 +812,9 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     }
   }
 
-  private ingestCapturedResponse(url: string, rawBody: string, receivedAt: number): void {
+  private ingestCapturedResponse(event: PredictFunCapturedResponse): void {
     if (!this.monitoringEnabled) return
+    const { url, body: rawBody, receivedAt } = event
     let body: unknown
     try {
       body = JSON.parse(rawBody) as unknown
@@ -839,9 +858,14 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     }
     if (path.endsWith('/graphql')) {
       this.passiveGraphqlResponseCount += 1
+      if (event.operationName) this.passiveLastGraphqlOperation = event.operationName
+      if (event.requestSlugs?.length) this.passiveLastGraphqlSlugs = event.requestSlugs.join(',')
       const fingerprints = graphqlMarketSchemaFingerprints(body)
       if (fingerprints.length > 0) this.passiveLastGraphqlSchema = fingerprints.join(' | ')
-      const capturedCategories = categoriesFromGraphql(body)
+      const capturedCategories = categoriesFromGraphql(body, {
+        requestSlugs: event.requestSlugs ?? [],
+        requestMarketIds: event.requestMarketIds ?? []
+      })
       if (capturedCategories.length === 0) {
         this.passiveLastReason = fingerprints.length > 0
           ? 'GraphQL 已收到市场结构，但没有形成 BTC 5m/15m 目录'
@@ -904,7 +928,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
 
   private passiveDiagnosticsSuffix(): string {
     const graphql = this.passiveGraphqlResponseCount > 0
-      ? `；GraphQL目录 ${this.passiveGraphqlMappedCount}/${this.passiveGraphqlResponseCount}${this.passiveLastGraphqlSchema ? `，字段 ${this.passiveLastGraphqlSchema}` : ''}`
+      ? `；GraphQL目录 ${this.passiveGraphqlMappedCount}/${this.passiveGraphqlResponseCount}${this.passiveLastGraphqlOperation ? `，操作 ${this.passiveLastGraphqlOperation}` : ''}${this.passiveLastGraphqlSlugs ? `，slug ${this.passiveLastGraphqlSlugs}` : ''}${this.passiveLastGraphqlSchema ? `，字段 ${this.passiveLastGraphqlSchema}` : ''}`
       : ''
     if (this.passiveFrameCount === 0) return `${graphql}；页面尚未收到可解析的 WebSocket 帧`
     const reason = this.passiveLastReason ? `，最近原因：${this.passiveLastReason}` : ''
