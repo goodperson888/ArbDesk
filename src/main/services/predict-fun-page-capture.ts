@@ -657,7 +657,8 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     let page: Page
     try {
       page = await this.fingerprintRuntime!.attach('PREDICT_FUN', {
-        hosts: ['predict.fun'], createIfMissing: true, startupUrl: currentPredictMarketUrl(15)
+        hosts: ['predict.fun'], createIfMissing: true, startupUrl: currentPredictMarketUrl(15),
+        urlPattern: /\/market\/btc-updown-(?:5|15)m-\d+/i
       })
     } catch (error) {
       this.setStatus('DISCONNECTED', `Predict.fun 指纹浏览器接管失败：${error instanceof Error ? error.message : String(error)}`)

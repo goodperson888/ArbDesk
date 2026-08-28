@@ -21,6 +21,8 @@ export interface AttachPageOptions {
   hosts: string[]
   createIfMissing?: boolean
   startupUrl?: string
+  /** Optional URL matcher used to avoid attaching a site's account/home page. */
+  urlPattern?: RegExp
 }
 
 function hostMatches(rawUrl: string, hosts: string[]): boolean {
@@ -33,6 +35,10 @@ function hostMatches(rawUrl: string, hosts: string[]): boolean {
   } catch {
     return false
   }
+}
+
+function pageMatches(rawUrl: string, options: AttachPageOptions): boolean {
+  return hostMatches(rawUrl, options.hosts) && (!options.urlPattern || options.urlPattern.test(rawUrl))
 }
 
 async function discoverHubstudioApiBase(): Promise<string> {
@@ -138,12 +144,12 @@ export class FingerprintBrowserRuntime {
     const containerCode = this.config?.containerCode
     if (!containerCode) throw new Error('请先配置指纹浏览器环境ID')
     const current = this.pages.get(venueId)
-    if (current && !current.isClosed() && hostMatches(current.url(), options.hosts)) return current
+    if (current && !current.isClosed() && pageMatches(current.url(), options)) return current
 
     const browser = await this.ensureBrowser(containerCode, options.startupUrl)
     const context = browser.contexts()[0]
     if (!context) throw new Error('指纹浏览器没有可用的浏览器上下文')
-    let page = context.pages().find((candidate) => !candidate.isClosed() && hostMatches(candidate.url(), options.hosts))
+    let page = context.pages().find((candidate) => !candidate.isClosed() && pageMatches(candidate.url(), options))
     if (!page && options.createIfMissing !== false) {
       page = await context.newPage()
       if (options.startupUrl) await page.goto(options.startupUrl, { waitUntil: 'domcontentloaded' })

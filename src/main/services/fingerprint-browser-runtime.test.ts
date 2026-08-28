@@ -63,6 +63,29 @@ describe('FingerprintBrowserRuntime', () => {
     expect(createdPage.goto).toHaveBeenCalledWith(startupUrl, { waitUntil: 'domcontentloaded' })
   })
 
+  it('does not attach Predict.fun monitoring to an account page when a market URL is required', async () => {
+    const portfolioPage = page('https://predict.fun/zh-cn/portfolio')
+    const marketPage = page('about:blank')
+    const context = { pages: () => [portfolioPage], newPage: vi.fn(async () => marketPage) }
+    const browser = { contexts: () => [context], isConnected: () => true, on: vi.fn() }
+    const backend: FingerprintBrowserBackend = {
+      resolveRunningPort: vi.fn(async () => 9333),
+      connect: vi.fn(async () => browser as never),
+      start: vi.fn(async () => ({ debuggingPort: 9333 }))
+    }
+    const runtime = new FingerprintBrowserRuntime(backend)
+    runtime.configure({ containerCode: 'container-1' })
+    const startupUrl = 'https://predict.fun/zh-cn/market/btc-updown-15m-1787877000'
+
+    await runtime.attach('PREDICT_FUN', {
+      hosts: ['predict.fun'], createIfMissing: true, startupUrl,
+      urlPattern: /\/market\/btc-updown-(?:5|15)m-\d+/i
+    })
+
+    expect(context.newPage).toHaveBeenCalledTimes(1)
+    expect(marketPage.goto).toHaveBeenCalledWith(startupUrl, { waitUntil: 'domcontentloaded' })
+  })
+
   it('requires a configured fingerprint container', async () => {
     const backend: FingerprintBrowserBackend = {
       resolveRunningPort: vi.fn(),
