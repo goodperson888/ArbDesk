@@ -471,6 +471,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private passiveParseRejectedCount = 0
   private passiveGraphqlResponseCount = 0
   private passiveGraphqlMappedCount = 0
+  private passiveMarketDetailCount = 0
   private passiveLastGraphqlSchema = ''
   private passiveLastGraphqlOperation = ''
   private passiveLastGraphqlSlugs = ''
@@ -865,6 +866,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     const isMarketDetail = /^\/v1\/markets\/\d+$/.test(path)
     if (isGraphql || isMarketDetail) {
       if (isGraphql) this.passiveGraphqlResponseCount += 1
+      if (isMarketDetail) this.passiveMarketDetailCount += 1
       if (event.operationName) this.passiveLastGraphqlOperation = event.operationName
       if (event.requestSlugs?.length) this.passiveLastGraphqlSlugs = event.requestSlugs.join(',')
       const fingerprints = graphqlMarketSchemaFingerprints(body)
@@ -938,9 +940,10 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     const graphql = this.passiveGraphqlResponseCount > 0
       ? `；GraphQL目录 ${this.passiveGraphqlMappedCount}/${this.passiveGraphqlResponseCount}${this.passiveLastGraphqlOperation ? `，操作 ${this.passiveLastGraphqlOperation}` : ''}${this.passiveLastGraphqlSlugs ? `，slug ${this.passiveLastGraphqlSlugs}` : ''}${this.passiveLastGraphqlSchema ? `，字段 ${this.passiveLastGraphqlSchema}` : ''}`
       : ''
-    if (this.passiveFrameCount === 0) return `${graphql}；页面尚未收到可解析的 WebSocket 帧`
+    const marketDetail = this.passiveMarketDetailCount > 0 ? `；REST市场详情 ${this.passiveMarketDetailCount}` : ''
+    if (this.passiveFrameCount === 0) return `${graphql}${marketDetail}；页面尚未收到可解析的 WebSocket 帧`
     const reason = this.passiveLastReason ? `，最近原因：${this.passiveLastReason}` : ''
-    return `${graphql}；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）`
+    return `${graphql}${marketDetail}；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）`
   }
 
   private notifyPassiveDiagnostics(): void {
