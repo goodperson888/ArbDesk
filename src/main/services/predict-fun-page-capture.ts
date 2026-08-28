@@ -102,6 +102,13 @@ interface CdpWebSocketFrame {
   response?: { opcode?: number; payloadData?: string }
 }
 
+interface PredictPageMarketMetadata {
+  pageUrl: string
+  categorySlug: string
+  marketId: string
+  outcomeIds: string[]
+}
+
 function isPredictHost(rawUrl: string): boolean {
   try {
     const hostname = new URL(rawUrl).hostname.toLowerCase()
@@ -263,6 +270,7 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     window.webContents.on('did-finish-load', () => {
       clearTimeout(startupTimeout)
       this.setStatus('CONNECTED', this.captureStatusMessage())
+      void this.capturePageMarketMetadata(window)
     })
     window.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedUrl, isMainFrame) => {
       if (!isMainFrame) return
@@ -306,6 +314,51 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
     await window.loadURL(currentPredictMarketUrl(5))
     await new Promise<void>((resolve) => setTimeout(resolve, PAGE_ROLL_SETTLE_MS))
     await window.loadURL(currentPredictMarketUrl(15))
+  }
+
+  private async capturePageMarketMetadata(window: BrowserWindow): Promise<void> {
+    try {
+      const metadata = await window.webContents.executeJavaScript(`(() => {
+        const pageUrl = location.href
+        const categorySlug = /\\/market\\/(btc-updown-(?:5|15)m-\\d+)/i.exec(location.pathname)?.[1]
+        const image = document.querySelector('meta[property="og:image"]')?.getAttribute('content') || ''
+        const marketId = new URL(image, location.origin).searchParams.get('marketId') || ''
+        const html = document.documentElement.innerHTML
+        const outcomeIds = [...html.matchAll(/onChainId.{0,24}?(\\d{20,})/g)].map((match) => match[1]).filter((id, index, all) => all.indexOf(id) === index).slice(0, 2)
+        return categorySlug && /^\\d+$/.test(marketId) ? { pageUrl, categorySlug, marketId, outcomeIds } : null
+      })()`, true) as PredictPageMarketMetadata | null
+      if (!metadata || this.window !== window) return
+      const start = Number(metadata.categorySlug.match(/-(\\d+)$/)?.[1])
+      if (!Number.isFinite(start)) return
+      const duration = metadata.categorySlug.includes('-5m-') ? 5 : 15
+      const outcomes = metadata.outcomeIds.length >= 2
+        ? metadata.outcomeIds.map((onChainId, index) => ({ name: index === 0 ? 'Up' : 'Down', index: index + 1, onChainId }))
+        : [{ name: 'Up', index: 1, onChainId: `predict-page:${metadata.marketId}:up` }, { name: 'Down', index: 2, onChainId: `predict-page:${metadata.marketId}:down` }]
+      const body = {
+        success: true,
+        data: [{
+          slug: metadata.categorySlug,
+          startsAt: new Date(start * 1_000).toISOString(),
+          endsAt: new Date((start + duration * 60) * 1_000).toISOString(),
+          status: 'OPEN',
+          marketVariant: 'CRYPTO_UP_DOWN',
+          variantData: { type: 'CRYPTO_UP_DOWN', priceFeedSymbol: 'BTCUSDT' },
+          markets: [{ id: Number(metadata.marketId), tradingStatus: 'OPEN', decimalPrecision: 2, outcomes }]
+        }]
+      }
+      const captured: PredictFunCapturedResponse = {
+        url: `${new URL(metadata.pageUrl).origin}/v1/categories/page-metadata`,
+        body: JSON.stringify(body),
+        receivedAt: Date.now(),
+        pageUrl: metadata.pageUrl,
+        operationName: 'PageMarketMetadata',
+        requestSlugs: [metadata.categorySlug],
+        requestMarketIds: [metadata.marketId]
+      }
+      for (const listener of this.responseListeners) listener(captured)
+    } catch {
+      // Page metadata is an optional directory fallback; network capture stays intact.
+    }
   }
 
   private scheduleNextRoll(window: BrowserWindow): void {
