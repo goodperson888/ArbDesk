@@ -702,11 +702,37 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
       session.on('Network.webSocketFrameSent', (raw) => this.handleFingerprintFrame(raw as CdpWebSocketFrame, page.url(), 'SENT'))
       if (show) await page.bringToFront()
       this.setStatus('CONNECTED', this.captureStatusMessage('已接管指纹浏览器'))
+      void this.captureFingerprintPageMarketMetadata(page)
     } catch (error) {
       await this.fingerprintSession?.detach().catch(() => undefined)
       this.fingerprintSession = undefined
       this.fingerprintPage = undefined
       this.setStatus('DISCONNECTED', `Predict.fun 指纹浏览器网络监听失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private async captureFingerprintPageMarketMetadata(page: Page): Promise<void> {
+    try {
+      const metadata = await page.evaluate(() => {
+        const pageUrl = location.href
+        const categorySlug = /\/market\/(btc-updown-(?:5|15)m-\d+)/i.exec(location.pathname)?.[1]
+        const html = document.documentElement.innerHTML
+        const marketId = [...html.matchAll(/(?:marketId|market_id)[^0-9]{0,12}(\d{4,})/gi)].map((match) => match[1]).find((id) => /^\d+$/.test(id)) || ''
+        const outcomeIds = [...html.matchAll(/onChainId.{0,24}?(\d{20,})/g)].map((match) => match[1]).filter((id, index, all) => all.indexOf(id) === index).slice(0, 2)
+        return categorySlug && /^\d+$/.test(marketId) ? { pageUrl, categorySlug, marketId, outcomeIds } : null
+      }) as { pageUrl: string; categorySlug: string; marketId: string; outcomeIds: string[] } | null
+      if (!metadata || this.fingerprintPage !== page) return
+      const start = Number(metadata.categorySlug.match(/-(\d+)$/)?.[1])
+      if (!Number.isFinite(start)) return
+      const duration = metadata.categorySlug.includes('-5m-') ? 5 : 15
+      const body = {
+        success: true,
+        data: [{ slug: metadata.categorySlug, startsAt: new Date(start * 1_000).toISOString(), endsAt: new Date((start + duration * 60) * 1_000).toISOString(), status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN', variantData: { type: 'CRYPTO_UP_DOWN', priceFeedSymbol: 'BTCUSDT' }, markets: [{ id: Number(metadata.marketId), tradingStatus: 'OPEN', decimalPrecision: 2, outcomes: metadata.outcomeIds.length >= 2 ? metadata.outcomeIds.map((onChainId, index) => ({ name: index === 0 ? 'Up' : 'Down', index: index + 1, onChainId })) : [{ name: 'Up', index: 1, onChainId: `predict-page:${metadata.marketId}:up` }, { name: 'Down', index: 2, onChainId: `predict-page:${metadata.marketId}:down` }] }] }]
+      }
+      const captured: PredictFunCapturedResponse = { url: `${new URL(metadata.pageUrl).origin}/v1/categories/page-metadata`, body: JSON.stringify(body), receivedAt: Date.now(), pageUrl: metadata.pageUrl, operationName: 'FingerprintPageMarketMetadata', requestSlugs: [metadata.categorySlug], requestMarketIds: [metadata.marketId] }
+      for (const listener of this.responseListeners) listener(captured)
+    } catch {
+      // DOM metadata is a fallback; CDP network capture remains authoritative.
     }
   }
 

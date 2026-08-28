@@ -146,7 +146,7 @@ interface PredictGraphqlCaptureHints {
 }
 
 function isNonMarketGraphqlOperation(operationName: string | undefined): boolean {
-  return /match|event|log|activity|comment|notification|history|order/i.test(String(operationName ?? ''))
+  return /match|event|log|activity|comment|notification|history|order|position/i.test(String(operationName ?? ''))
 }
 
 function categoriesFromGraphql(body: unknown, hints?: PredictGraphqlCaptureHints): PredictCategory[] {
@@ -968,8 +968,12 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       if (event.requestSlugs?.length) this.passiveLastGraphqlSlugs = event.requestSlugs.join(',')
       const fingerprints = graphqlMarketSchemaFingerprints(body)
       if (fingerprints.length > 0) this.passiveLastGraphqlSchema = fingerprints.join(' | ')
+      const pageSlug = (() => {
+        try { return new URL(event.pageUrl ?? '').pathname.match(/\/market\/(btc-updown-(?:5|15)m-\d+)/i)?.[1] } catch { return undefined }
+      })()
+      const requestSlugs = event.requestSlugs?.length ? event.requestSlugs : pageSlug ? [pageSlug] : []
       const capturedCategories = categoriesFromGraphql(body, {
-        requestSlugs: event.requestSlugs ?? [],
+        requestSlugs,
         requestMarketIds: event.requestMarketIds ?? [],
         operationName: event.operationName
       })
