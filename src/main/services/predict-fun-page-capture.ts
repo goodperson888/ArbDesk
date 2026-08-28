@@ -792,9 +792,21 @@ export class PredictFunPageCapture implements PredictFunPageCaptureSource {
   private handleFingerprintFrame(event: CdpWebSocketFrame, pageUrl: string, direction: 'SENT' | 'RECEIVED'): void {
     const frame = event.response ?? event.request
     if (!event.requestId || frame?.opcode !== 1 || typeof frame.payloadData !== 'string') return
-    const url = this.fingerprintSocketUrls.get(event.requestId)
-    if (!url) return
     const payload = frame.payloadData
+    // If the fingerprint page was already open when CDP attached, Chrome does
+    // not replay Network.webSocketCreated for the existing socket. We can
+    // still safely bind a market frame to this Predict.fun page: only payloads
+    // carrying an orderbook/status marker are accepted, and the page URL is
+    // restricted to predict.fun. This closes the intermittent "0 WS frames /
+    // all quotes stale" gap without creating another request or socket.
+    let url = this.fingerprintSocketUrls.get(event.requestId)
+    if (!url) {
+      const isPredictMarketPage = isPredictHost(pageUrl) && /\/market\/btc-updown-(?:5|15)m-\d+/i.test(pageUrl)
+      const isLikelyMarketPayload = /predictOrderbook|predict(?:Trading|Market)Status|order[._:/-]?book|"type"\s*:\s*"M"/i.test(payload)
+      if (!isPredictMarketPage || !isLikelyMarketPayload) return
+      url = 'wss://ws.predict.fun/unknown'
+      this.fingerprintSocketUrls.set(event.requestId, url)
+    }
     if (this.orderCapturing && /order|trade|fill|mutation|execution|place/i.test(payload)) {
       const body = traceBody(payload)
       this.pushOrderTrace({ kind: 'WEBSOCKET', endpoint: traceEndpoint(url), direction, bodyFormat: body.format, bodyBytes: body.bytes, responseFields: body.fields, operationName: body.operationName, bodyPreview: body.preview, pageUrl: traceEndpoint(pageUrl), receivedAt: Date.now() })

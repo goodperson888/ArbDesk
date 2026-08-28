@@ -127,11 +127,36 @@ interface PredictGraphqlMarket {
   category?: PredictGraphqlCategory
 }
 
+const ROLLING_CRYPTO_CATEGORY_RE = /^btc-updown-(?:5|15)m-\d+$/i
+
+/**
+ * The page's compact market queries only return category.id.  In the current
+ * schema that id is itself the canonical rolling slug (for example
+ * btc-updown-15m-1787928300); it is not an opaque numeric category id.
+ * Normalize that shape before applying the crypto/category filters so the
+ * market can be joined with the full GetCategory response later.
+ */
+function normalizeGraphqlCategory(category: PredictGraphqlCategory): PredictGraphqlCategory {
+  const rollingSlug = String(category.slug ?? category.id ?? '')
+  if (!ROLLING_CRYPTO_CATEGORY_RE.test(rollingSlug)) return category
+  return {
+    ...category,
+    slug: category.slug ?? rollingSlug,
+    marketVariant: category.marketVariant ?? 'CRYPTO_UP_DOWN',
+    variantData: {
+      ...(category.variantData ?? {}),
+      type: category.variantData?.type ?? 'CRYPTO_UP_DOWN',
+      priceFeedSymbol: category.variantData?.priceFeedSymbol ?? 'BTCUSDT'
+    }
+  }
+}
+
 function isCryptoCategory(category: PredictGraphqlCategory): boolean {
   const variant = String(category.marketVariant ?? '').toUpperCase()
   if (/CRYPTO.?UP.?DOWN/.test(variant)) return true
-  const text = `${category.slug ?? ''} ${category.description ?? ''}`.toUpperCase()
+  const text = `${category.slug ?? ''} ${category.id ?? ''} ${category.description ?? ''}`.toUpperCase()
   if (text.includes('BTC') && /UP.?DOWN|HIGHER.?LOWER|RISE.?FALL/.test(text)) return true
+  if (ROLLING_CRYPTO_CATEGORY_RE.test(String(category.slug ?? category.id ?? ''))) return true
   const feeds = Array.isArray(category.marketData) ? category.marketData : category.marketData ? [category.marketData] : []
   return feeds.some((feed) => /BTC(?:USD|USDT)?/i.test(String(feed.priceFeedSymbol ?? '')))
 }
@@ -197,7 +222,11 @@ function categoriesFromGraphql(body: unknown, hints?: PredictGraphqlCaptureHints
       for (const entry of value) walk(entry, depth + 1)
       return
     }
-    const candidate = value as PredictGraphqlMarket & PredictGraphqlCategory & Record<string, unknown>
+    const rawCandidate = value as PredictGraphqlMarket & PredictGraphqlCategory & Record<string, unknown>
+    const candidate = normalizeGraphqlCategory({
+      ...rawCandidate,
+      ...(rawCandidate.category ? { category: normalizeGraphqlCategory(rawCandidate.category) } : {})
+    }) as PredictGraphqlMarket & PredictGraphqlCategory & Record<string, unknown>
     if (isCryptoCategory(candidate)) {
       const marketNodes = Array.isArray(candidate.markets)
         ? candidate.markets

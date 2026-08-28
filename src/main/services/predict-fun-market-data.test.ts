@@ -379,6 +379,47 @@ describe('PredictFunMarketData', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
+  it('maps the current GetMarket response whose category exposes only the rolling category id', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-28T14:46:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+
+    // This is the shape captured from the live Predict.fun page on
+    // 2026-08-28: GetMarket has the complete market/outcome metadata, while
+    // market.category contains id/startsAt/endsAt but no slug or variant.
+    capture.emitResponse('https://graphql.predict.fun/graphql', {
+      data: { market: {
+        id: '1766727', decimalPrecision: 2, takerFeeBps: 200,
+        isTradingEnabled: true, status: 'REGISTERED',
+        outcomes: { edges: [
+          { node: { id: '3471450', name: '涨', index: 1, onChainId: 'up-live' } },
+          { node: { id: '3471451', name: '跌', index: 2, onChainId: 'down-live' } }
+        ] },
+        category: {
+          id: 'btc-updown-5m-1787928300',
+          startsAt: '2026-08-28T14:45:00.000Z',
+          endsAt: '2026-08-28T14:50:00.000Z',
+          isNegRisk: false, isYieldBearing: false
+        }
+      }}
+    }, {
+      operationName: 'GetMarket',
+      requestMarketIds: ['1766727'],
+      requestSlugs: ['btc-updown-5m-1787928300']
+    })
+    capture.emitFrame({
+      type: 'M', topic: 'predictOrderbook/1766727',
+      data: { marketId: 1766727, updateTimestampMs: Date.now(), asks: [[0.45, 12]], bids: [[0.54, 8]] }
+    }, 'https://predict.fun/zh-cn/market/btc-updown-5m-1787928300')
+
+    expect(source.getLatestWindows()).toHaveLength(1)
+    expect(source.getLatestWindows()[0]).toMatchObject({ marketId: '1766727', durationMinutes: 5, feeRateBps: 200 })
+    expect(source.getLatestWindows()[0].outcomes.UP?.outcomeId).toBe('up-live')
+    expect(source.getLatestWindows()[0].outcomes.DOWN?.outcomeId).toBe('down-live')
+  })
+
   it('maps the compact page Market response when the GraphQL request carries the rolling slug', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-28T00:37:00.000Z'))
