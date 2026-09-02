@@ -150,7 +150,7 @@ function nearestSettlementDistance(values: Array<{ label: string; value?: string
   const threshold = money(required ?? '', 1)
   if (candidates.length === 0) return `— / ${threshold} bps`
   const nearest = candidates[0]
-  return `${nearest.label} ${signedMoney(nearest.value ?? '', 1)} / ${threshold} bps`
+  return `${signedMoney(nearest.value ?? '', 1)} / ${threshold} bps`
 }
 
 function signedMoney(value: string, digits = 2): string {
