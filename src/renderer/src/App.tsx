@@ -142,6 +142,17 @@ function money(value: string, digits = 2): string {
   return Number.isFinite(parsed) ? parsed.toFixed(digits) : '—'
 }
 
+function nearestSettlementDistance(values: Array<{ label: string; value?: string }>, required?: string): string {
+  const candidates = values
+    .map((entry) => ({ ...entry, parsed: Number(entry.value) }))
+    .filter((entry) => Number.isFinite(entry.parsed))
+    .sort((left, right) => Math.abs(left.parsed) - Math.abs(right.parsed))
+  const threshold = money(required ?? '', 1)
+  if (candidates.length === 0) return `— / ${threshold} bps`
+  const nearest = candidates[0]
+  return `${nearest.label} ${signedMoney(nearest.value ?? '', 1)} / ${threshold} bps`
+}
+
 function signedMoney(value: string, digits = 2): string {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return '—'
@@ -2071,7 +2082,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <div className="ticket-key-metrics">
                   <span>预计本金<strong>{selected.feeVerificationBlocked ? '—' : `$${requestedCapital.toFixed(2)}`}</strong></span>
                   <span>预计利润<strong className={!selected.feeVerificationBlocked && requestedProfit > 0 ? 'profit' : ''}>{selected.feeVerificationBlocked ? '—' : signedUsd(requestedProfit)}</strong></span>
-                  <span>安全距离<strong>{money(selected.settlementDistanceBps, 1)} / {money(selected.requiredSettlementDistanceBps, 1)} bps</strong></span>
+                  <span>最近一侧安全距离<strong>{nearestSettlementDistance([
+                    { label: 'MEXC', value: selected.mexcDistanceBps },
+                    { label: 'Polymarket', value: selected.polymarketDistanceBps }
+                  ], selected.requiredSettlementDistanceBps)}</strong></span>
                 </div>
 
                 {(selected.feeVerificationBlocked || selected.settlementRiskBlocked || selected.stale || Number(selected.conditionalReturnPct) < Number(snapshot.settings.minConditionalReturnPct)) && selected.riskFlags.length > 0 && (
@@ -2143,7 +2157,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   <span>两腿成本<strong>{money(selectedComparison.allInCostPerShare, 4)}</strong></span>
                   <span>参考毛边际<strong className={Number(selectedComparison.netEdgePerShare) > 0 ? 'profit' : ''}>{signedMoney(selectedComparison.netEdgePerShare, 4)}</strong></span>
                   <span>参考收益率<strong>{signedMoney(selectedComparison.conditionalReturnPct, 2)}%</strong></span>
-                  <span>安全距离<strong>{money(selectedComparison.settlementDistanceBps ?? '', 1)} / {money(selectedComparison.requiredSettlementDistanceBps ?? '', 1)} bps</strong></span>
+                  <span>最近一侧安全距离<strong>{nearestSettlementDistance(selectedComparison.legs.map((leg) => ({ label: leg.venueLabel, value: leg.settlementDistanceBps })), selectedComparison.requiredSettlementDistanceBps)}</strong></span>
                 </div>
                 {selectedComparison.doubleWinEntryEligible && <label className="double-win-entry-choice">
                   <input type="checkbox" checked={allowDoubleWinEntry} onChange={(event) => setAllowDoubleWinEntry(event.target.checked)} />

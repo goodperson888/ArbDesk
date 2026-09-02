@@ -50,12 +50,15 @@ export interface PredictFunTradingMetadata {
 
 interface PredictVariant {
   type?: string
+  crypto?: PredictVariant
   priceFeedProvider?: string
   priceFeedId?: string
   priceFeedSymbol?: string
   /** Crypto up/down categories expose the opening and closing oracle values. */
   startPrice?: number | string
   endPrice?: number | string
+  openPrice?: number | string
+  priceToBeat?: number | string
 }
 
 interface PredictCategory {
@@ -67,6 +70,13 @@ interface PredictCategory {
   marketVariant?: string
   resolutionProvider?: string
   description?: string
+  priceFeedProvider?: string
+  priceFeedId?: string
+  priceFeedSymbol?: string
+  startPrice?: number | string
+  endPrice?: number | string
+  openPrice?: number | string
+  priceToBeat?: number | string
   variantData?: PredictVariant
   variantDetails?: { crypto?: PredictVariant }
   markets?: PredictMarket[]
@@ -180,6 +190,7 @@ interface PredictGraphqlCategory {
   variantData?: PredictVariant
   resolutionProvider?: string
   description?: string
+  variantDetails?: { crypto?: PredictVariant }
   marketData?: PredictGraphqlMarketDataEntry[] | PredictGraphqlMarketDataEntry
   outcomes?: { edges?: Array<{ node?: PredictOutcome }> } | PredictOutcome[]
   markets?: { edges?: Array<{ node?: PredictGraphqlMarket }> } | PredictGraphqlMarket[]
@@ -504,7 +515,20 @@ function outcome(direction: Direction, source: PredictOutcome | undefined, level
 }
 
 function categoryCryptoData(category: PredictCategory): PredictVariant {
-  return { ...(category.variantDetails?.crypto ?? {}), ...(category.variantData ?? {}) }
+  const direct = category as PredictCategory & PredictVariant
+  const variantData = category.variantData ?? {}
+  return {
+    priceFeedProvider: direct.priceFeedProvider,
+    priceFeedId: direct.priceFeedId,
+    priceFeedSymbol: direct.priceFeedSymbol,
+    startPrice: direct.startPrice,
+    endPrice: direct.endPrice,
+    openPrice: direct.openPrice,
+    priceToBeat: direct.priceToBeat,
+    ...(variantData.crypto ?? {}),
+    ...(category.variantDetails?.crypto ?? {}),
+    ...variantData
+  }
 }
 
 function positivePrice(value: unknown): string | undefined {
@@ -731,7 +755,7 @@ function parseCategory(category: PredictCategory, market: PredictMarket, book: P
   const feedId = crypto.priceFeedId ?? 'unknown'
   const feedSymbol = crypto.priceFeedSymbol ?? 'BTCUSDT'
   const feedProvider = crypto.priceFeedProvider ?? category.resolutionProvider ?? 'UNKNOWN'
-  const baselineValue = positivePrice(crypto.startPrice) ?? baselineOverride
+  const baselineValue = positivePrice(crypto.startPrice ?? crypto.openPrice ?? crypto.priceToBeat) ?? baselineOverride
   return {
     venueId: 'PREDICT_FUN', marketId: String(market.id), asset: 'BTC/USD', durationMinutes: duration,
     startTime, endTime, feeRateBps: Number(market.feeRateBps ?? 0), feeVerified: false,
@@ -1058,7 +1082,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         ? this.oracleBaselines.get(`${feedId}:${window.startTime}`)
         : this.oracleBaselines.size === 1 ? [...this.oracleBaselines.values()][0] : undefined
       : undefined
-    const historyBaseline = window && !baselineOverride && !positivePrice(crypto.startPrice)
+    const historyBaseline = window && !baselineOverride && !positivePrice(crypto.startPrice ?? crypto.openPrice ?? crypto.priceToBeat)
       ? this.findOracleBaseline(inferredFeedId, window.startTime)
       : undefined
     return parseCategory(category, market, book, receivedAt, observedAt, oracle, baselineOverride ?? historyBaseline)
@@ -1100,7 +1124,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     // mid-round tick as a fake baseline.
     for (const { category } of this.marketContexts.values()) {
       const crypto = categoryCryptoData(category)
-      if (crypto.priceFeedId && String(crypto.priceFeedId) !== feedId || positivePrice(crypto.startPrice)) continue
+      if (crypto.priceFeedId && String(crypto.priceFeedId) !== feedId || positivePrice(crypto.startPrice ?? crypto.openPrice ?? crypto.priceToBeat)) continue
       const window = categoryWindowTimes(category)
       if (window && Math.abs(sourceAt - window.startTime) <= 3_000) this.oracleBaselines.set(`${feedId}:${window.startTime}`, value)
     }
@@ -1110,7 +1134,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       if (!context) return window
       const crypto = categoryCryptoData(context.category)
       if (crypto.priceFeedId && String(crypto.priceFeedId) !== feedId) return window
-      const baseline = positivePrice(crypto.startPrice) ?? this.oracleBaselines.get(`${feedId}:${window.startTime}`)
+      const baseline = positivePrice(crypto.startPrice ?? crypto.openPrice ?? crypto.priceToBeat) ?? this.oracleBaselines.get(`${feedId}:${window.startTime}`)
       return baseline ? { ...window, settlementObservation: { baselineValue: baseline, currentValue: value, observedAt: receivedAt } } : window
     })
     if (this.snapshot) this.snapshot = { fetchedAt: Date.now(), windows }
@@ -1507,7 +1531,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       const withBaseline = contexts.filter(({ category }) => {
         const crypto = categoryCryptoData(category)
         const feedId = crypto.priceFeedId ?? (this.oracleHistory.size === 1 ? [...this.oracleHistory.keys()][0] : undefined)
-        return Boolean(positivePrice(crypto.startPrice) || this.findOracleBaseline(feedId, categoryWindowTimes(category)?.startTime ?? Number.NaN))
+        return Boolean(positivePrice(crypto.startPrice ?? crypto.openPrice ?? crypto.priceToBeat) || this.findOracleBaseline(feedId, categoryWindowTimes(category)?.startTime ?? Number.NaN))
       }).length
       const withCurrent = contexts.filter(({ category }) => {
         const feedId = categoryCryptoData(category).priceFeedId
