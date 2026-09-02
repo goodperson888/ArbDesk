@@ -122,7 +122,10 @@ interface GateCpiObservation {
   duration: 5 | 15
   value: string
   sourceAt: number
+  observedAt?: number
 }
+
+const CPI_BASELINE_WINDOW_MS = 5_000
 
 function parseCpiObservation(payload: unknown): GateCpiObservation | undefined {
   const root = record(payload)
@@ -406,6 +409,10 @@ export class GateMarketData implements ReadOnlyVenueSource {
   private monitoringEnabled = true
   private status: ReadOnlyVenueStatus = { connectionState: 'NOT_CONFIGURED', message: '等待 Gate 单页面被动行情', marketCount: 0 }
   private contexts = new Map<string, GateMarketContext>()
+  // Gate's page GraphQL/catalogue does not always expose the opening target.
+  // Retain short CPI history so a market context that arrives just after the
+  // round boundary can still be paired with the correct opening observation.
+  private cpiHistory = new Map<5 | 15, GateCpiObservation[]>()
   private outcomeToMarket = new Map<string, { marketId: string; direction: Direction }>()
   /** REST /book asset IDs are the same compact `aid` used by Gate's WS. */
   private assetIdToMarket = new Map<string, GateBookHashBinding | null>()
@@ -467,6 +474,7 @@ export class GateMarketData implements ReadOnlyVenueSource {
     this.websocketMarketTokens.clear()
     this.subscriptionTokensByMarket.clear()
     this.pipelineStats.clear()
+    this.cpiHistory.clear()
     this.snapshot = []
     this.emit()
   }
@@ -505,11 +513,15 @@ export class GateMarketData implements ReadOnlyVenueSource {
       : false
     const cpi = transport === 'WebSocket' ? parseCpiObservation(parsed) : undefined
     if (cpi) {
+      const history = this.cpiHistory.get(cpi.duration) ?? []
+      history.push({ ...cpi, observedAt: receivedAt })
+      this.cpiHistory.set(cpi.duration, history.slice(-120))
       const active = [...this.contexts.values()]
         .filter((context) => context.durationMinutes === cpi.duration && context.endTime > receivedAt - 15_000)
         .sort((left, right) => Math.abs(left.startTime - cpi.sourceAt) - Math.abs(right.startTime - cpi.sourceAt))
       const target = active.find((context) => cpi.sourceAt >= context.startTime - 15_000 && cpi.sourceAt <= context.endTime + 15_000) ?? active[0]
       if (target) {
+        target.baselinePrice ??= this.findCpiBaseline(target.durationMinutes, target.startTime)?.value
         target.currentPrice = cpi.value
         target.currentObservedAt = receivedAt
         changed = true
@@ -586,7 +598,12 @@ export class GateMarketData implements ReadOnlyVenueSource {
           currentObservedAt: market.currentObservedAt ?? previous.currentObservedAt,
           outcomes: mergeOutcomeQuotes(previous.outcomes, market.outcomes),
           catalogOutcomeIds: { ...previous.catalogOutcomeIds, ...market.catalogOutcomeIds }
-        } : market)
+        } : {
+          ...market,
+          baselinePrice: market.baselinePrice ?? this.findCpiBaseline(market.durationMinutes, market.startTime)?.value,
+          currentPrice: this.latestCpiObservation(market.durationMinutes)?.value,
+          currentObservedAt: this.latestCpiObservation(market.durationMinutes)?.observedAt
+        })
         for (const quote of Object.values(market.outcomes)) {
           if (quote) this.outcomeToMarket.set(quote.outcomeId, { marketId: market.marketId, direction: quote.direction })
         }
@@ -774,6 +791,18 @@ export class GateMarketData implements ReadOnlyVenueSource {
   }
 
   private emit(): void { for (const listener of this.listeners) listener() }
+
+  private findCpiBaseline(duration: 5 | 15, startTime: number): GateCpiObservation | undefined {
+    return (this.cpiHistory.get(duration) ?? [])
+      .map((observation) => ({ observation, distance: Math.abs(observation.sourceAt - startTime) }))
+      .filter(({ distance }) => distance <= CPI_BASELINE_WINDOW_MS)
+      .sort((left, right) => left.distance - right.distance)[0]?.observation
+  }
+
+  private latestCpiObservation(duration: 5 | 15): GateCpiObservation | undefined {
+    const history = this.cpiHistory.get(duration) ?? []
+    return history[history.length - 1]
+  }
 
   private refreshObservedAt(duration: 5 | 15 | undefined, marketId: string | undefined, observedAt: number): boolean {
     if (!duration) return false
