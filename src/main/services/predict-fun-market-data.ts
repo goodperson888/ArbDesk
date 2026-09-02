@@ -1490,6 +1490,19 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   }
 
   private passiveDiagnosticsSuffix(): string {
+    const settlement = (() => {
+      const contexts = [...this.marketContexts.values()]
+      const withBaseline = contexts.filter(({ category }) => {
+        const crypto = categoryCryptoData(category)
+        const feedId = crypto.priceFeedId ?? (this.oracleHistory.size === 1 ? [...this.oracleHistory.keys()][0] : undefined)
+        return Boolean(positivePrice(crypto.startPrice) || this.findOracleBaseline(feedId, categoryWindowTimes(category)?.startTime ?? Number.NaN))
+      }).length
+      const withCurrent = contexts.filter(({ category }) => {
+        const feedId = categoryCryptoData(category).priceFeedId
+        return Boolean(feedId ? this.oracleObservations.has(String(feedId)) : this.oracleObservations.size === 1)
+      }).length
+      return contexts.length > 0 ? `；结算基准/当前 ${withBaseline}/${withCurrent}` : ''
+    })()
     const graphql = this.passiveGraphqlResponseCount > 0
       ? `；GraphQL目录 ${this.passiveGraphqlMappedCount}/${this.passiveGraphqlResponseCount}${this.passiveLastGraphqlOperation ? `，操作 ${this.passiveLastGraphqlOperation}${isNonMarketGraphqlOperation(this.passiveLastGraphqlOperation) ? '（非市场响应，已忽略）' : ''}` : ''}${this.passiveLastGraphqlSlugs ? `，slug ${this.passiveLastGraphqlSlugs}` : ''}${this.passiveLastGraphqlSchema ? `，字段 ${this.passiveLastGraphqlSchema}` : ''}`
       : ''
@@ -1499,9 +1512,9 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     const latestFrame = this.passiveFrameCount > 0
       ? `；最近WS topic=${this.passiveLastFrameTopic || '无'} marketId=${this.passiveLastFrameMarketId || '无'} slug=${this.passiveLastFramePageSlug || '无'} 结构=${this.passiveLastFrameShape || '无'}`
       : ''
-    if (this.passiveFrameCount === 0) return `${graphql}${marketDetail}；页面尚未收到可解析的 WebSocket 帧`
+    if (this.passiveFrameCount === 0) return `${graphql}${marketDetail}${settlement}；页面尚未收到可解析的 WebSocket 帧`
     const reason = this.passiveLastReason ? `，最近原因：${this.passiveLastReason}` : ''
-    return `${graphql}${marketDetail}；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、页面绑定 ${this.passivePageBoundFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、忽略 ${this.passiveIgnoredFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）${latestFrame}`
+    return `${graphql}${marketDetail}${settlement}；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、页面绑定 ${this.passivePageBoundFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、忽略 ${this.passiveIgnoredFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）${latestFrame}`
   }
 
   private notifyPassiveDiagnostics(): void {

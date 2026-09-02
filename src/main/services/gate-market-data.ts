@@ -822,12 +822,14 @@ export class GateMarketData implements ReadOnlyVenueSource {
   private pipelineStatusMessage(now: number): string {
     return ([5, 15] as const).map((duration) => {
       const stats = this.pipelineStats.get(duration)
+      const contexts = [...this.contexts.values()].filter((context) => context.durationMinutes === duration)
+      const settled = `${contexts.filter((context) => Boolean(context.baselinePrice)).length}/${contexts.filter((context) => Boolean(context.currentPrice && context.currentObservedAt)).length}`
       const rawAge = stats?.lastRawBookAt === undefined ? '无' : `${((Math.max(0, now - stats.lastRawBookAt)) / 1_000).toFixed(1)}秒`
       const mappedAge = stats?.lastMappedBookAt === undefined ? '无' : `${((Math.max(0, now - stats.lastMappedBookAt)) / 1_000).toFixed(1)}秒`
       const quoteAge = stats?.lastQuoteUpdateAt === undefined ? '无' : `${((Math.max(0, now - stats.lastQuoteUpdateAt)) / 1_000).toFixed(1)}秒`
       const rest = stats ? `REST hash ${stats.restBookHashes}/${stats.restBookResponses}·方向${stats.restBookDirections}` : 'REST hash 无'
       const ws = stats ? `WS h ${stats.websocketHashes}·命中${stats.websocketHashMatches} / aid ${stats.websocketAids}·命中${stats.websocketAidMatches} / mk ${stats.websocketMarketKeys}·命中${stats.websocketMarketKeyMatches}` : 'WS h 无'
-      return `${duration}m 原始WS ${rawAge} / 映射${mappedAge} / 盘口${quoteAge} / 未映射${stats?.unmappedBookFrames ?? 0} / ${rest} / ${ws}`
+      return `${duration}m 原始WS ${rawAge} / 映射${mappedAge} / 盘口${quoteAge} / 结算基准/当前${settled} / 未映射${stats?.unmappedBookFrames ?? 0} / ${rest} / ${ws}`
     }).join('；')
   }
 
