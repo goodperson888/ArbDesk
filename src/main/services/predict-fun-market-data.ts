@@ -762,6 +762,10 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private desiredTopics = new Set<string>()
   private activeTopics = new Set<string>()
   private oracleObservations = new Map<string, PredictOracleObservation>()
+  // Keep a short observation history. Passive GraphQL responses often arrive
+  // after the round has already started, so retaining only the latest tick
+  // loses the opening reference needed for settlement-distance checks.
+  private oracleHistory = new Map<string, PredictOracleObservation[]>()
   private oracleBaselines = new Map<string, string>()
   private marketContexts = new Map<string, { category: PredictCategory; market: PredictMarket }>()
   private reconnectTimer?: NodeJS.Timeout
@@ -884,6 +888,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     this.snapshot = undefined
     this.lastRestBookAt = 0
     this.oracleObservations.clear()
+    this.oracleHistory.clear()
     this.oracleBaselines.clear()
   }
 
@@ -901,6 +906,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       this.snapshot = undefined
       this.marketContexts.clear()
       this.oracleObservations.clear()
+      this.oracleHistory.clear()
       this.oracleBaselines.clear()
       this.emitMarketData()
     }
@@ -1030,6 +1036,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private parseCategoryWindow(category: PredictCategory, market: PredictMarket, book: PredictBookResponse, receivedAt: number, observedAt: number): ReadOnlyWindowQuote | undefined {
     const crypto = categoryCryptoData(category)
     const feedId = crypto.priceFeedId
+    const inferredFeedId = feedId ?? (this.oracleHistory.size === 1 ? [...this.oracleHistory.keys()][0] : undefined)
     // Passive page contexts can omit priceFeedId even though the page's
     // Chainlink topic is unambiguous. Use the sole observed feed as a
     // fallback; if multiple feeds exist, stay conservative and leave it
@@ -1043,7 +1050,23 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         ? this.oracleBaselines.get(`${feedId}:${window.startTime}`)
         : this.oracleBaselines.size === 1 ? [...this.oracleBaselines.values()][0] : undefined
       : undefined
-    return parseCategory(category, market, book, receivedAt, observedAt, oracle, baselineOverride)
+    const historyBaseline = window && !baselineOverride && !positivePrice(crypto.startPrice)
+      ? this.findOracleBaseline(inferredFeedId, window.startTime)
+      : undefined
+    return parseCategory(category, market, book, receivedAt, observedAt, oracle, baselineOverride ?? historyBaseline)
+  }
+
+  private findOracleBaseline(feedId: string | undefined, startTime: number): string | undefined {
+    if (!feedId) return undefined
+    const observations = this.oracleHistory.get(feedId) ?? []
+    // A Chainlink page tick is normally emitted once per second. Accept only
+    // a sample very close to the round boundary; never use a mid-round price
+    // as a fabricated baseline.
+    const nearest = observations
+      .map((observation) => ({ observation, distance: Math.abs(observation.observedAt - startTime) }))
+      .filter(({ distance }) => distance <= 5_000)
+      .sort((left, right) => left.distance - right.distance)[0]
+    return nearest?.observation.value
   }
 
   private handleOracleUpdate(feedIdFromTopic: string, rawData: unknown, receivedAt: number): void {
@@ -1060,6 +1083,9 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       ? (sourceRaw < 100_000_000_000 ? Math.round(sourceRaw * 1_000) : Math.round(sourceRaw))
       : receivedAt
     this.oracleObservations.set(feedId, { value, observedAt: receivedAt })
+    const history = this.oracleHistory.get(feedId) ?? []
+    history.push({ value, observedAt: sourceAt })
+    this.oracleHistory.set(feedId, history.slice(-120))
 
     // A page-only response can omit startPrice. Only infer it from an oracle
     // tick that is actually at the category boundary; never use the first

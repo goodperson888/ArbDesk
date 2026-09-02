@@ -55,6 +55,17 @@ interface KalshiMarket {
   capStrike?: number | string
   functional_strike?: string
   functionalStrike?: string
+  // Only populated by page/API variants that expose the underlying index
+  // observation. Contract last/yes/no prices are deliberately not accepted
+  // here because they are probabilities, not BTC prices.
+  underlying_price?: number | string
+  underlyingPrice?: number | string
+  index_price?: number | string
+  indexPrice?: number | string
+  spot_price?: number | string
+  spotPrice?: number | string
+  current_price?: number | string
+  currentPrice?: number | string
 }
 
 interface KalshiMarketsResponse { markets?: KalshiMarket[] }
@@ -75,6 +86,8 @@ interface Candidate {
   durationMinutes: 5 | 15
   exchangeIndex?: number
   baselinePrice?: string
+  currentPrice?: string
+  currentObservedAt?: number
 }
 
 function timestamp(value: unknown): number | undefined {
@@ -100,6 +113,11 @@ function positiveStrike(value: unknown): string | undefined {
   return Number.isFinite(parsed) && parsed > 0 ? String(value) : undefined
 }
 
+function positiveUnderlying(value: unknown): string | undefined {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? String(value) : undefined
+}
+
 export function parseKalshiCandidate(market: KalshiMarket): Candidate | undefined {
   const ticker = (market.ticker ?? market.market_ticker ?? market.marketTicker)?.trim()
   const startTime = timestamp(market.open_time ?? market.openTime)
@@ -120,7 +138,11 @@ export function parseKalshiCandidate(market: KalshiMarket): Candidate | undefine
   const rawExchangeIndex = Number(market.exchange_index ?? market.exchangeIndex)
   const exchangeIndex = Number.isInteger(rawExchangeIndex) && rawExchangeIndex >= 0 ? rawExchangeIndex : undefined
   const baselinePrice = positiveStrike(market.floor_strike ?? market.floorStrike ?? market.functional_strike ?? market.functionalStrike)
-  return { market, ticker, yesDirection, startTime, endTime, durationMinutes, exchangeIndex, baselinePrice }
+  const currentPrice = positiveUnderlying(
+    market.underlying_price ?? market.underlyingPrice ?? market.index_price ?? market.indexPrice ??
+    market.spot_price ?? market.spotPrice ?? market.current_price ?? market.currentPrice
+  )
+  return { market, ticker, yesDirection, startTime, endTime, durationMinutes, exchangeIndex, baselinePrice, currentPrice, currentObservedAt: currentPrice ? Date.now() : undefined }
 }
 
 function decimalPrice(value: string): number | undefined {
@@ -154,6 +176,11 @@ function resolution(candidate: Candidate): ResolutionFingerprint {
     ruleVersion: 'kalshi-btc-direction-contract-v1',
     evidenceUrl: `https://kalshi.com/markets/${candidate.ticker}`
   }
+}
+
+function settlementObservation(candidate: Candidate): ReadOnlyWindowQuote['settlementObservation'] {
+  if (!candidate.baselinePrice || !candidate.currentPrice || !candidate.currentObservedAt) return undefined
+  return { baselineValue: candidate.baselinePrice, currentValue: candidate.currentPrice, observedAt: candidate.currentObservedAt }
 }
 
 export class KalshiMarketData implements ReadOnlyVenueSource {
@@ -291,7 +318,7 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
         return {
           venueId: 'KALSHI', marketId: candidate.ticker, asset: 'BTC/USD', durationMinutes: candidate.durationMinutes,
           startTime: candidate.startTime, endTime: candidate.endTime, feeVerified: false,
-          resolution: resolution(candidate), outcomes
+          resolution: resolution(candidate), settlementObservation: settlementObservation(candidate), outcomes
         }
       })
       this.snapshot = windows.filter((value): value is ReadOnlyWindowQuote => Boolean(value))
@@ -439,7 +466,7 @@ export class KalshiMarketData implements ReadOnlyVenueSource {
       .map((context): ReadOnlyWindowQuote => ({
         venueId: 'KALSHI', marketId: context.candidate.ticker, asset: 'BTC/USD', durationMinutes: context.candidate.durationMinutes,
         startTime: context.candidate.startTime, endTime: context.candidate.endTime, feeVerified: false,
-        resolution: resolution(context.candidate), outcomes: context.outcomes
+        resolution: resolution(context.candidate), settlementObservation: settlementObservation(context.candidate), outcomes: context.outcomes
       }))
       .sort((left, right) => left.startTime - right.startTime || left.durationMinutes - right.durationMinutes)
     if (!this.snapshot.length) return

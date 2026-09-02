@@ -148,6 +148,31 @@ describe('PredictFunMarketData', () => {
     vi.useRealTimers()
   })
 
+  it('retains an opening Chainlink tick when the passive market directory arrives after the round starts', async () => {
+    vi.useFakeTimers()
+    const start = new Date('2026-08-21T11:30:00.000Z').getTime()
+    vi.setSystemTime(new Date('2026-08-21T11:32:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+
+    // The page subscribes to Chainlink before its GetMarket GraphQL response
+    // is processed. The old implementation kept only the latest 11:32 tick,
+    // so it could never recover the 11:30 opening value afterwards.
+    capture.emitFrame({ type: 'M', topic: 'chainlinkAssetPriceUpdate/1', data: { price: 80400, priceFeedId: 1, publishTime: Math.round(start / 1_000), timestamp: Math.round(start / 1_000) } })
+    vi.setSystemTime(new Date('2026-08-21T11:32:01.000Z'))
+    capture.emitFrame({ type: 'M', topic: 'chainlinkAssetPriceUpdate/1', data: { price: 80435, priceFeedId: 1, publishTime: Math.round(Date.now() / 1_000), timestamp: Math.round(Date.now() / 1_000) } })
+    capture.emitResponse('https://graphql.predict.fun/graphql', { data: { market: {
+      id: '42', status: 'REGISTERED', tradingStatus: 'OPEN', outcomes: { edges: [
+        { node: { name: 'Up', index: 1, onChainId: 'up' } }, { node: { name: 'Down', index: 2, onChainId: 'down' } }
+      ] }, category: { id: 'btc-updown-5m-1787302200', startsAt: '2026-08-21T11:30:00.000Z', endsAt: '2026-08-21T11:35:00.000Z' }
+    } } }, { operationName: 'GetMarket', requestMarketIds: ['42'], requestSlugs: ['btc-updown-5m-1787302200'] })
+    capture.emitFrame({ type: 'M', topic: 'predictOrderbook/42', data: { marketId: 42, asks: [[0.61, 10]], bids: [[0.54, 12]] } })
+
+    expect(source.getLatestWindows()[0].settlementObservation).toEqual({ baselineValue: '80400', currentValue: '80435', observedAt: Date.now() })
+    vi.useRealTimers()
+  })
+
   it('binds an early passive websocket frame to the rolling page slug before the directory arrives', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-28T00:34:00.000Z'))

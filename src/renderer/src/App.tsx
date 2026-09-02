@@ -281,6 +281,18 @@ function quoteAgeLabel(milliseconds: number): string {
   return `${Math.max(0, milliseconds / 1_000).toFixed(1)}秒`
 }
 
+const BEST_SWITCH_MIN_GAIN_USDT = 0.05
+const BEST_SWITCH_MIN_GAIN_RATIO = 0.10
+const BEST_SWITCH_COOLDOWN_MS = 2_000
+
+function comparisonScore(comparison: MultiVenueComparison, autoOpenEnabled: boolean): number {
+  const primary = Number(autoOpenEnabled ? comparison.autoOrderPotentialProfit : comparison.potentialProfit)
+  if (Number.isFinite(primary) && primary > 0) return primary
+  const edge = Number(comparison.netEdgePerShare)
+  const quantity = Number(comparison.executableQuantity)
+  return Number.isFinite(edge) && Number.isFinite(quantity) ? edge * quantity : Number.NEGATIVE_INFINITY
+}
+
 type MultiVenueExecutionNotice = {
   comparisonId: string
   startedAt: number
@@ -714,6 +726,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [hedgeModeDraft, setHedgeModeDraft] = useState<PolymarketHedgeMode>('PROTECTED_MARKET')
   const previousAlertCandidateRef = useRef<string | undefined>(undefined)
   const lastOpportunityAlertAtRef = useRef(0)
+  const heldBestComparisonRef = useRef<{ id?: string; switchedAt: number }>({ switchedAt: 0 })
 
   useEffect(() => {
     void window.arbApp.getSnapshot().then((value) => {
@@ -891,12 +904,36 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       .map((comparison) => comparison.id))
     return selectReadyComparisons({ comparisons: visibleComparisons, legacyReadyIds, multiVenueReports: multiVenueEntryReports })
   }, [multiVenueEntryReports, now, opportunityById, snapshot, visibleComparisons])
-  const bestComparison = useMemo(() => [...readyComparisons].sort((left, right) =>
-    Number(snapshot?.settings.autoOpenEnabled ? right.autoOrderPotentialProfit : right.potentialProfit) -
-      Number(snapshot?.settings.autoOpenEnabled ? left.autoOrderPotentialProfit : left.potentialProfit) ||
+  const autoOpenEnabled = Boolean(snapshot?.settings.autoOpenEnabled)
+  const rawBestComparison = useMemo(() => [...readyComparisons].sort((left, right) =>
+    comparisonScore(right, autoOpenEnabled) - comparisonScore(left, autoOpenEnabled) ||
     Number(right.netEdgePerShare) - Number(left.netEdgePerShare) ||
     left.fixedSortKey.localeCompare(right.fixedSortKey)
-  )[0], [readyComparisons, snapshot?.settings.autoOpenEnabled])
+  )[0], [autoOpenEnabled, readyComparisons])
+  const bestComparison = useMemo(() => {
+    const raw = rawBestComparison
+    if (!raw) {
+      heldBestComparisonRef.current = { switchedAt: 0 }
+      return undefined
+    }
+    const held = heldBestComparisonRef.current.id
+      ? readyComparisons.find((comparison) => comparison.id === heldBestComparisonRef.current.id)
+      : undefined
+    if (!held) {
+      heldBestComparisonRef.current = { id: raw.id, switchedAt: Date.now() }
+      return raw
+    }
+    if (held.id === raw.id) return held
+    const elapsedSinceSwitch = Date.now() - heldBestComparisonRef.current.switchedAt
+    const heldScore = comparisonScore(held, autoOpenEnabled)
+    const rawScore = comparisonScore(raw, autoOpenEnabled)
+    const gain = rawScore - heldScore
+    const relativeGain = heldScore > 0 ? gain / heldScore : Number.POSITIVE_INFINITY
+    const materiallyBetter = gain >= BEST_SWITCH_MIN_GAIN_USDT && relativeGain >= BEST_SWITCH_MIN_GAIN_RATIO
+    if (elapsedSinceSwitch < BEST_SWITCH_COOLDOWN_MS || !materiallyBetter) return held
+    heldBestComparisonRef.current = { id: raw.id, switchedAt: Date.now() }
+    return raw
+  }, [autoOpenEnabled, rawBestComparison, readyComparisons])
   const readyOpportunityCount = readyComparisons.length
   const orderedComparisonRows = useMemo(() => visibleComparisons
     .map((comparison) => ({
@@ -1143,9 +1180,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
 
   function followBestOpportunity(): void {
     setSelectionMode('FOLLOW_BEST')
-    if (bestComparison) {
-      setSelectedComparisonId(bestComparison.id)
-      setSelectedId(bestComparison.legacyOpportunityId)
+    if (rawBestComparison) {
+      heldBestComparisonRef.current = { id: rawBestComparison.id, switchedAt: Date.now() }
+      setSelectedComparisonId(rawBestComparison.id)
+      setSelectedId(rawBestComparison.legacyOpportunityId)
     }
   }
 
@@ -2024,6 +2062,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                     <b className="mono">{Number(leg.price) > 0 ? money(leg.price, 4) : '—'}</b>
                     <small>{Number(leg.availableQuantity) > 0 ? `深度 ${money(leg.availableQuantity, 2)}份` : '仅有价格 · 深度待捕获'} · {quoteAgeLabel(leg.quoteAgeMs)}</small>
                     <small>计划 {Number.isFinite(multiVenueRequestedQuantity) ? multiVenueRequestedQuantity.toFixed(2) : '—'} 份 · 预计 ${Number.isFinite(multiVenueRequestedQuantity) && Number(leg.price) > 0 ? (multiVenueRequestedQuantity * Number(leg.price)).toFixed(2) : '—'}</small>
+                    <small>结算安全距离 {money(leg.settlementDistanceBps ?? '', 1)} bps</small>
                   </div>)}
                 </div>
               </section>
