@@ -42,6 +42,9 @@ export interface EntryGateInput {
   legs: EntryGateLeg[]
   feeVerificationApplicable?: boolean
   settlementRiskApplicable?: boolean
+  settlementRiskPassed?: boolean
+  settlementRiskLabel?: string
+  settlementRiskBlockReason?: string
   depthLimitApplicable?: boolean
 }
 
@@ -137,7 +140,9 @@ export function evaluateEntryGates(input: EntryGateInput): EntryGateReport {
   const minimumReturnPct = decimal(input.minConditionalReturnPct)
   const returnPassed = returnPct.isFinite() && minimumReturnPct.isFinite() && returnPct.gte(minimumReturnPct)
   const feePassed = input.edgeKind === 'NET_VERIFIED'
-  const settlementPassed = input.matchClass === 'EXACT'
+  const settlementPassed = input.settlementRiskPassed ?? input.matchClass === 'EXACT'
+  const settlementBlockReason = input.settlementRiskBlockReason
+    ?? (input.settlementRiskPassed === undefined ? '两平台结算规则存在差异' : '动态安全距离或结算方向未通过')
   const slowestQuoteAgeMs = input.legs.length > 0 ? Math.max(...input.legs.map((leg) => leg.quoteAgeMs)) : Infinity
   const freshnessPassed = Number.isFinite(slowestQuoteAgeMs) && slowestQuoteAgeMs <= input.maxQuoteAgeMs
   const remainingSeconds = (input.endTime - input.now) / 1_000
@@ -153,7 +158,15 @@ export function evaluateEntryGates(input: EntryGateInput): EntryGateReport {
     hardCheck('execution-idle', input.executionIdle, input.executionIdle ? '当前无冲突执行' : '已有执行中的套利组', '已有执行中的套利组，不能重复开仓'),
     configurableCheck(input, 'conditional-return', 'conditionalReturn', returnPassed, `条件收益率 ${finiteFixed(returnPct, 2)}% ≥ ${finiteFixed(minimumReturnPct, 2)}%`, `条件收益率 ${finiteFixed(returnPct, 2)}% 低于入场阀值 ${finiteFixed(minimumReturnPct, 2)}%`),
     configurableCheck(input, 'fee-verification', 'feeVerification', feePassed, feePassed ? '手续费模型已验证' : '手续费模型未验证，当前仅有毛边际', '手续费模型尚未验证', input.feeVerificationApplicable !== false),
-    configurableCheck(input, 'settlement-risk', 'settlementRisk', settlementPassed, settlementPassed ? '两平台结算规则完全一致' : '两平台结算规则存在差异', '两平台结算规则存在差异', input.settlementRiskApplicable !== false),
+    configurableCheck(
+      input,
+      'settlement-risk',
+      'settlementRisk',
+      settlementPassed,
+      input.settlementRiskLabel ?? (settlementPassed ? '动态安全距离与结算方向通过' : '动态安全距离或结算方向未通过'),
+      settlementBlockReason,
+      input.settlementRiskApplicable !== false
+    ),
     configurableCheck(input, 'quote-freshness', 'quoteFreshness', freshnessPassed, `最慢一腿 ${Number.isFinite(slowestQuoteAgeMs) ? (slowestQuoteAgeMs / 1_000).toFixed(1) : '—'} 秒 ≤ ${(input.maxQuoteAgeMs / 1_000).toFixed(0)} 秒`, `行情已过期：最慢一腿 ${Number.isFinite(slowestQuoteAgeMs) ? Math.round(slowestQuoteAgeMs / 1_000) : '—'} 秒未收到有效观测`),
     configurableCheck(input, 'expiry-cutoff', 'expiryCutoff', expiryPassed, `距离到期 ${Number.isFinite(remainingSeconds) ? remainingSeconds.toFixed(0) : '—'} 秒 > ${input.stopBeforeExpirySeconds} 秒`, `距离到期不足 ${input.stopBeforeExpirySeconds} 秒，禁止新开仓`)
   ]

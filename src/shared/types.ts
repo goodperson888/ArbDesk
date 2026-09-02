@@ -1,4 +1,4 @@
-import type { MultiVenueBoardSnapshot, MultiVenueExecutionCommand, MultiVenueExecutionReceipt, MultiVenueExecutionSession } from './multi-venue'
+import type { MultiVenueBoardSnapshot, MultiVenueExecutionCommand, MultiVenueExecutionReceipt, MultiVenueExecutionSession, SettlementScenario } from './multi-venue'
 
 export type Venue = 'MEXC' | 'POLYMARKET'
 export type Direction = 'UP' | 'DOWN'
@@ -109,6 +109,8 @@ export interface Opportunity {
   polymarketDistanceBps?: string
   settlementDistanceBps: string
   requiredSettlementDistanceBps: string
+  settlementScenario?: SettlementScenario
+  doubleWinEntryEligible?: boolean
   matchClass: MatchClass
   stale: boolean
   riskFlags: string[]
@@ -346,6 +348,8 @@ export interface ExecuteRequest {
   opportunityId: string
   quantity: string
   source?: Exclude<OrderTriggerSource, 'UNKNOWN'>
+  /** Explicit, per-click consent for a route currently inside its double-win interval. */
+  allowDoubleWinEntry?: boolean
 }
 
 export interface ConfirmMexcFillRequest extends Pick<Fill, 'quantity' | 'averagePrice' | 'orderId'> {

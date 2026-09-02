@@ -15,7 +15,7 @@ const settings: RiskSettings = {
   preHedgeRatioPct: 50, unprotectedExecutionEnabled: false, manualExecutionConditions: defaultManualExecutionConditions(), autoOpenStabilityMs: 100
 }
 
-function market(venueId: string): ReadOnlyWindowQuote {
+function market(venueId: string, settlementObservation?: ReadOnlyWindowQuote['settlementObservation']): ReadOnlyWindowQuote {
   return {
     venueId, marketId: `${venueId}-market`, asset: 'BTC/USD', durationMinutes: 5, startTime: 1_000, endTime: 301_000,
     feeVerified: true,
@@ -23,6 +23,7 @@ function market(venueId: string): ReadOnlyWindowQuote {
       asset: 'BTC/USD', startTime: 1_000, endTime: 301_000, baselineSource: 'CHAINLINK', settlementSource: 'CHAINLINK',
       observationMethod: 'TWAP', comparisonOperator: 'GTE', tieOutcome: 'UP', voidRule: 'NONE', staleDataRule: 'NONE', timezone: 'UTC', ruleVersion: 'same'
     },
+    settlementObservation,
     outcomes: {
       UP: { direction: 'UP', outcomeId: `${venueId}-up`, bestAsk: '0.40', askSize: '20', levels: [], receivedAt: 10_000 },
       DOWN: { direction: 'DOWN', outcomeId: `${venueId}-down`, bestAsk: '0.40', askSize: '20', levels: [], receivedAt: 10_000 }
@@ -103,5 +104,29 @@ describe('bidirectional route builder', () => {
     } }
     const route = buildBidirectionalRoutes([noDepth, market('KALSHI')], settings, 10_100)[0]
     expect(routeToComparison(route, settings, 10_100).status).toBe('BLOCKED')
+  })
+
+  it('classifies a direction inside the double-win interval and requires explicit consent', () => {
+    const left = market('MEXC', { baselineValue: '60000', currentValue: '60060', observedAt: 10_100 })
+    const right = market('GATE', { baselineValue: '60050', currentValue: '59900', observedAt: 10_100 })
+    const comparison = buildBidirectionalRoutes([left, right], settings, 10_100)
+      .map((route) => routeToComparison(route, settings, 10_100))
+      .find((candidate) => candidate.settlementScenario === 'DOUBLE_WIN')!
+    expect(comparison.settlementScenario).toBe('DOUBLE_WIN')
+    expect(comparison.doubleWinEntryEligible).toBe(true)
+    expect(comparison.settlementRiskPassed).toBe(false)
+    expect(comparison.settlementRiskReason).toContain('双赢区间')
+  })
+
+  it('blocks a direction inside the double-loss interval', () => {
+    const left = market('MEXC', { baselineValue: '60000', currentValue: '60060', observedAt: 10_100 })
+    const right = market('GATE', { baselineValue: '60050', currentValue: '59900', observedAt: 10_100 })
+    const comparison = buildBidirectionalRoutes([left, right], settings, 10_100)
+      .map((route) => routeToComparison(route, settings, 10_100))
+      .find((candidate) => candidate.settlementScenario === 'DOUBLE_LOSS')!
+    expect(comparison.settlementScenario).toBe('DOUBLE_LOSS')
+    expect(comparison.doubleWinEntryEligible).toBe(false)
+    expect(comparison.settlementRiskPassed).toBe(false)
+    expect(comparison.settlementRiskReason).toContain('双输风险')
   })
 })

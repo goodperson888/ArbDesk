@@ -37,6 +37,11 @@ export function normalizeLegacyWindows(
       venueId: 'MEXC', marketId: window.eventId, asset: 'BTC/USD', durationMinutes: window.durationMinutes,
       startTime: window.startTime, endTime: window.endTime, feeVerified: window.feeRateSource === 'HISTORY',
       feeRateBps: Number(window.feeRate || 0) * 10_000, resolution: mexcResolution(window),
+      settlementObservation: window.baselinePrice && window.indexPrice && window.indexReceivedAt ? {
+        baselineValue: window.baselinePrice,
+        currentValue: window.indexPrice,
+        observedAt: window.indexReceivedAt
+      } : undefined,
       outcomes: Object.fromEntries((['UP', 'DOWN'] as const).map((direction) => {
         const quote = window.outcomes[direction]
         return [direction, {
@@ -52,6 +57,11 @@ export function normalizeLegacyWindows(
       venueId: 'POLYMARKET', marketId: window.conditionId ?? `${window.startTime}`, asset: 'BTC/USD',
       durationMinutes: window.durationMinutes, startTime: window.startTime, endTime: window.endTime,
       feeVerified: true, resolution: polymarketResolution(window),
+      settlementObservation: window.baselinePrice && window.indexPrice && window.indexReceivedAt ? {
+        baselineValue: window.baselinePrice,
+        currentValue: window.indexPrice,
+        observedAt: window.indexReceivedAt
+      } : undefined,
       outcomes: Object.fromEntries(Object.entries(window.outcomes).map(([direction, quote]) => [direction, quote ? {
         direction: direction as Direction, outcomeId: quote.tokenId, bestAsk: quote.bestAsk, askSize: quote.askSize,
         levels: quote.levels, receivedAt: quote.receivedAt

@@ -689,7 +689,7 @@ export class AppController {
     }
     if (!opportunity) throw new Error('机会已失效，请刷新后重试')
     const executionPlan = await this.calculateExecutionPlanInternal(opportunity, request.quantity, false, triggerSource)
-    this.validateExecution(opportunity, request.quantity, executionPlan, triggerSource)
+    this.validateExecution(opportunity, request.quantity, executionPlan, triggerSource, request.allowDoubleWinEntry)
     this.activeExecutionPlan = executionPlan
 
     this.activeSession = {
@@ -1305,7 +1305,8 @@ export class AppController {
     opportunity: Opportunity,
     quantityInput: string,
     executionPlan: ExecutionPlan,
-    source: 'MANUAL' | 'AUTO' | 'TEST'
+    source: 'MANUAL' | 'AUTO' | 'TEST',
+    allowDoubleWinEntry = false
   ): void {
     const quantity = new Decimal(quantityInput)
     if (!quantity.isFinite() || quantity.lte(0)) throw new Error('数量必须大于0')
@@ -1324,9 +1325,11 @@ export class AppController {
     if (opportunity.feeVerificationBlocked && this.executionConditionEnabled('feeVerification', source)) {
       throw new Error(`手续费校验未通过：${opportunity.feeVerificationReason ?? '缺少可验证费率'}`)
     }
+    const doubleWinConsented = source === 'MANUAL' && allowDoubleWinEntry && opportunity.doubleWinEntryEligible === true
     if (
       opportunity.settlementRiskBlocked &&
       this.executionConditionEnabled('settlementRisk', source) &&
+      !doubleWinConsented &&
       !this.settings.allowUnprofitableTestTrade
     ) {
       throw new Error(`结算源风控拦截：${opportunity.settlementRiskReason ?? '实时信号不满足条件'}`)

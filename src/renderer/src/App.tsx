@@ -141,6 +141,13 @@ function money(value: string, digits = 2): string {
   return Number.isFinite(parsed) ? parsed.toFixed(digits) : '—'
 }
 
+function signedMoney(value: string, digits = 2): string {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return '—'
+  const rounded = Number(parsed.toFixed(digits))
+  return `${rounded > 0 ? '+' : ''}${rounded.toFixed(digits)}`
+}
+
 function shortAddress(value: string): string {
   return value.length > 12 ? `${value.slice(0, 6)}…${value.slice(-4)}` : value
 }
@@ -636,6 +643,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [quantity, setQuantity] = useState('50')
   const [multiVenueQuantity, setMultiVenueQuantity] = useState('1')
   const [multiVenueAmount, setMultiVenueAmount] = useState('10.00')
+  const [allowDoubleWinEntry, setAllowDoubleWinEntry] = useState(false)
   const [now, setNow] = useState(Date.now())
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<string>()
@@ -791,6 +799,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     () => snapshot?.multiVenueBoard.comparisons.find((comparison) => comparison.id === selectedComparisonId),
     [selectedComparisonId, snapshot?.multiVenueBoard.comparisons]
   )
+  useEffect(() => setAllowDoubleWinEntry(false), [selectedComparisonId])
   const selectedGateLeg = useMemo(
     () => selectedComparison?.legs.find((leg) => leg.venueId === 'GATE'),
     [selectedComparison]
@@ -955,7 +964,8 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   )
   const effectiveConditionalReturn = currentPlan?.conditionalReturnPct ?? selected?.conditionalReturnPct ?? '0'
   const conditionalReturnPassed = Boolean(selected && snapshot && Number(effectiveConditionalReturn) >= Number(snapshot.settings.minConditionalReturnPct))
-  const settlementRiskPassed = Boolean(selected && !selected.settlementRiskBlocked)
+  const doubleWinEntryConsented = Boolean(selected?.doubleWinEntryEligible && allowDoubleWinEntry)
+  const settlementRiskPassed = Boolean(selected && (!selected.settlementRiskBlocked || doubleWinEntryConsented))
   const manualConditions = snapshot?.settings.manualExecutionConditions
   const manualConditionEnabled = (condition: keyof ManualExecutionConditions): boolean => manualConditions?.[condition] !== false
   const manualRiskOverrideActive = Boolean(manualConditions && Object.values(manualConditions).some((enabled) => !enabled))
@@ -972,7 +982,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       (unprotectedMode || !manualConditionEnabled('feeVerification') || !selected.feeVerificationBlocked) &&
       (!snapshot?.settings.allowUnprofitableTestTrade || (minimumTestCapital <= 12 && requestedCapital <= dynamicTestCapitalLimit)) &&
       (unprotectedMode || !manualConditionEnabled('conditionalReturn') || Number(effectiveConditionalReturn) >= Number(snapshot?.settings.minConditionalReturnPct ?? 0) || testOverrideReady) &&
-      (unprotectedMode || !manualConditionEnabled('settlementRisk') || !selected.settlementRiskBlocked || testOverrideReady) &&
+      (unprotectedMode || !manualConditionEnabled('settlementRisk') || !selected.settlementRiskBlocked || doubleWinEntryConsented || testOverrideReady) &&
       (unprotectedMode || !manualConditionEnabled('quoteFreshness') || !selected.stale) &&
       (unprotectedMode || !manualConditionEnabled('expiryCutoff') || (selected.endTime - now) / 1_000 > Number(snapshot?.settings.stopBeforeExpirySeconds ?? 0)) &&
       executionSessionIdle &&
@@ -998,7 +1008,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
               ? `距离到期不足${snapshot?.settings.stopBeforeExpirySeconds ?? 0}秒，禁止新开仓`
             : selected.feeVerificationBlocked && manualConditionEnabled('feeVerification')
               ? selected.feeVerificationReason ?? '手续费尚未校验'
-              : selected.settlementRiskBlocked && manualConditionEnabled('settlementRisk') && !testOverrideReady
+              : selected.settlementRiskBlocked && manualConditionEnabled('settlementRisk') && !doubleWinEntryConsented && !testOverrideReady
               ? selected.settlementRiskReason ?? '结算信号风控拦截'
               : Number(effectiveConditionalReturn) < Number(snapshot?.settings.minConditionalReturnPct ?? 0) && manualConditionEnabled('conditionalReturn') && !snapshot?.settings.allowUnprofitableTestTrade
                 ? '条件收益率低于设置门槛'
@@ -1040,7 +1050,8 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       now,
       executionIdle: executionSessionIdle && !busy,
       kalshiReady: kalshiCredentials?.configured === true,
-      gateReady: selectedGateLeg ? gateDurationExecutionReady(gateOrderCapture, selectedComparison.durationMinutes) : true
+      gateReady: selectedGateLeg ? gateDurationExecutionReady(gateOrderCapture, selectedComparison.durationMinutes) : true,
+      allowDoubleWinEntry
     })
     : undefined
 
@@ -1144,7 +1155,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
 
   async function execute(): Promise<void> {
     if (!selected) return
-    await run(() => window.arbApp.execute({ opportunityId: selected.id, quantity }), '执行流程已更新')
+    await run(() => window.arbApp.execute({ opportunityId: selected.id, quantity, allowDoubleWinEntry }), '执行流程已更新')
   }
 
   async function toggleManualExecutionCondition(condition: keyof ManualExecutionConditions): Promise<void> {
@@ -1442,7 +1453,8 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     const request: MultiVenueExecutionCommand = {
       comparisonId: selectedComparison.id,
       quantity: orderQuantity.toFixed(2),
-      confirmed: true
+      confirmed: true,
+      allowDoubleWinEntry
     }
     const startedAt = Date.now()
     setMultiVenueExecutionNotice({
@@ -1946,7 +1958,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   <strong>{comparisonLegLabel(bestComparison, 0)} + {comparisonLegLabel(bestComparison, 1)}</strong>
                   <span>{bestComparison.durationMinutes}m</span>
                   <span>可执行 {money(bestComparison.executableQuantity, 2)}份</span>
-                  <span className="positive-value">预计 +{money(displayedProfit(bestComparison), 2)} USDT</span>
+                  <span className={Number(displayedProfit(bestComparison)) >= 0 ? 'positive-value' : 'negative-value'}>预计 {signedMoney(displayedProfit(bestComparison), 2)} USDT</span>
                   <small>{selectionMode === 'FOLLOW_BEST' ? '下单面板正在跟随最优' : '当前已手动锁定，推荐仅作提示'}</small>
                 </>
               ) : <span className="best-opportunity-empty">当前没有通过全部风控的可执行机会</span>}
@@ -1961,30 +1973,33 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                     <tr><td colSpan={MULTI_VENUE_TABLE_COLUMNS.length}><div className="empty-state">当前筛选下暂无真实跨平台报价。{snapshot.connectionDetails.polymarket}</div></td></tr>
                   )}
                   {orderedComparisonRows.map(({ comparison, opportunity }) => {
-                    const positive = opportunity
+                    const ready = opportunity
                       ? opportunityReady(opportunity, snapshot, now)
                       : multiVenueEntryReports.get(comparison.id)?.allowed === true
+                    const netEdgePositive = Number(comparison.netEdgePerShare) >= 0
+                    const displayedProfitValue = displayedProfit(comparison)
+                    const profitPositive = Number(displayedProfitValue) >= 0
                     const isSelected = comparison.id === selectedComparison?.id
                     const isBest = comparison.id === bestComparison?.id
                     const firstLeg = comparison.legs[0]
                     const secondLeg = comparison.legs[1]
                     const unprotectedReady = !opportunity && unprotectedMode && multiVenueEntryReports.get(comparison.id)?.allowed === true
                     return (
-                      <tr key={stableRouteKey(comparison)} className={['opportunity-row', positive ? 'ready' : '', isBest ? 'best' : '', isSelected ? 'selected' : '', opportunity ? '' : comparison.status === 'MANUAL_EXECUTABLE' ? 'manual-executable' : 'read-only'].filter(Boolean).join(' ')} onClick={() => selectComparison(comparison)} tabIndex={0} aria-selected={isSelected} onKeyDown={(event) => {
+                      <tr key={stableRouteKey(comparison)} className={['opportunity-row', ready ? 'ready' : '', isBest ? 'best' : '', isSelected ? 'selected' : '', opportunity ? '' : comparison.status === 'MANUAL_EXECUTABLE' ? 'manual-executable' : 'read-only'].filter(Boolean).join(' ')} onClick={() => selectComparison(comparison)} tabIndex={0} aria-selected={isSelected} onKeyDown={(event) => {
                         if (event.key !== 'Enter' && event.key !== ' ') return
                         event.preventDefault()
                         selectComparison(comparison)
                       }}>
-                        <td><span className="market-window-cell"><span><span className="duration-pill">{comparison.durationMinutes}m</span>{isBest && <span className="best-badge">最佳</span>}</span><small>{comparison.asset.replace('/USD', '')} · {marketWindowLabel(comparison.startTime, comparison.endTime)}</small></span></td>
+                        <td><span className="market-window-cell"><span><span className="duration-pill">{comparison.durationMinutes}m</span>{isBest && <span className="best-badge">最佳</span>}{comparison.settlementScenario === 'DOUBLE_WIN' && <span className="double-win-badge">双赢确认</span>}</span><small>{comparison.asset.replace('/USD', '')} · {marketWindowLabel(comparison.startTime, comparison.endTime)}</small></span></td>
                         <td><span className="venue-leg"><strong>{firstLeg?.venueLabel ?? '—'}</strong><span className="quote-inline">{firstLeg && <Direction direction={firstLeg.direction} />}<span className="mono">{firstLeg && Number(firstLeg.price) > 0 ? money(firstLeg.price, 4) : '--'}</span>{firstLeg && Number(firstLeg.price) > 0 && !(Number(firstLeg.availableQuantity) > 0) && <span className="price-only-badge" title="已拿到最优价格，真实盘口深度尚未捕获">仅价</span>}</span></span></td>
                         <td><span className="venue-leg"><strong>{secondLeg?.venueLabel ?? '—'}</strong><span className="quote-inline">{secondLeg && <Direction direction={secondLeg.direction} />}<span className="mono">{secondLeg && Number(secondLeg.price) > 0 ? money(secondLeg.price, 4) : '--'}</span>{secondLeg && Number(secondLeg.price) > 0 && !(Number(secondLeg.availableQuantity) > 0) && <span className="price-only-badge" title="已拿到最优价格，真实盘口深度尚未捕获">仅价</span>}</span></span></td>
-                        <td><span className="edge-cell" title={comparison.edgeKind === 'GROSS_ONLY' ? comparison.blockReasons.join('；') : opportunity?.feeVerificationBlocked ? '费用待校验' : opportunity?.settlementRiskBlocked ? '风控拦截' : positive ? '当前可执行' : '未通过全部执行门槛'}>
-                          <span className={positive ? 'positive-value' : 'negative-value'}>
-                            {comparison.edgeKind === 'GROSS_ONLY' ? `参考 ${Number(comparison.netEdgePerShare) >= 0 ? '+' : ''}${money(comparison.netEdgePerShare, 4)}` : opportunity?.feeVerificationBlocked ? '—' : `${positive ? '+' : ''}${money(comparison.netEdgePerShare, 4)}`}
+                        <td><span className="edge-cell" title={comparison.edgeKind === 'GROSS_ONLY' ? comparison.blockReasons.join('；') : opportunity?.feeVerificationBlocked ? '费用待校验' : opportunity?.settlementRiskBlocked ? '风控拦截' : ready ? '当前可执行' : '未通过全部执行门槛'}>
+                          <span className={netEdgePositive ? 'positive-value' : 'negative-value'}>
+                            {comparison.edgeKind === 'GROSS_ONLY' ? `参考 ${signedMoney(comparison.netEdgePerShare, 4)}` : opportunity?.feeVerificationBlocked ? '—' : signedMoney(comparison.netEdgePerShare, 4)}
                           </span>
-                          {!positive && <AlertTriangle aria-hidden="true" />}
+                          {!ready && <AlertTriangle aria-hidden="true" />}
                         </span></td>
-                        <td><span className={positive ? 'positive-value' : 'negative-value'}>{comparison.edgeKind === 'GROSS_ONLY' ? '—' : `${positive ? '+' : ''}${money(displayedProfit(comparison), 2)}`}</span></td>
+                        <td><span className={profitPositive ? 'positive-value' : 'negative-value'}>{comparison.edgeKind === 'GROSS_ONLY' ? '—' : signedMoney(displayedProfitValue, 2)}</span></td>
                         <td className="mono countdown">{secondsRemaining(comparison.endTime, now)}</td>
                         <td><span className={`comparison-status ${unprotectedReady ? 'manual_executable' : comparison.status.toLowerCase()}`} title={comparison.blockReasons.join('；') || '当前通过展示层机会检查'}>{unprotectedReady ? '无保护可执行' : comparison.edgeKind === 'GROSS_ONLY' ? grossComparisonStatusLabel(comparison.status) : comparisonStatusLabel(comparison.status)}</span></td>
                         <td className="all-in-cost-cell mono"><strong>{money(comparison.allInCostPerShare, 4)}</strong><small>/ 份</small></td>
@@ -2015,13 +2030,18 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
               {selected ? <>
                 <div className="ticket-key-metrics">
                   <span>预计本金<strong>{selected.feeVerificationBlocked ? '—' : `$${requestedCapital.toFixed(2)}`}</strong></span>
-                  <span>预计利润<strong className={!selected.feeVerificationBlocked && requestedProfit > 0 ? 'profit' : ''}>{selected.feeVerificationBlocked ? '—' : `${requestedProfit >= 0 ? '+' : ''}$${requestedProfit.toFixed(2)}`}</strong></span>
+                  <span>预计利润<strong className={!selected.feeVerificationBlocked && requestedProfit > 0 ? 'profit' : ''}>{selected.feeVerificationBlocked ? '—' : signedUsd(requestedProfit)}</strong></span>
                   <span>安全距离<strong>{money(selected.settlementDistanceBps, 1)} / {money(selected.requiredSettlementDistanceBps, 1)} bps</strong></span>
                 </div>
 
                 {(selected.feeVerificationBlocked || selected.settlementRiskBlocked || selected.stale || Number(selected.conditionalReturnPct) < Number(snapshot.settings.minConditionalReturnPct)) && selected.riskFlags.length > 0 && (
                   <div className="inline-warning"><AlertTriangle aria-hidden="true" /><span>{selected.riskFlags[0]}</span></div>
                 )}
+
+                {selected.doubleWinEntryEligible && <label className="double-win-entry-choice">
+                  <input type="checkbox" checked={allowDoubleWinEntry} onChange={(event) => setAllowDoubleWinEntry(event.target.checked)} />
+                  <span><strong>选择反向双赢开仓</strong><small>当前两平台结算信号分歧，但两侧均已超过安全距离；仅本次点击有效，自动开单不会使用。</small></span>
+                </label>}
 
                 <label className="field-label ticket-quantity-label" htmlFor="quantity">对齐份额</label>
                 <div className="quantity-control">
@@ -2062,7 +2082,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                     <summary>风险与费用明细</summary>
                     <div>
                       <FormulaHelp inline />
-                      <Row label="条件收益率" value={selected.feeVerificationBlocked ? '—' : `${Number(effectiveConditionalReturn) >= 0 ? '+' : ''}${money(effectiveConditionalReturn, 2)}%`} positive={!selected.feeVerificationBlocked && Number(effectiveConditionalReturn) > 0} />
+                      <Row label="条件收益率" value={selected.feeVerificationBlocked ? '—' : `${signedMoney(effectiveConditionalReturn, 2)}%`} positive={!selected.feeVerificationBlocked && Number(effectiveConditionalReturn) > 0} />
                       <Row label="最坏亏损率" value={selected.feeVerificationBlocked ? '—' : `${money(selected.worstCaseReturnPct, 2)}%`} />
                       <Row label="MEXC结算信号" value={selected.mexcSignal ? <SignalValue direction={selected.mexcSignal} distanceBps={selected.mexcDistanceBps} /> : '未知'} />
                       <Row label="Polymarket结算信号" value={selected.polymarketSignal ? <SignalValue direction={selected.polymarketSignal} distanceBps={selected.polymarketDistanceBps} /> : '未知'} />
@@ -2081,9 +2101,14 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
               </> : <section className="read-only-ticket">
                 <div className="ticket-key-metrics">
                   <span>两腿成本<strong>{money(selectedComparison.allInCostPerShare, 4)}</strong></span>
-                  <span>参考毛边际<strong className={Number(selectedComparison.netEdgePerShare) > 0 ? 'profit' : ''}>{Number(selectedComparison.netEdgePerShare) >= 0 ? '+' : ''}{money(selectedComparison.netEdgePerShare, 4)}</strong></span>
-                  <span>参考收益率<strong>{Number(selectedComparison.conditionalReturnPct) >= 0 ? '+' : ''}{money(selectedComparison.conditionalReturnPct, 2)}%</strong></span>
+                  <span>参考毛边际<strong className={Number(selectedComparison.netEdgePerShare) > 0 ? 'profit' : ''}>{signedMoney(selectedComparison.netEdgePerShare, 4)}</strong></span>
+                  <span>参考收益率<strong>{signedMoney(selectedComparison.conditionalReturnPct, 2)}%</strong></span>
+                  <span>安全距离<strong>{money(selectedComparison.settlementDistanceBps ?? '', 1)} / {money(selectedComparison.requiredSettlementDistanceBps ?? '', 1)} bps</strong></span>
                 </div>
+                {selectedComparison.doubleWinEntryEligible && <label className="double-win-entry-choice">
+                  <input type="checkbox" checked={allowDoubleWinEntry} onChange={(event) => setAllowDoubleWinEntry(event.target.checked)} />
+                  <span><strong>选择反向双赢开仓</strong><small>当前组合处于双赢区间并已超过动态安全距离；仅本次点击有效，未勾选时继续拦截。</small></span>
+                </label>}
                 <label className="field-label ticket-quantity-label" htmlFor="multi-venue-amount">双腿下单金额（USDT）</label>
                 <div className="quantity-control">
                   <input id="multi-venue-amount" value={multiVenueAmount} inputMode="decimal" onChange={(event) => {
@@ -2713,9 +2738,11 @@ function Row({ label, value, emphasized, positive }: { label: string; value: Rea
   return <div className={`breakdown-row ${emphasized ? 'emphasized' : ''} ${positive ? 'positive' : ''}`}><span>{label}</span><strong>{value}</strong></div>
 }
 
-function signedUsd(value: string): string {
+function signedUsd(value: string | number): string {
   const amount = Number(value)
-  return `${amount >= 0 ? '+' : '-'}$${Math.abs(amount).toFixed(2)}`
+  if (!Number.isFinite(amount)) return '—'
+  const rounded = Number(amount.toFixed(2))
+  return `${rounded > 0 ? '+' : rounded < 0 ? '-' : ''}$${Math.abs(rounded).toFixed(2)}`
 }
 
 function FormulaHelp({ compact = false, inline = false }: { compact?: boolean; inline?: boolean }): JSX.Element {
@@ -2807,7 +2834,7 @@ function HistoryModal({
                   <div><span className="history-venue">Polymarket <Direction direction={order.polymarket.direction} /></span><strong>{order.polymarket.entryFill ? `${order.polymarket.entryFill.quantity}份 @ ${money(order.polymarket.entryFill.averagePrice, 4)}` : '未成交'}</strong><small>目标对冲 {money(order.polymarket.targetQuantity ?? order.mexc.entryFill?.quantity ?? '0', 2)}份</small>{orderIds.polymarket && <small className="history-order-id" title={orderIds.polymarket}>订单号 {orderIds.polymarket}</small>}{order.polymarket.closeFills.at(-1) && <small>最近卖出 @ {money(order.polymarket.closeFills.at(-1)!.averagePrice, 4)}</small>}<small>记录剩余 {money(order.polymarket.openQuantity, 2)}份</small></div>
                   <div>{order.hedgeOutcome
                     ? <><span>正常互斥结算（保守）</span><strong>最低 {signedUsd(order.hedgeOutcome.worstPnl)}</strong><small>MEXC方向胜 {signedUsd(order.hedgeOutcome.mexcDirectionPnl)} · Poly方向胜 {signedUsd(order.hedgeOutcome.polymarketDirectionPnl)}</small><small>{order.hedgeOutcome.safe ? order.hedgeOutcome.meetsProfitTarget ? '达到利润门槛' : '双边不亏，但最低利润低于开仓门槛' : '至少一种正常结算结果可能亏损'}</small></>
-                    : <><span>预计本金 / 利润</span><strong>${money(order.expectedCapital)} / {Number(order.expectedProfit) >= 0 ? '+' : ''}${money(order.expectedProfit)}</strong><small>{order.mode === 'SIMULATION' ? '模拟' : '实盘记录'}</small></>}</div>
+                    : <><span>预计本金 / 利润</span><strong>${money(order.expectedCapital)} / {signedUsd(order.expectedProfit)}</strong><small>{order.mode === 'SIMULATION' ? '模拟' : '实盘记录'}</small></>}</div>
                 </div>
                 {order.hedgeOutcome && Number(order.hedgeOutcome.quantityDifference) !== 0 && <p className={`history-hedge-outcome ${order.hedgeOutcome.safe ? 'safe' : 'unsafe'}`}><Info aria-hidden="true" />Poly相对MEXC {Number(order.hedgeOutcome.quantityDifference) >= 0 ? '+' : ''}{money(order.hedgeOutcome.quantityDifference, 2)}份；{order.hedgeOutcome.safe ? '正常互斥结算下两种结果均不亏，未自动平仓。' : '至少一种正常结算结果可能亏损，需要恢复或平仓。'}</p>}
                 {order.closeOperation?.error && <p className={`history-error ${order.status === 'EXPIRED' ? 'archived' : ''}`}>{order.status === 'EXPIRED' ? '历史执行备注：' : ''}{order.closeOperation.error}</p>}

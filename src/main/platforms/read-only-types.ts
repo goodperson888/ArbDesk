@@ -23,6 +23,12 @@ export interface ReadOnlyWindowQuote {
   feeRateBps?: number
   feeVerified: boolean
   resolution: ResolutionFingerprint
+  /** Values used only for settlement-distance protection, never as an order-book quote. */
+  settlementObservation?: {
+    baselineValue: string
+    currentValue: string
+    observedAt: number
+  }
   outcomes: Partial<Record<Direction, ReadOnlyOutcomeQuote>>
 }
 

@@ -11,6 +11,7 @@ export interface MultiVenueEntryGateArgs {
   executionIdle: boolean
   kalshiReady?: boolean
   gateReady: boolean
+  allowDoubleWinEntry?: boolean
 }
 
 export function gateDurationExecutionReady(summary: GateOrderCaptureSummary | undefined, durationMinutes: number): boolean {
@@ -21,6 +22,15 @@ export function gateDurationExecutionReady(summary: GateOrderCaptureSummary | un
 export function buildMultiVenueEntryGateReport(args: MultiVenueEntryGateArgs): EntryGateReport {
   const unprotected = args.settings.mode === 'ASSISTED' && args.settings.unprotectedExecutionEnabled === true
   const supportedRoute = args.comparison.legs.length === 2 && args.comparison.legs.every((leg) => isMultiVenueExecutionVenue(leg.venueId))
+  const doubleWinConsented = args.comparison.doubleWinEntryEligible === true && args.allowDoubleWinEntry === true
+  const settlementRiskPassed = args.comparison.settlementRiskPassed === undefined
+    ? args.comparison.matchClass === 'EXACT'
+    : args.comparison.settlementRiskPassed === true || doubleWinConsented
+  const settlementLabel = doubleWinConsented
+    ? `已确认反向双赢开仓；安全距离 ${args.comparison.settlementDistanceBps ?? '—'} ≥ ${args.comparison.requiredSettlementDistanceBps ?? '—'} bps`
+    : settlementRiskPassed
+      ? `动态安全距离通过：${args.comparison.settlementDistanceBps ?? '—'} ≥ ${args.comparison.requiredSettlementDistanceBps ?? '—'} bps`
+      : args.comparison.settlementRiskReason ?? '无法验证动态安全距离'
   const unsupportedVenue = args.comparison.legs.find((leg) => !isMultiVenueExecutionVenue(leg.venueId))?.venueId
   const unsupportedReason = unsupportedVenue === 'LIMITLESS'
       ? 'Limitless 当前只读，尚未开放实盘执行'
@@ -79,6 +89,9 @@ export function buildMultiVenueEntryGateReport(args: MultiVenueEntryGateArgs): E
         }
       : args.settings.manualExecutionConditions,
     executionIdle: args.executionIdle,
+    settlementRiskPassed,
+    settlementRiskLabel: settlementLabel,
+    settlementRiskBlockReason: args.comparison.settlementRiskReason ?? '动态安全距离未通过',
     depthLimitApplicable: !unprotected,
     readiness,
     legs: args.comparison.legs.map((leg) => ({

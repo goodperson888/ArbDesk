@@ -124,7 +124,9 @@ function buildComparison(opportunity: Opportunity, settings: RiskSettings, now: 
         direction: opportunity.mexcDirection,
         price: opportunity.mexcPrice,
         availableQuantity: opportunity.mexcAvailableQuantity,
-        quoteAgeMs: opportunity.mexcQuoteAgeMs
+        quoteAgeMs: opportunity.mexcQuoteAgeMs,
+        settlementSignal: opportunity.mexcSignal,
+        settlementDistanceBps: opportunity.mexcDistanceBps
       },
       {
         venueId: polymarketVenue.id,
@@ -132,7 +134,9 @@ function buildComparison(opportunity: Opportunity, settings: RiskSettings, now: 
         direction: opportunity.polymarketDirection,
         price: opportunity.polymarketPrice,
         availableQuantity: opportunity.polymarketAvailableQuantity,
-        quoteAgeMs: opportunity.polymarketQuoteAgeMs
+        quoteAgeMs: opportunity.polymarketQuoteAgeMs,
+        settlementSignal: opportunity.polymarketSignal,
+        settlementDistanceBps: opportunity.polymarketDistanceBps
       }
     ],
     allInCostPerShare: opportunity.allInCostPerShare,
@@ -150,7 +154,13 @@ function buildComparison(opportunity: Opportunity, settings: RiskSettings, now: 
       polymarketVenue.id,
       opportunity.polymarketDirection
     ].join(':'),
-    blockReasons
+    blockReasons,
+    settlementScenario: opportunity.settlementScenario,
+    settlementRiskPassed: !opportunity.settlementRiskBlocked,
+    settlementRiskReason: opportunity.settlementRiskReason,
+    settlementDistanceBps: opportunity.settlementDistanceBps,
+    requiredSettlementDistanceBps: opportunity.requiredSettlementDistanceBps,
+    doubleWinEntryEligible: opportunity.doubleWinEntryEligible
   }
 }
 

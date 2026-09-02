@@ -93,13 +93,24 @@ export function calculateOpportunity(input: OpportunityInput): Opportunity {
   const signalsAvailable = Boolean(input.mexcSignal && input.polymarketSignal)
   const signalsDisagree = signalsAvailable && input.mexcSignal !== input.polymarketSignal
   const tooCloseToBaseline = signalsAvailable && (mexcDistance.abs().lt(minimumDistance) || polymarketDistance.abs().lt(minimumDistance))
-  const settlementRiskBlocked = !signalsAvailable || signalsDisagree || tooCloseToBaseline
+  const polymarketDirection = opposite(input.mexcDirection)
+  const settlementScenario = !signalsAvailable
+    ? 'UNKNOWN'
+    : !signalsDisagree
+      ? 'SINGLE_WIN'
+      : input.mexcSignal === input.mexcDirection && input.polymarketSignal === polymarketDirection
+        ? 'DOUBLE_WIN'
+        : 'DOUBLE_LOSS'
+  const doubleWinEntryEligible = settlementScenario === 'DOUBLE_WIN' && !tooCloseToBaseline
+  const settlementRiskBlocked = !signalsAvailable || settlementScenario !== 'SINGLE_WIN' || tooCloseToBaseline
   const settlementRiskReason = !signalsAvailable
       ? `结算信号不完整：${input.settlementSignalMissingReason ?? '缺少平台基准价、实时指数价或有效更新时间'}`
-    : signalsDisagree
-      ? `结算信号分歧（不是对冲腿方向）：MEXC ${input.mexcSignal} / Polymarket ${input.polymarketSignal}`
-      : tooCloseToBaseline
+    : tooCloseToBaseline
         ? `距离基准价不足动态门槛 ${minimumDistance.toFixed(2)} bps（当前较近一侧 ${settlementDistance.toFixed(2)} bps）`
+      : settlementScenario === 'DOUBLE_WIN'
+        ? `结算信号分歧：当前方向位于双赢区间；需用户明确选择“反向双赢开仓”后才可执行`
+      : settlementScenario === 'DOUBLE_LOSS'
+        ? `结算信号分歧：当前方向存在双输风险：MEXC ${input.mexcSignal} / Polymarket ${input.polymarketSignal}`
         : undefined
 
   if (matchClass !== 'EXACT') riskFlags.push('两个平台结算源不同，不属于保证锁利')
@@ -118,7 +129,7 @@ export function calculateOpportunity(input: OpportunityInput): Opportunity {
     startTime: input.startTime,
     endTime: input.endTime,
     mexcDirection: input.mexcDirection,
-    polymarketDirection: opposite(input.mexcDirection),
+    polymarketDirection,
     polymarketTokenId: input.polymarketTokenId,
     polymarketMinOrderSize: new Decimal(input.polymarketMinOrderSize ?? '1').toString(),
     mexcPrice: mexcPrice.toFixed(4),
@@ -155,6 +166,8 @@ export function calculateOpportunity(input: OpportunityInput): Opportunity {
     polymarketDistanceBps: input.polymarketDistanceBps,
     settlementDistanceBps: settlementDistance.toFixed(4),
     requiredSettlementDistanceBps: minimumDistance.toFixed(4),
+    settlementScenario,
+    doubleWinEntryEligible,
     matchClass,
     stale,
     riskFlags

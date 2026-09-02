@@ -104,6 +104,7 @@ export type MultiVenueStrategy =
 export type MultiVenueMatchClass = 'EXACT' | 'COVERED' | 'CONDITIONAL' | 'CORRELATED' | 'INCOMPATIBLE'
 export type MultiVenueComparisonStatus = 'EXECUTABLE' | 'MANUAL_EXECUTABLE' | 'NO_EDGE' | 'BLOCKED' | 'STALE'
 export type MultiVenueExecutionProvider = 'LEGACY_MEXC_POLY' | 'MULTI_VENUE'
+export type SettlementScenario = 'SINGLE_WIN' | 'DOUBLE_WIN' | 'DOUBLE_LOSS' | 'UNKNOWN'
 
 export interface MultiVenueLeg {
   venueId: VenueId
@@ -114,6 +115,8 @@ export interface MultiVenueLeg {
   price: string
   availableQuantity: string
   quoteAgeMs: number
+  settlementSignal?: CanonicalDirection
+  settlementDistanceBps?: string
 }
 
 export interface MultiVenueComparison {
@@ -137,6 +140,12 @@ export interface MultiVenueComparison {
   autoOrderPotentialProfit: string
   fixedSortKey: string
   blockReasons: string[]
+  settlementScenario?: SettlementScenario
+  settlementRiskPassed?: boolean
+  settlementRiskReason?: string
+  settlementDistanceBps?: string
+  requiredSettlementDistanceBps?: string
+  doubleWinEntryEligible?: boolean
 }
 
 export interface MultiVenueBoardSnapshot {
@@ -177,6 +186,8 @@ export interface MultiVenueExecutionCommand {
   comparisonId: string
   quantity: string
   confirmed: boolean
+  /** Explicit, per-click consent for a route currently inside its double-win interval. */
+  allowDoubleWinEntry?: boolean
 }
 
 export interface MultiVenueExecutionLegReceipt {

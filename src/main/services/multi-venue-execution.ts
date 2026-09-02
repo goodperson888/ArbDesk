@@ -93,6 +93,7 @@ export class MultiVenueExecutionService {
       if (!comparison) throw new Error('机会已变化或不再存在，请重新选择后下单')
       if (comparison.executionProvider !== 'MULTI_VENUE' || comparison.legs.length !== 2) throw new Error('当前机会不是可执行的多平台双腿路线')
       const unprotected = settings.unprotectedExecutionEnabled === true
+      const doubleWinConsented = comparison.doubleWinEntryEligible === true && command.allowDoubleWinEntry === true
       const requestLegs: [MultiVenueExecutionLegRequest, MultiVenueExecutionLegRequest] = [
         { ...comparison.legs[0] },
         { ...comparison.legs[1] }
@@ -146,6 +147,15 @@ export class MultiVenueExecutionService {
             }
           : settings.manualExecutionConditions,
         executionIdle: true,
+        settlementRiskPassed: comparison.settlementRiskPassed === undefined
+          ? comparison.matchClass === 'EXACT'
+          : comparison.settlementRiskPassed === true || doubleWinConsented,
+        settlementRiskLabel: doubleWinConsented
+          ? `已确认反向双赢开仓；安全距离 ${comparison.settlementDistanceBps ?? '—'} ≥ ${comparison.requiredSettlementDistanceBps ?? '—'} bps`
+          : comparison.settlementRiskPassed
+            ? `动态安全距离通过：${comparison.settlementDistanceBps ?? '—'} ≥ ${comparison.requiredSettlementDistanceBps ?? '—'} bps`
+            : comparison.settlementRiskReason ?? '无法验证动态安全距离',
+        settlementRiskBlockReason: comparison.settlementRiskReason ?? '动态安全距离未通过',
         depthLimitApplicable: !unprotected,
         readiness,
         legs: requestLegs.map((leg) => ({
