@@ -34,7 +34,7 @@ interface SettlementRouteAssessment {
   scenario: SettlementScenario
   riskPassed: boolean
   reason?: string
-  distanceBps: string
+  distanceBps?: string
   requiredDistanceBps: string
   doubleWinEntryEligible: boolean
   left: SettlementLegAssessment
@@ -89,7 +89,7 @@ function assessSettlement(route: BidirectionalRoute, settings: RiskSettings, now
     scenario,
     riskPassed: signalsAvailable && !tooClose && scenario === 'SINGLE_WIN',
     reason,
-    distanceBps: distance.toFixed(4),
+    distanceBps: signalsAvailable ? distance.toFixed(4) : undefined,
     requiredDistanceBps: required.toFixed(4),
     doubleWinEntryEligible,
     left,

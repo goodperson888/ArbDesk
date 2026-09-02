@@ -164,7 +164,7 @@ export function calculateOpportunity(input: OpportunityInput): Opportunity {
     polymarketSignal: input.polymarketSignal,
     mexcDistanceBps: input.mexcDistanceBps,
     polymarketDistanceBps: input.polymarketDistanceBps,
-    settlementDistanceBps: settlementDistance.toFixed(4),
+    settlementDistanceBps: signalsAvailable ? settlementDistance.toFixed(4) : '',
     requiredSettlementDistanceBps: minimumDistance.toFixed(4),
     settlementScenario,
     doubleWinEntryEligible,
