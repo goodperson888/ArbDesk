@@ -137,6 +137,7 @@ const CALIBRATION_LABELS: Record<MexcCalibrationKind, string> = {
 }
 
 function money(value: string, digits = 2): string {
+  if (value.trim() === '') return '—'
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed.toFixed(digits) : '—'
 }
