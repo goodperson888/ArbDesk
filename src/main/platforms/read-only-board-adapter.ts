@@ -11,6 +11,7 @@ import { profileAllowsWindow } from '../services/market-profile'
 function mexcResolution(window: MexcWindowQuote): ResolutionFingerprint {
   return {
     asset: 'BTC/USD', startTime: window.startTime, endTime: window.endTime,
+    baselineValue: window.baselinePrice,
     baselineSource: 'MEXC:PLATFORM_RULE', settlementSource: 'MEXC:PLATFORM_RULE',
     observationMethod: 'MEXC prediction market settlement rule', comparisonOperator: 'GT', tieOutcome: 'DOWN',
     voidRule: 'Platform rule', staleDataRule: 'Platform rule', timezone: 'UTC', ruleVersion: 'mexc-legacy-live'
@@ -20,6 +21,7 @@ function mexcResolution(window: MexcWindowQuote): ResolutionFingerprint {
 function polymarketResolution(window: PolymarketWindowQuote): ResolutionFingerprint {
   return {
     asset: 'BTC/USD', startTime: window.startTime, endTime: window.endTime,
+    baselineValue: window.baselinePrice,
     baselineSource: 'CHAINLINK:BTC/USD_TWAP_60S', settlementSource: 'CHAINLINK:BTC/USD_TWAP_60S',
     observationMethod: 'Polymarket opening and settlement Chainlink-computed 60-second TWAP', comparisonOperator: 'GTE', tieOutcome: 'UP',
     voidRule: 'Polymarket market rule', staleDataRule: 'Polymarket market rule', timezone: 'UTC',

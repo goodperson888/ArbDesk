@@ -47,6 +47,14 @@ interface KalshiMarket {
   status?: string
   exchange_index?: number
   exchangeIndex?: number
+  strike_type?: string
+  strikeType?: string
+  floor_strike?: number | string
+  floorStrike?: number | string
+  cap_strike?: number | string
+  capStrike?: number | string
+  functional_strike?: string
+  functionalStrike?: string
 }
 
 interface KalshiMarketsResponse { markets?: KalshiMarket[] }
@@ -66,6 +74,7 @@ interface Candidate {
   endTime: number
   durationMinutes: 5 | 15
   exchangeIndex?: number
+  baselinePrice?: string
 }
 
 function timestamp(value: unknown): number | undefined {
@@ -84,6 +93,11 @@ function directionFromText(text: string): Direction | undefined {
   if (/(?:\bup\b|\bhigher\b|\babove\b|\brise\w*\b|\bincrease\w*\b|\bpositive\b|上涨|上升)/i.test(text)) return 'UP'
   if (/(?:\bdown\b|\blower\b|\bbelow\b|\bfall\w*\b|\bdecrease\w*\b|\bnegative\b|下跌|下降)/i.test(text)) return 'DOWN'
   return undefined
+}
+
+function positiveStrike(value: unknown): string | undefined {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? String(value) : undefined
 }
 
 export function parseKalshiCandidate(market: KalshiMarket): Candidate | undefined {
@@ -105,7 +119,8 @@ export function parseKalshiCandidate(market: KalshiMarket): Candidate | undefine
   if (durationMinutes !== 15 || !yesDirection) return undefined
   const rawExchangeIndex = Number(market.exchange_index ?? market.exchangeIndex)
   const exchangeIndex = Number.isInteger(rawExchangeIndex) && rawExchangeIndex >= 0 ? rawExchangeIndex : undefined
-  return { market, ticker, yesDirection, startTime, endTime, durationMinutes, exchangeIndex }
+  const baselinePrice = positiveStrike(market.floor_strike ?? market.floorStrike ?? market.functional_strike ?? market.functionalStrike)
+  return { market, ticker, yesDirection, startTime, endTime, durationMinutes, exchangeIndex, baselinePrice }
 }
 
 function decimalPrice(value: string): number | undefined {
@@ -131,6 +146,7 @@ function quote(direction: Direction, outcomeId: string, levels: OrderBookLevel[]
 function resolution(candidate: Candidate): ResolutionFingerprint {
   return {
     asset: 'BTC/USD', startTime: candidate.startTime, endTime: candidate.endTime,
+    baselineValue: candidate.baselinePrice,
     baselineSource: 'KALSHI:MARKET_RULE', settlementSource: 'KALSHI:MARKET_RULE',
     observationMethod: candidate.market.rules_primary?.slice(0, 300) || 'Kalshi market contract rule',
     comparisonOperator: 'GTE', tieOutcome: 'UP', voidRule: 'Kalshi market contract rule',

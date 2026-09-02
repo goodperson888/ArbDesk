@@ -126,6 +126,28 @@ describe('PredictFunMarketData', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
+  it('joins the Predict Chainlink price stream with the category startPrice', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-21T11:32:00.000Z'))
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+    const category = {
+      slug: 'btc-updown-5m-1787311800', startsAt: '2026-08-21T11:30:00.000Z', endsAt: '2026-08-21T11:35:00.000Z',
+      status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN',
+      variantDetails: { crypto: { priceFeedProvider: 'CHAINLINK', priceFeedId: '1', priceFeedSymbol: 'BTC/USD', startPrice: 80400 } },
+      markets: [{ id: 42, tradingStatus: 'OPEN', outcomes: [{ name: 'Up', index: 1, onChainId: 'up' }, { name: 'Down', index: 2, onChainId: 'down' }] }]
+    }
+    capture.emitResponse('https://api.predict.fun/v1/categories?status=OPEN', { success: true, data: [category] })
+    capture.emitResponse('https://api.predict.fun/v1/markets/42/orderbook', {
+      success: true, data: { marketId: 42, updateTimestampMs: Date.now(), asks: [[0.61, 10]], bids: [[0.54, 12]] }
+    })
+    expect(source.getLatestWindows()[0].settlementObservation).toBeUndefined()
+    capture.emitFrame({ type: 'M', topic: 'chainlinkAssetPriceUpdate/1', data: { price: 80435.42, priceFeedId: 1, publishTime: 1787311920 } })
+    expect(source.getLatestWindows()[0].settlementObservation).toEqual({ baselineValue: '80400', currentValue: '80435.42', observedAt: Date.now() })
+    vi.useRealTimers()
+  })
+
   it('binds an early passive websocket frame to the rolling page slug before the directory arrives', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-28T00:34:00.000Z'))

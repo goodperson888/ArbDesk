@@ -53,6 +53,9 @@ interface PredictVariant {
   priceFeedProvider?: string
   priceFeedId?: string
   priceFeedSymbol?: string
+  /** Crypto up/down categories expose the opening and closing oracle values. */
+  startPrice?: number | string
+  endPrice?: number | string
 }
 
 interface PredictCategory {
@@ -504,6 +507,16 @@ function categoryCryptoData(category: PredictCategory): PredictVariant {
   return { ...(category.variantDetails?.crypto ?? {}), ...(category.variantData ?? {}) }
 }
 
+function positivePrice(value: unknown): string | undefined {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? String(value) : undefined
+}
+
+interface PredictOracleObservation {
+  value: string
+  observedAt: number
+}
+
 function assetSymbol(category: PredictCategory): string {
   return (categoryCryptoData(category).priceFeedSymbol ?? `${category.slug ?? ''} ${category.description ?? ''}`)
     .toUpperCase().replace(/[/_-]/g, '')
@@ -699,7 +712,7 @@ function mergeCapturedCategory(previous: PredictCategory | undefined, incoming: 
   }
 }
 
-function parseCategory(category: PredictCategory, market: PredictMarket, book: PredictBookResponse, receivedAt: number, observedAt = receivedAt): ReadOnlyWindowQuote | undefined {
+function parseCategory(category: PredictCategory, market: PredictMarket, book: PredictBookResponse, receivedAt: number, observedAt = receivedAt, oracle?: PredictOracleObservation, baselineOverride?: string): ReadOnlyWindowQuote | undefined {
   const window = categoryWindowTimes(category)
   const startTime = window?.startTime ?? Number.NaN
   const endTime = window?.endTime ?? Number.NaN
@@ -718,16 +731,20 @@ function parseCategory(category: PredictCategory, market: PredictMarket, book: P
   const feedId = crypto.priceFeedId ?? 'unknown'
   const feedSymbol = crypto.priceFeedSymbol ?? 'BTCUSDT'
   const feedProvider = crypto.priceFeedProvider ?? category.resolutionProvider ?? 'UNKNOWN'
+  const baselineValue = positivePrice(crypto.startPrice) ?? baselineOverride
   return {
     venueId: 'PREDICT_FUN', marketId: String(market.id), asset: 'BTC/USD', durationMinutes: duration,
     startTime, endTime, feeRateBps: Number(market.feeRateBps ?? 0), feeVerified: false,
     resolution: {
-      asset: 'BTC/USD', startTime, endTime, baselineSource: `${feedProvider}:${feedId}`,
+      asset: 'BTC/USD', startTime, endTime, baselineValue, baselineSource: `${feedProvider}:${feedId}`,
       settlementSource: `${feedProvider}:${feedId}`, observationMethod: `${feedSymbol} 5m candle close immediately before end`,
       comparisonOperator: 'GT', tieOutcome: 'SPLIT', voidRule: 'Unavailable Chainlink data: consensus of reliable sources',
       staleDataRule: 'Fallback to consensus of reliable sources', timezone: 'UTC',
       ruleVersion: 'predict-crypto-up-down-chainlink-v1', evidenceUrl: `https://predict.fun/market/${market.id}`
     },
+    settlementObservation: baselineValue && oracle ? {
+      baselineValue, currentValue: oracle.value, observedAt: oracle.observedAt
+    } : undefined,
     outcomes: { ...(up ? { UP: up } : {}), ...(down ? { DOWN: down } : {}) }
   }
 }
@@ -744,6 +761,8 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private socketApiKey = ''
   private desiredTopics = new Set<string>()
   private activeTopics = new Set<string>()
+  private oracleObservations = new Map<string, PredictOracleObservation>()
+  private oracleBaselines = new Map<string, string>()
   private marketContexts = new Map<string, { category: PredictCategory; market: PredictMarket }>()
   private reconnectTimer?: NodeJS.Timeout
   private reconnectAttempt = 0
@@ -864,6 +883,8 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     this.discovery = undefined
     this.snapshot = undefined
     this.lastRestBookAt = 0
+    this.oracleObservations.clear()
+    this.oracleBaselines.clear()
   }
 
   async openPageCapture(): Promise<void> {
@@ -879,6 +900,8 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       this.discovery = undefined
       this.snapshot = undefined
       this.marketContexts.clear()
+      this.oracleObservations.clear()
+      this.oracleBaselines.clear()
       this.emitMarketData()
     }
   }
@@ -979,7 +1002,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         if (!market.id) return undefined
         const book = await this.fetchJson<PredictBookResponse>(`${this.apiBase}/v1/markets/${market.id}/orderbook`, apiKey, signal)
         const observedAt = Date.now()
-        return parseCategory(category, market, book, receivedAtFromBook(book.data?.updateTimestampMs, observedAt), observedAt)
+        return this.parseCategoryWindow(category, market, book, receivedAtFromBook(book.data?.updateTimestampMs, observedAt), observedAt)
       }))
       for (const result of results) {
         if (result.status === 'fulfilled' && result.value) current.set(result.value.marketId, result.value)
@@ -1004,14 +1027,78 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     }
   }
 
+  private parseCategoryWindow(category: PredictCategory, market: PredictMarket, book: PredictBookResponse, receivedAt: number, observedAt: number): ReadOnlyWindowQuote | undefined {
+    const crypto = categoryCryptoData(category)
+    const feedId = crypto.priceFeedId
+    // Passive page contexts can omit priceFeedId even though the page's
+    // Chainlink topic is unambiguous. Use the sole observed feed as a
+    // fallback; if multiple feeds exist, stay conservative and leave it
+    // missing rather than attaching another asset's price.
+    const oracle = feedId
+      ? this.oracleObservations.get(feedId)
+      : this.oracleObservations.size === 1 ? [...this.oracleObservations.values()][0] : undefined
+    const window = categoryWindowTimes(category)
+    const baselineOverride = window
+      ? feedId
+        ? this.oracleBaselines.get(`${feedId}:${window.startTime}`)
+        : this.oracleBaselines.size === 1 ? [...this.oracleBaselines.values()][0] : undefined
+      : undefined
+    return parseCategory(category, market, book, receivedAt, observedAt, oracle, baselineOverride)
+  }
+
+  private handleOracleUpdate(feedIdFromTopic: string, rawData: unknown, receivedAt: number): void {
+    const data = typeof rawData === 'string'
+      ? (() => { try { return JSON.parse(rawData) as unknown } catch { return undefined } })()
+      : rawData
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return
+    const record = data as Record<string, unknown>
+    const value = positivePrice(record.price ?? record.value ?? record.currentPrice)
+    if (!value) return
+    const feedId = String(record.priceFeedId ?? record.feedId ?? feedIdFromTopic)
+    const sourceRaw = Number(record.publishTime ?? record.timestamp)
+    const sourceAt = Number.isFinite(sourceRaw) && sourceRaw > 0
+      ? (sourceRaw < 100_000_000_000 ? Math.round(sourceRaw * 1_000) : Math.round(sourceRaw))
+      : receivedAt
+    this.oracleObservations.set(feedId, { value, observedAt: receivedAt })
+
+    // A page-only response can omit startPrice. Only infer it from an oracle
+    // tick that is actually at the category boundary; never use the first
+    // mid-round tick as a fake baseline.
+    for (const { category } of this.marketContexts.values()) {
+      const crypto = categoryCryptoData(category)
+      if (crypto.priceFeedId && String(crypto.priceFeedId) !== feedId || positivePrice(crypto.startPrice)) continue
+      const window = categoryWindowTimes(category)
+      if (window && Math.abs(sourceAt - window.startTime) <= 3_000) this.oracleBaselines.set(`${feedId}:${window.startTime}`, value)
+    }
+
+    const windows = (this.snapshot?.windows ?? []).map((window) => {
+      const context = this.marketContexts.get(window.marketId)
+      if (!context) return window
+      const crypto = categoryCryptoData(context.category)
+      if (crypto.priceFeedId && String(crypto.priceFeedId) !== feedId) return window
+      const baseline = positivePrice(crypto.startPrice) ?? this.oracleBaselines.get(`${feedId}:${window.startTime}`)
+      return baseline ? { ...window, settlementObservation: { baselineValue: baseline, currentValue: value, observedAt: receivedAt } } : window
+    })
+    if (this.snapshot) this.snapshot = { fetchedAt: Date.now(), windows }
+    this.status = {
+      ...this.status, connectionState: 'CONNECTED', updatedAt: receivedAt,
+      message: `Predict.fun Chainlink 实时价已接收（feed ${feedId}=${value}）；${windows.filter((window) => window.settlementObservation).length} 个窗口已补齐基准/当前价`
+    }
+    this.emitMarketData()
+  }
+
   private ensureMarketStream(candidates: Array<{ category: PredictCategory; market: PredictMarket }>, apiKey: string): void {
     if (this.options.enableStreaming === false || !this.monitoringEnabled) return
     this.marketContexts = new Map(candidates.flatMap((context) => context.market.id ? [[String(context.market.id), context]] : []))
+    const oracleTopics = candidates.flatMap(({ category }) => {
+      const feedId = categoryCryptoData(category).priceFeedId
+      return feedId ? [`chainlinkAssetPriceUpdate/${feedId}`] : []
+    })
     this.desiredTopics = new Set([...this.marketContexts.keys()].flatMap((marketId) => [
       `predictOrderbook/${marketId}`,
       `predictTradingStatus/${marketId}`,
       `predictMarketStatus/${marketId}`
-    ]))
+    ]).concat(oracleTopics))
     if (this.socket && this.socketApiKey === apiKey) {
       if (this.socket.readyState === WebSocket.OPEN) this.syncSubscriptions()
       return
@@ -1102,6 +1189,11 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       if (officialSocket) this.sendStreamRequest({ method: 'heartbeat', data: message.data })
       return
     }
+    const oracleMatch = /^chainlinkAssetPriceUpdate\/([^/]+)$/i.exec(message.topic)
+    if (oracleMatch) {
+      this.handleOracleUpdate(oracleMatch[1], message.data, observedAt)
+      return
+    }
     const orderbookMatch = /(?:predict)?order[._:/-]?book[/:](\d+)$|^(\d+)[/:](?:predict)?order[._:/-]?book$/i.exec(message.topic)
     const looksLikeOrderbook = Boolean(orderbookMatch) || looksLikeOrderbookTopic(message.topic)
     const parsedData = typeof message.data === 'string'
@@ -1171,7 +1263,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
         return
       }
       const book = { success: true, data: bookRecord as PredictBookResponse['data'] }
-      const parsed = parseCategory(context.category, context.market, book, receivedAtFromBook(book.data?.updateTimestampMs, observedAt), observedAt)
+      const parsed = this.parseCategoryWindow(context.category, context.market, book, receivedAtFromBook(book.data?.updateTimestampMs, observedAt), observedAt)
       if (!parsed) {
         if (!officialSocket) {
           this.passiveParseRejectedCount += 1
@@ -1288,7 +1380,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       // UI can show the market instead of reporting "无市场" while the page
       // itself is publishing prices through GraphQL.
       const embeddedWindows = candidates.flatMap(({ category, market }) => {
-        const parsed = parseCategory(category, market, { success: true, data: {} }, receivedAt, receivedAt)
+        const parsed = this.parseCategoryWindow(category, market, { success: true, data: {} }, receivedAt, receivedAt)
         return parsed && Object.keys(parsed.outcomes).length > 0 ? [parsed] : []
       })
       if (embeddedWindows.length > 0) {
@@ -1325,7 +1417,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     const context = this.marketContexts.get(orderbookMatch[1])
     if (!context) return
     const book = body as PredictBookResponse
-    const parsed = parseCategory(context.category, context.market, book, receivedAtFromBook(book.data?.updateTimestampMs, receivedAt), receivedAt)
+    const parsed = this.parseCategoryWindow(context.category, context.market, book, receivedAtFromBook(book.data?.updateTimestampMs, receivedAt), receivedAt)
     if (parsed) this.applyCapturedWindow(parsed, receivedAt)
   }
 

@@ -62,6 +62,28 @@ describe('GateMarketData', () => {
     expect(source.getLatestWindows()[0].resolution).toMatchObject({ comparisonOperator: 'GTE', tieOutcome: 'UP' })
   })
 
+  it('joins Gate CPI oracle updates to the matching 5m window for settlement distance', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-22T01:32:00.000Z'))
+    const capture = new FakeGateCapture()
+    const source = new GateMarketData(capture)
+    await source.fetchWindows()
+    capture.emitResponse({ data: [{
+      eventId: 'btc-5m-cpi', symbol: 'BTC_USDT', period: '5min',
+      startTime: '2026-08-22T01:30:00.000Z', endTime: '2026-08-22T01:35:00.000Z',
+      baselinePrice: '80400',
+      outcomes: [{ id: 'up-contract', name: 'Up', asks: [[0.57, 20]] }, { id: 'down-contract', name: 'Down', asks: [[0.44, 12]] }]
+    }] })
+    capture.emitFrame({ channel: 'pred.poly.cpi', event: 'update', result: {
+      src: '5m', sym: 'btcusdt', p: '80435.4193588353', cp: '80435.42', pt: '1787362320000', t: 1787362320000
+    }})
+
+    expect(source.getLatestWindows()[0].settlementObservation).toEqual({
+      baselineValue: '80400', currentValue: '80435.4193588353', observedAt: Date.now()
+    })
+    vi.useRealTimers()
+  })
+
   it('parses the live Gate contract-events list shape without inventing depth', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date(1_787_328_840_000))

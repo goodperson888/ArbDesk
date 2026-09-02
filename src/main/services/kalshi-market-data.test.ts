@@ -49,6 +49,14 @@ describe('Kalshi market normalization', () => {
     expect(candidate).toMatchObject({ durationMinutes: 15, yesDirection: 'UP', exchangeIndex: 2 })
   })
 
+  it('keeps the official numeric strike as the contract baseline', () => {
+    expect(parseKalshiCandidate({
+      ticker: 'KXBTC15M-26AUG230330-30', market_type: 'binary', status: 'active',
+      floor_strike: 80400,
+      open_time: '2026-08-23T03:15:00.000Z', close_time: '2026-08-23T03:30:00.000Z'
+    })).toMatchObject({ baselinePrice: '80400' })
+  })
+
   it('keeps an unchanged quote fresh while the Kalshi page WebSocket remains active', () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-25T04:50:00.000Z'))

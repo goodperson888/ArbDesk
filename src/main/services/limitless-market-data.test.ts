@@ -33,7 +33,7 @@ describe('LimitlessMarketData', () => {
       if (url.includes('/markets/active')) return new Response(JSON.stringify({ data: [{
         slug: 'btc-up-or-down-5-min-1787311800', startAt: '2026-08-21T11:30:00.000Z', expirationTimestamp: Date.parse('2026-08-21T11:35:00.000Z'),
         tradeType: 'clob', automationType: 'lumy', tokens: { yes: 'yes-token', no: 'no-token' },
-        metadata: { minutesDeadline: 5, chainlinkDataStream: { pair: 'BTC/USD', feedId: 'feed', toleranceSeconds: 5 } },
+        metadata: { minutesDeadline: 5, openPrice: '80400', chainlinkDataStream: { pair: 'BTC/USD', feedId: 'feed', toleranceSeconds: 5 } },
         priceOracleMetadata: { ticker: 'BTC', chainlinkFeedId: 'feed', chainlinkPair: 'BTC/USD' }
       }] }), { status: 200 })
       return new Response(JSON.stringify({
@@ -50,7 +50,7 @@ describe('LimitlessMarketData', () => {
     expect(first[0]).toMatchObject({ venueId: 'LIMITLESS', durationMinutes: 5, feeVerified: false })
     expect(first[0].outcomes.UP).toMatchObject({ bestAsk: '0.61', askSize: '20' })
     expect(first[0].outcomes.DOWN).toMatchObject({ bestAsk: '0.45', askSize: '30' })
-    expect(first[0].resolution).toMatchObject({ comparisonOperator: 'GTE', tieOutcome: 'UP' })
+    expect(first[0].resolution).toMatchObject({ comparisonOperator: 'GTE', tieOutcome: 'UP', baselineValue: '80400' })
 
     await source.fetchWindows()
     expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -62,7 +62,7 @@ describe('LimitlessMarketData', () => {
     let activeMarkets = [{
       slug: 'btc-5m', startAt: '2026-08-21T11:30:00.000Z', expirationTimestamp: Date.parse('2026-08-21T11:35:00.000Z'),
       tradeType: 'clob', automationType: 'lumy', tokens: { yes: 'yes', no: 'no' },
-      metadata: { minutesDeadline: 5, chainlinkDataStream: { pair: 'BTC/USD', feedId: 'feed' } },
+      metadata: { minutesDeadline: 5, openPrice: '80400', chainlinkDataStream: { pair: 'BTC/USD', feedId: 'feed' } },
       priceOracleMetadata: { ticker: 'BTC' }
     }]
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
@@ -94,6 +94,11 @@ describe('LimitlessMarketData', () => {
     })
     expect(source.getLatestWindows()[0].outcomes.UP?.bestAsk).toBe('0.58')
     expect(listener).toHaveBeenCalled()
+
+    socket.trigger('oraclePriceData', { marketSlug: 'btc-5m', value: 80435.42, timestamp: Date.now() })
+    expect(source.getLatestWindows()[0].settlementObservation).toEqual({
+      baselineValue: '80400', currentValue: '80435.42', observedAt: Date.now()
+    })
 
     activeMarkets = []
     vi.advanceTimersByTime(16_000)

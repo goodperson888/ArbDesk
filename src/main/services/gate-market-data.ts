@@ -9,6 +9,10 @@ interface GateMarketContext {
   startTime: number
   endTime: number
   outcomes: Partial<Record<Direction, ReadOnlyOutcomeQuote>>
+  /** Gate's event catalogue may expose the Chainlink start target. */
+  baselinePrice?: string
+  currentPrice?: string
+  currentObservedAt?: number
   /** Token IDs learned from the event catalogue, including sides with no quote yet. */
   catalogOutcomeIds?: Partial<Record<Direction, string>>
 }
@@ -107,6 +111,29 @@ function decimal(value: unknown): string | undefined {
   const parsed = Number(value)
   if (!Number.isFinite(parsed) || parsed <= 0 || parsed >= 1) return undefined
   return parsed.toString()
+}
+
+function positiveNumber(value: unknown): string | undefined {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? String(value) : undefined
+}
+
+interface GateCpiObservation {
+  duration: 5 | 15
+  value: string
+  sourceAt: number
+}
+
+function parseCpiObservation(payload: unknown): GateCpiObservation | undefined {
+  const root = record(payload)
+  if (String(root?.channel ?? '') !== 'pred.poly.cpi') return undefined
+  const result = record(root?.result)
+  if (!result) return undefined
+  const source = String(result.src ?? '').match(/^(5|15)m$/i)
+  const price = positiveNumber(result.p ?? result.cp ?? result.price)
+  const sourceAt = timestamp(result.pt ?? result.t) ?? 0
+  if (!source || !price || !sourceAt) return undefined
+  return { duration: Number(source[1]) as 5 | 15, value: price, sourceAt }
 }
 
 /**
@@ -265,6 +292,10 @@ export function parseGateMarketObject(source: JsonRecord, receivedAt: number, co
     range = { startTime: range.endTime - parsedDuration * 60_000, endTime: range.endTime }
   }
   const outcomes: Partial<Record<Direction, ReadOnlyOutcomeQuote>> = {}
+  const baselinePrice = positiveNumber(firstValue(source, [
+    'baselinePrice', 'baseline_price', 'startPrice', 'start_price', 'priceToBeat', 'price_to_beat',
+    'targetPrice', 'target_price', 'floorStrike', 'floor_strike', 'functionalStrike', 'functional_strike'
+  ]))
   const catalogTokens = catalogOutcomeIds(source)
   const upPrice = decimal(firstValue(source, ['bullish', 'best_ask', 'outcome_price0']))
   const downPrice = decimal(firstValue(source, ['bearish', 'best_ask_token1', 'outcome_price1']))
@@ -288,7 +319,7 @@ export function parseGateMarketObject(source: JsonRecord, receivedAt: number, co
   // price/size rows walked later.
   const direct = outcomeQuote(source, askLevels(source).length ? pageContext.outcomeDirection : undefined, receivedAt)
   if (direct) outcomes[direct.direction] = direct
-  return { marketId: id, asset: parsedAsset, durationMinutes: parsedDuration, ...range, outcomes, catalogOutcomeIds: catalogTokens }
+  return { marketId: id, asset: parsedAsset, durationMinutes: parsedDuration, ...range, outcomes, baselinePrice, catalogOutcomeIds: catalogTokens }
 }
 
 function walk(value: unknown, visitor: (value: JsonRecord) => void): void {
@@ -326,6 +357,7 @@ function toWindow(context: GateMarketContext): ReadOnlyWindowQuote | undefined {
       asset: context.asset,
       startTime: context.startTime,
       endTime: context.endTime,
+      baselineValue: context.baselinePrice,
       baselineSource: 'CHAINLINK:BTC/USD_START_TARGET',
       settlementSource: 'CHAINLINK:BTC/USD_TWAP',
       observationMethod: 'Gate event contract start target versus Chainlink BTC/USD TWAP at expiry',
@@ -337,6 +369,11 @@ function toWindow(context: GateMarketContext): ReadOnlyWindowQuote | undefined {
       ruleVersion: 'gate-event-contract-chainlink-twap-v1',
       evidenceUrl: 'https://www.gate.com/trade-events'
     },
+    settlementObservation: context.baselinePrice && context.currentPrice && context.currentObservedAt ? {
+      baselineValue: context.baselinePrice,
+      currentValue: context.currentPrice,
+      observedAt: context.currentObservedAt
+    } : undefined,
     outcomes: context.outcomes
   }
 }
@@ -466,6 +503,18 @@ export class GateMarketData implements ReadOnlyVenueSource {
     let changed = transport === 'WebSocket'
       ? this.refreshObservedAt(streamContext.duration, streamContext.marketId, receivedAt)
       : false
+    const cpi = transport === 'WebSocket' ? parseCpiObservation(parsed) : undefined
+    if (cpi) {
+      const active = [...this.contexts.values()]
+        .filter((context) => context.durationMinutes === cpi.duration && context.endTime > receivedAt - 15_000)
+        .sort((left, right) => Math.abs(left.startTime - cpi.sourceAt) - Math.abs(right.startTime - cpi.sourceAt))
+      const target = active.find((context) => cpi.sourceAt >= context.startTime - 15_000 && cpi.sourceAt <= context.endTime + 15_000) ?? active[0]
+      if (target) {
+        target.currentPrice = cpi.value
+        target.currentObservedAt = receivedAt
+        changed = true
+      }
+    }
     let observedPipeline = false
     const frameDuration = transport === 'WebSocket' ? urlContext({ pageUrl, sourceUrl }).duration : undefined
     const restDuration = transport === 'REST' ? urlContext({ pageUrl, sourceUrl }).duration : undefined
@@ -532,6 +581,9 @@ export class GateMarketData implements ReadOnlyVenueSource {
         this.contexts.set(market.marketId, previous ? {
           ...previous,
           ...market,
+          baselinePrice: market.baselinePrice ?? previous.baselinePrice,
+          currentPrice: market.currentPrice ?? previous.currentPrice,
+          currentObservedAt: market.currentObservedAt ?? previous.currentObservedAt,
           outcomes: mergeOutcomeQuotes(previous.outcomes, market.outcomes),
           catalogOutcomeIds: { ...previous.catalogOutcomeIds, ...market.catalogOutcomeIds }
         } : market)

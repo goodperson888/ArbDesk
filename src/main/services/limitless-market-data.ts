@@ -23,6 +23,7 @@ interface LimitlessMarket {
   collateralToken?: { address?: string; decimals?: number; symbol?: string }
   metadata?: {
     minutesDeadline?: number
+    openPrice?: string | number
     chainlinkDataStream?: {
       pair?: string
       feedId?: string
@@ -64,6 +65,8 @@ interface LimitlessBook {
   minSize?: string
 }
 
+interface LimitlessOracleObservation { value: string; observedAt: number }
+
 function validLevel(level: LimitlessLevel): boolean {
   return Number(level.price) > 0 && Number(level.price) < 1 && Number(level.size) > 0
 }
@@ -92,7 +95,7 @@ function outcome(direction: Direction, outcomeId: string, levels: OrderBookLevel
   return { direction, outcomeId, bestAsk: best.price, askSize: best.size, levels, receivedAt }
 }
 
-function parseMarket(market: LimitlessMarket, book: LimitlessBook, receivedAt: number): ReadOnlyWindowQuote | undefined {
+function parseMarket(market: LimitlessMarket, book: LimitlessBook, receivedAt: number, oracle?: LimitlessOracleObservation): ReadOnlyWindowQuote | undefined {
   const duration = Number(market.metadata?.minutesDeadline)
   const startTime = Date.parse(market.startAt ?? '')
   const endTime = Number(market.expirationTimestamp)
@@ -104,16 +107,18 @@ function parseMarket(market: LimitlessMarket, book: LimitlessBook, receivedAt: n
   if (!up && !down) return undefined
   const feedId = market.metadata?.chainlinkDataStream?.feedId ?? market.priceOracleMetadata?.chainlinkFeedId ?? 'unknown'
   const pair = market.metadata?.chainlinkDataStream?.pair ?? market.priceOracleMetadata?.chainlinkPair ?? 'BTC/USD'
+  const baselineValue = Number(market.metadata?.openPrice) > 0 ? String(market.metadata?.openPrice) : undefined
   return {
     venueId: 'LIMITLESS', marketId: market.slug, asset: 'BTC/USD', durationMinutes: duration,
     startTime, endTime, feeVerified: false,
     resolution: {
-      asset: 'BTC/USD', startTime, endTime, baselineSource: `CHAINLINK:${feedId}`,
+      asset: 'BTC/USD', startTime, endTime, baselineValue, baselineSource: `CHAINLINK:${feedId}`,
       settlementSource: `CHAINLINK:${feedId}`, observationMethod: `${pair} exact timestamp; next tick within ${market.metadata?.chainlinkDataStream?.toleranceSeconds ?? 5}s`,
       comparisonOperator: 'GTE', tieOutcome: 'UP', voidRule: 'Long outage: manual closest Chainlink price',
       staleDataRule: 'Next Chainlink price within tolerance, otherwise manual closest price', timezone: 'UTC',
       ruleVersion: 'limitless-lumy-chainlink-v2', evidenceUrl: `https://limitless.exchange/markets/${market.slug}`
     },
+    settlementObservation: baselineValue && oracle ? { baselineValue, currentValue: oracle.value, observedAt: oracle.observedAt } : undefined,
     outcomes: { ...(up ? { UP: up } : {}), ...(down ? { DOWN: down } : {}) }
   }
 }
@@ -131,6 +136,7 @@ export class LimitlessMarketData implements ReadOnlyVenueSource {
   private subscribedSlugs = ''
   private activeSubscriptionKey = ''
   private listeners = new Set<() => void>()
+  private oracleObservations = new Map<string, LimitlessOracleObservation>()
 
   constructor(private readonly options: {
     enableStreaming?: boolean
@@ -180,6 +186,7 @@ export class LimitlessMarketData implements ReadOnlyVenueSource {
       this.socket?.disconnect()
       this.socket = undefined
       this.snapshot = undefined
+      this.oracleObservations.clear()
       this.status = { connectionState: 'DISCONNECTED', message: 'Limitless 监控已暂停，不会主动请求市场数据', marketCount: 0 }
       for (const listener of this.listeners) listener()
     }
@@ -190,6 +197,7 @@ export class LimitlessMarketData implements ReadOnlyVenueSource {
     this.socket = undefined
     this.socketTokenId = ''
     this.activeSubscriptionKey = ''
+    this.oracleObservations.clear()
     socket?.close()
   }
 
@@ -231,7 +239,7 @@ export class LimitlessMarketData implements ReadOnlyVenueSource {
       const results = await Promise.allSettled(booksToFetch.map(async (market) => {
         if (!market.slug) return undefined
         const book = await this.fetchJson<LimitlessBook>(`${API}/markets/${encodeURIComponent(market.slug)}/orderbook`, signal)
-        return parseMarket(market, book, Date.now())
+        return parseMarket(market, book, Date.now(), this.oracleObservations.get(market.slug))
       }))
       for (const result of results) {
         if (result.status === 'fulfilled' && result.value) current.set(result.value.marketId, result.value)
@@ -294,7 +302,7 @@ export class LimitlessMarketData implements ReadOnlyVenueSource {
     socket.on('orderbookUpdate', (event: { marketSlug?: string; orderbook?: LimitlessBook }) => {
       if (this.socket !== socket || !this.monitoringEnabled || !event.marketSlug || !event.orderbook) return
       const market = this.discovery?.markets.find((candidate) => candidate.slug === event.marketSlug)
-      const parsed = market ? parseMarket(market, event.orderbook, Date.now()) : undefined
+      const parsed = market ? parseMarket(market, event.orderbook, Date.now(), this.oracleObservations.get(event.marketSlug)) : undefined
       if (!parsed) return
       const windows = [...(this.snapshot?.windows ?? []).filter((window) => window.marketId !== parsed.marketId), parsed]
         .sort((left, right) => left.startTime - right.startTime || left.durationMinutes - right.durationMinutes)
@@ -303,6 +311,23 @@ export class LimitlessMarketData implements ReadOnlyVenueSource {
         connectionState: 'CONNECTED', marketCount: windows.length, updatedAt: Date.now(),
         message: `WebSocket实时盘口已连接，最近推送 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`
       }
+      this.emitMarketData()
+    })
+    socket.on('oraclePriceData', (event: { marketSlug?: string; value?: number | string; timestamp?: number }) => {
+      if (this.socket !== socket || !this.monitoringEnabled || !event.marketSlug) return
+      const value = Number(event.value)
+      if (!Number.isFinite(value) || value <= 0) return
+      const observedAt = Number.isFinite(Number(event.timestamp)) && Number(event.timestamp) > 0 ? Number(event.timestamp) : Date.now()
+      this.oracleObservations.set(event.marketSlug, { value: String(event.value), observedAt: Math.min(Date.now(), observedAt) })
+      const market = this.discovery?.markets.find((candidate) => candidate.slug === event.marketSlug)
+      if (!market || !this.snapshot) return
+      this.snapshot = {
+        fetchedAt: Date.now(),
+        windows: this.snapshot.windows.map((window) => window.marketId === event.marketSlug && market.metadata?.openPrice
+          ? { ...window, settlementObservation: { baselineValue: String(market.metadata.openPrice), currentValue: String(event.value), observedAt: Math.min(Date.now(), observedAt) } }
+          : window)
+      }
+      this.status = { ...this.status, updatedAt: Date.now(), message: `Limitless Chainlink 实时价已接收（${event.marketSlug}=${event.value}）` }
       this.emitMarketData()
     })
     socket.on('marketCreated', () => {
