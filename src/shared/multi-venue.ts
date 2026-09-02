@@ -146,6 +146,8 @@ export interface MultiVenueComparison {
   settlementDistanceBps?: string
   requiredSettlementDistanceBps?: string
   doubleWinEntryEligible?: boolean
+  /** The matching opposite route is currently eligible to avoid a double-loss interval. */
+  reverseEntryEligible?: boolean
 }
 
 export interface MultiVenueBoardSnapshot {

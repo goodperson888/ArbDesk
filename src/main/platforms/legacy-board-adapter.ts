@@ -160,7 +160,8 @@ function buildComparison(opportunity: Opportunity, settings: RiskSettings, now: 
     settlementRiskReason: opportunity.settlementRiskReason,
     settlementDistanceBps: opportunity.settlementDistanceBps,
     requiredSettlementDistanceBps: opportunity.requiredSettlementDistanceBps,
-    doubleWinEntryEligible: opportunity.doubleWinEntryEligible
+    doubleWinEntryEligible: opportunity.doubleWinEntryEligible,
+    reverseEntryEligible: opportunity.reverseEntryEligible
   }
 }
 

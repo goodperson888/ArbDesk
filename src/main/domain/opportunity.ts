@@ -102,6 +102,7 @@ export function calculateOpportunity(input: OpportunityInput): Opportunity {
         ? 'DOUBLE_WIN'
         : 'DOUBLE_LOSS'
   const doubleWinEntryEligible = settlementScenario === 'DOUBLE_WIN' && !tooCloseToBaseline
+  const reverseEntryEligible = settlementScenario === 'DOUBLE_LOSS' && !tooCloseToBaseline
   const settlementRiskBlocked = !signalsAvailable || settlementScenario !== 'SINGLE_WIN' || tooCloseToBaseline
   const settlementRiskReason = !signalsAvailable
       ? `结算信号不完整：${input.settlementSignalMissingReason ?? '缺少平台基准价、实时指数价或有效更新时间'}`
@@ -168,6 +169,7 @@ export function calculateOpportunity(input: OpportunityInput): Opportunity {
     requiredSettlementDistanceBps: minimumDistance.toFixed(4),
     settlementScenario,
     doubleWinEntryEligible,
+    reverseEntryEligible,
     matchClass,
     stale,
     riskFlags

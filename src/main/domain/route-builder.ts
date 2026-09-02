@@ -37,6 +37,7 @@ interface SettlementRouteAssessment {
   distanceBps?: string
   requiredDistanceBps: string
   doubleWinEntryEligible: boolean
+  reverseEntryEligible: boolean
   left: SettlementLegAssessment
   right: SettlementLegAssessment
 }
@@ -76,6 +77,7 @@ function assessSettlement(route: BidirectionalRoute, settings: RiskSettings, now
         ? 'DOUBLE_WIN'
         : 'DOUBLE_LOSS'
   const doubleWinEntryEligible = scenario === 'DOUBLE_WIN' && !tooClose
+  const reverseEntryEligible = scenario === 'DOUBLE_LOSS' && !tooClose
   const reason = !signalsAvailable
     ? [left.missingReason, right.missingReason].filter(Boolean).join('；')
     : tooClose
@@ -92,6 +94,7 @@ function assessSettlement(route: BidirectionalRoute, settings: RiskSettings, now
     distanceBps: signalsAvailable ? distance.toFixed(4) : undefined,
     requiredDistanceBps: required.toFixed(4),
     doubleWinEntryEligible,
+    reverseEntryEligible,
     left,
     right
   }
@@ -205,6 +208,7 @@ export function routeToComparison(route: BidirectionalRoute, settings: RiskSetti
     settlementRiskReason: settlement.reason,
     settlementDistanceBps: settlement.distanceBps,
     requiredSettlementDistanceBps: settlement.requiredDistanceBps,
-    doubleWinEntryEligible: settlement.doubleWinEntryEligible
+    doubleWinEntryEligible: settlement.doubleWinEntryEligible,
+    reverseEntryEligible: settlement.reverseEntryEligible
   }
 }

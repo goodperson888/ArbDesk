@@ -114,6 +114,7 @@ describe('bidirectional route builder', () => {
       .find((candidate) => candidate.settlementScenario === 'DOUBLE_WIN')!
     expect(comparison.settlementScenario).toBe('DOUBLE_WIN')
     expect(comparison.doubleWinEntryEligible).toBe(true)
+    expect(comparison.reverseEntryEligible).toBe(false)
     expect(comparison.settlementRiskPassed).toBe(false)
     expect(comparison.settlementRiskReason).toContain('双赢区间')
   })
@@ -126,6 +127,7 @@ describe('bidirectional route builder', () => {
       .find((candidate) => candidate.settlementScenario === 'DOUBLE_LOSS')!
     expect(comparison.settlementScenario).toBe('DOUBLE_LOSS')
     expect(comparison.doubleWinEntryEligible).toBe(false)
+    expect(comparison.reverseEntryEligible).toBe(true)
     expect(comparison.settlementRiskPassed).toBe(false)
     expect(comparison.settlementRiskReason).toContain('双输风险')
   })

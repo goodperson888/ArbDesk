@@ -168,6 +168,33 @@ function directionLabel(direction: Direction): string {
   return direction === 'UP' ? '看涨 UP' : '看跌 DOWN'
 }
 
+function oppositeDirection(direction: Direction): Direction {
+  return direction === 'UP' ? 'DOWN' : 'UP'
+}
+
+function sameOptionalId(left?: string, right?: string): boolean {
+  return !left || !right || left === right
+}
+
+/**
+ * Finds the already-built complementary route whose two outcomes are swapped.
+ * Selecting that row is safer than mutating directions in-place because it also
+ * switches each venue's outcome/token id and uses the normal selection effects.
+ */
+function findReverseComparison(comparison: MultiVenueComparison | undefined, candidates: MultiVenueComparison[]): MultiVenueComparison | undefined {
+  if (!comparison || comparison.legs.length !== 2 || comparison.reverseEntryEligible !== true) return undefined
+  return candidates.find((candidate) => {
+    if (candidate.id === comparison.id || candidate.legs.length !== 2) return false
+    if (candidate.asset !== comparison.asset || candidate.durationMinutes !== comparison.durationMinutes || candidate.startTime !== comparison.startTime || candidate.endTime !== comparison.endTime) return false
+    if (candidate.settlementScenario !== 'DOUBLE_WIN' || candidate.doubleWinEntryEligible !== true) return false
+    return comparison.legs.every((sourceLeg) => {
+      const targetLeg = candidate.legs.find((leg) => leg.venueId === sourceLeg.venueId)
+      if (!targetLeg || targetLeg.direction !== oppositeDirection(sourceLeg.direction)) return false
+      return sameOptionalId(sourceLeg.marketId, targetLeg.marketId) && sameOptionalId(sourceLeg.outcomeId, targetLeg.outcomeId)
+    })
+  })
+}
+
 function triggerSourceLabel(source: ArbitrageOrderRecord['triggerSource']): string {
   return source === 'AUTO' ? '自动开单' : source === 'MANUAL' ? '手动开单' : source === 'TEST' ? '测试开单' : '历史记录（来源未记录）'
 }
@@ -888,6 +915,18 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
         : comparison.durationMinutes === durationFilter
     )
     : [], [durationFilter, snapshot])
+  const selectedComparisonReverse = useMemo(
+    () => findReverseComparison(selectedComparison, visibleComparisons),
+    [selectedComparison, visibleComparisons]
+  )
+  const selectedLegacyComparison = useMemo(
+    () => selected?.id ? visibleComparisons.find((comparison) => comparison.legacyOpportunityId === selected.id) : undefined,
+    [selected?.id, visibleComparisons]
+  )
+  const selectedLegacyReverse = useMemo(
+    () => findReverseComparison(selectedLegacyComparison, visibleComparisons),
+    [selectedLegacyComparison, visibleComparisons]
+  )
   const multiVenueEntryReports = useMemo(() => {
     const reports = new Map<string, ReturnType<typeof buildMultiVenueEntryGateReport>>()
     if (!snapshot) return reports
@@ -1187,6 +1226,16 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     setSelectionMode('LOCKED')
     setSelectedComparisonId(comparison.id)
     setSelectedId(comparison.legacyOpportunityId)
+  }
+
+  function selectReverseComparison(comparison: MultiVenueComparison | undefined): void {
+    const reverse = findReverseComparison(comparison, visibleComparisons)
+    if (!reverse) {
+      setMessage('当前没有安全可用的反向组合，未切换')
+      return
+    }
+    selectComparison(reverse)
+    setMessage(`已切换到反向组合：${reverse.legs.map((leg) => `${leg.venueLabel} ${leg.direction}`).join(' + ')}`)
   }
 
   function followBestOpportunity(): void {
@@ -2092,6 +2141,11 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   <div className="inline-warning"><AlertTriangle aria-hidden="true" /><span>{selected.riskFlags[0]}</span></div>
                 )}
 
+                {selectedLegacyReverse && <button type="button" className="reverse-entry-button" onClick={() => selectReverseComparison(selectedLegacyComparison)} disabled={busy}>
+                  <RotateCcw aria-hidden="true" />
+                  <span><strong>反向开仓（涨跌互换）</strong><small>切换到已验证的反向组合行，不会直接提交订单</small></span>
+                </button>}
+
                 {selected.doubleWinEntryEligible && <label className="double-win-entry-choice">
                   <input type="checkbox" checked={allowDoubleWinEntry} onChange={(event) => setAllowDoubleWinEntry(event.target.checked)} />
                   <span><strong>确认按当前双赢信号开仓</strong><small>当前两平台结算信号分歧且两侧均已超过安全距离；仅本次点击有效，仍可能因结算源差异变为双输。</small></span>
@@ -2159,6 +2213,10 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   <span>参考收益率<strong>{signedMoney(selectedComparison.conditionalReturnPct, 2)}%</strong></span>
                   <span>最近一侧安全距离<strong>{nearestSettlementDistance(selectedComparison.legs.map((leg) => ({ label: leg.venueLabel, value: leg.settlementDistanceBps })), selectedComparison.requiredSettlementDistanceBps)}</strong></span>
                 </div>
+                {selectedComparisonReverse && <button type="button" className="reverse-entry-button" onClick={() => selectReverseComparison(selectedComparison)} disabled={busy}>
+                  <RotateCcw aria-hidden="true" />
+                  <span><strong>反向开仓（涨跌互换）</strong><small>切换到已验证的反向组合行，不会直接提交订单</small></span>
+                </button>}
                 {selectedComparison.doubleWinEntryEligible && <label className="double-win-entry-choice">
                   <input type="checkbox" checked={allowDoubleWinEntry} onChange={(event) => setAllowDoubleWinEntry(event.target.checked)} />
                   <span><strong>确认按当前双赢信号开仓</strong><small>当前组合处于双赢区间并已超过动态安全距离；仅本次点击有效，仍可能因结算源差异变为双输。</small></span>

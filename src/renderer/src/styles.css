@@ -302,6 +302,13 @@ tbody tr.opportunity-row.manual-executable:not(.best):hover { background: rgba(2
 .double-win-entry-choice span { display: grid; gap: 2px; }
 .double-win-entry-choice strong { color: #dcfce7; font-size: 10px; }
 .double-win-entry-choice small { color: var(--text-soft); font-size: 9px; line-height: 1.45; }
+.reverse-entry-button { width: 100%; margin-top: 8px; padding: 9px 10px; display: flex; align-items: center; gap: 8px; color: #d9f99d; border: 1px solid rgba(163,230,53,.38); border-radius: 9px; background: rgba(132,204,22,.1); cursor: pointer; text-align: left; }
+.reverse-entry-button:hover:not(:disabled) { border-color: rgba(190,242,100,.72); background: rgba(132,204,22,.18); }
+.reverse-entry-button:disabled { opacity: .55; cursor: not-allowed; }
+.reverse-entry-button svg { width: 17px; height: 17px; flex: 0 0 auto; }
+.reverse-entry-button span { display: grid; gap: 2px; }
+.reverse-entry-button strong { color: #ecfccb; font-size: 10px; }
+.reverse-entry-button small { color: var(--text-soft); font-size: 9px; line-height: 1.45; }
 .double-win-badge { display: inline-flex; align-items: center; margin-left: 4px; padding: 2px 5px; color: #bbf7d0; border: 1px solid rgba(34,197,94,.3); border-radius: 999px; background: rgba(34,197,94,.12); font-size: 8px; font-weight: 700; }
 .execution-conditions-help { position: relative; z-index: 12; }
 .execution-conditions-trigger { width: 44px; height: 44px; display: grid; place-items: center; color: #7dd3fc; border: 1px solid rgba(56,189,248,.24); border-radius: 10px; background: rgba(56,189,248,.07); cursor: pointer; }

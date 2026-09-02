@@ -111,6 +111,8 @@ export interface Opportunity {
   requiredSettlementDistanceBps: string
   settlementScenario?: SettlementScenario
   doubleWinEntryEligible?: boolean
+  /** The opposite one-up/one-down route is currently eligible to avoid a double-loss interval. */
+  reverseEntryEligible?: boolean
   matchClass: MatchClass
   stale: boolean
   riskFlags: string[]
