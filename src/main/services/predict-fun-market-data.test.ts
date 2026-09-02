@@ -676,6 +676,21 @@ describe('PredictFunMarketData', () => {
     expect(source.getStatus().message).toContain('目录0')
   })
 
+  it('does not let a late passive page response contaminate API mode', async () => {
+    const capture = new FakePredictPageCapture()
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ success: true, data: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const source = new PredictFunMarketData(async () => 'mainnet-key', undefined, { enableStreaming: false, pageCapture: capture })
+
+    await source.fetchWindows()
+    capture.emitResponse('https://api.predict.fun/v1/categories?status=OPEN', { success: true, data: [{
+      slug: 'btc-updown-5m-1787302200', startsAt: '2026-08-21T11:30:00.000Z', endsAt: '2026-08-21T11:35:00.000Z', status: 'OPEN',
+      marketVariant: 'CRYPTO_UP_DOWN', markets: [{ id: 42, tradingStatus: 'OPEN', outcomes: [{ name: 'Up', index: 1, onChainId: 'up' }, { name: 'Down', index: 2, onChainId: 'down' }] }]
+    }] })
+    capture.emitFrame({ type: 'M', topic: 'predictOrderbook/42', data: { marketId: 42, asks: [[0.61, 10]], bids: [[0.54, 10]] } })
+    expect(source.getLatestWindows()).toEqual([])
+  })
+
   it('applies API key changes immediately instead of waiting for the snapshot cache', async () => {
     let apiKey: string | undefined
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ success: true, data: [] }), { status: 200 }))

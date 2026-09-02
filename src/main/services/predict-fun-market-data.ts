@@ -759,6 +759,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private lastRestBookAt = 0
   private socket?: WebSocket
   private socketApiKey = ''
+  private apiMode = false
   private desiredTopics = new Set<string>()
   private activeTopics = new Set<string>()
   private oracleObservations = new Map<string, PredictOracleObservation>()
@@ -812,7 +813,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     options.pageCapture?.onResponse((event) => this.ingestCapturedResponse(event))
     options.pageCapture?.onWebSocketFrame((event) => this.ingestCapturedWebSocketFrame(event.payload, event.pageUrl, event.receivedAt))
     options.pageCapture?.onStatus((captureStatus) => {
-      if (this.socketApiKey) return
+      if (this.apiMode) return
       const parsedSuffix = (this.snapshot?.windows.length ?? 0) > 0
         ? `；已形成 ${this.snapshot?.windows.length ?? 0} 个可比较盘口`
         : this.marketContexts.size > 0
@@ -883,6 +884,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
 
   credentialsChanged(): void {
     this.closeMarketStream()
+    this.apiMode = false
     this.socketApiKey = ''
     this.discovery = undefined
     this.snapshot = undefined
@@ -901,7 +903,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     // Keep official API mode untouched. In no-key mode the page is the only
     // source, so remove its old snapshot immediately instead of showing stale
     // opportunities after the user releases the Chromium page.
-    if (!this.socketApiKey) {
+    if (!this.apiMode) {
       this.discovery = undefined
       this.snapshot = undefined
       this.marketContexts.clear()
@@ -938,6 +940,7 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private async load(signal?: AbortSignal): Promise<ReadOnlyWindowQuote[]> {
     const apiKey = (await this.apiKeyProvider())?.trim()
     if (!apiKey) {
+      this.apiMode = false
       this.closeMarketStream()
       const captureStatusBeforeStart = this.options.pageCapture?.getStatus()
       if (this.options.autoStartPageCapture !== false || (captureStatusBeforeStart && (captureStatusBeforeStart.state === 'CONNECTED' || captureStatusBeforeStart.state === 'STARTING'))) {
@@ -966,6 +969,11 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       return windows
     }
     try {
+      this.apiMode = true
+      // API mode is authoritative. Stop any previously opened passive page
+      // and prevent its late responses/frames from contaminating the API
+      // snapshot or its settlement observations.
+      this.stopPageCapture()
       const now = Date.now()
       let categories = this.discovery?.categories
       let discoveryPath = '缓存目录'
@@ -1323,7 +1331,9 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   }
 
   private ingestCapturedResponse(event: PredictFunCapturedResponse): void {
-    if (!this.monitoringEnabled) return
+    // Page interception is a no-key fallback only. Once an official key is
+    // active, REST/GraphQL page responses must not overwrite API data.
+    if (!this.monitoringEnabled || this.apiMode) return
     const { url, body: rawBody, receivedAt } = event
     let body: unknown
     try {
@@ -1448,7 +1458,9 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   }
 
   private ingestCapturedWebSocketFrame(rawPayload: string, pageUrl?: string, observedAt = Date.now()): void {
-    if (!this.monitoringEnabled) return
+    // Keep passive page WS completely separate from the authenticated
+    // Predict.fun stream used by API mode.
+    if (!this.monitoringEnabled || this.apiMode) return
     this.passiveFrameCount += 1
     let parsed: unknown
     try {
