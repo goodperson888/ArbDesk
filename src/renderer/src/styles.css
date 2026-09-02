@@ -260,6 +260,7 @@ tbody tr.opportunity-row.manual-executable:not(.best):hover { background: rgba(2
 .ticket-key-metrics { margin-top: 8px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
 .ticket-key-metrics > span { min-width: 0; padding: 7px 6px; display: grid; gap: 3px; color: var(--muted); border: 1px solid var(--border-soft); border-radius: 8px; background: rgba(15,23,42,.36); font-size: 9px; }
 .ticket-key-metrics strong { overflow: hidden; color: var(--text); font-size: 11px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.ticket-key-metrics > .settlement-distance-metric strong { overflow: visible; overflow-wrap: anywhere; text-overflow: clip; white-space: normal; line-height: 1.2; }
 .ticket-key-metrics strong.profit { color: #4ade80; }
 .ticket-quantity-label { margin-top: 10px; }
 .read-only-ticket { display: grid; gap: 8px; }

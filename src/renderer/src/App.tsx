@@ -2131,7 +2131,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 <div className="ticket-key-metrics">
                   <span>预计本金<strong>{selected.feeVerificationBlocked ? '—' : `$${requestedCapital.toFixed(2)}`}</strong></span>
                   <span>预计利润<strong className={!selected.feeVerificationBlocked && requestedProfit > 0 ? 'profit' : ''}>{selected.feeVerificationBlocked ? '—' : signedUsd(requestedProfit)}</strong></span>
-                  <span>最近一侧安全距离<strong>{nearestSettlementDistance([
+                  <span className="settlement-distance-metric">最近一侧安全距离<strong>{nearestSettlementDistance([
                     { label: 'MEXC', value: selected.mexcDistanceBps },
                     { label: 'Polymarket', value: selected.polymarketDistanceBps }
                   ], selected.requiredSettlementDistanceBps)}</strong></span>
@@ -2211,7 +2211,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   <span>两腿成本<strong>{money(selectedComparison.allInCostPerShare, 4)}</strong></span>
                   <span>参考毛边际<strong className={Number(selectedComparison.netEdgePerShare) > 0 ? 'profit' : ''}>{signedMoney(selectedComparison.netEdgePerShare, 4)}</strong></span>
                   <span>参考收益率<strong>{signedMoney(selectedComparison.conditionalReturnPct, 2)}%</strong></span>
-                  <span>最近一侧安全距离<strong>{nearestSettlementDistance(selectedComparison.legs.map((leg) => ({ label: leg.venueLabel, value: leg.settlementDistanceBps })), selectedComparison.requiredSettlementDistanceBps)}</strong></span>
+                  <span className="settlement-distance-metric">最近一侧安全距离<strong>{nearestSettlementDistance(selectedComparison.legs.map((leg) => ({ label: leg.venueLabel, value: leg.settlementDistanceBps })), selectedComparison.requiredSettlementDistanceBps)}</strong></span>
                 </div>
                 {selectedComparisonReverse && <button type="button" className="reverse-entry-button" onClick={() => selectReverseComparison(selectedComparison)} disabled={busy}>
                   <RotateCcw aria-hidden="true" />
