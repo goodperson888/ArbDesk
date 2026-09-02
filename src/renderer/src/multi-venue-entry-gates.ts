@@ -27,7 +27,7 @@ export function buildMultiVenueEntryGateReport(args: MultiVenueEntryGateArgs): E
     ? args.comparison.matchClass === 'EXACT'
     : args.comparison.settlementRiskPassed === true || doubleWinConsented
   const settlementLabel = doubleWinConsented
-    ? `已确认反向双赢开仓；安全距离 ${args.comparison.settlementDistanceBps ?? '—'} ≥ ${args.comparison.requiredSettlementDistanceBps ?? '—'} bps`
+    ? `已确认当前双赢组合开仓；安全距离 ${args.comparison.settlementDistanceBps ?? '—'} ≥ ${args.comparison.requiredSettlementDistanceBps ?? '—'} bps`
     : settlementRiskPassed
       ? `动态安全距离通过：${args.comparison.settlementDistanceBps ?? '—'} ≥ ${args.comparison.requiredSettlementDistanceBps ?? '—'} bps`
       : args.comparison.settlementRiskReason ?? '无法验证动态安全距离'

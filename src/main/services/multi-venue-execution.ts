@@ -151,7 +151,7 @@ export class MultiVenueExecutionService {
           ? comparison.matchClass === 'EXACT'
           : comparison.settlementRiskPassed === true || doubleWinConsented,
         settlementRiskLabel: doubleWinConsented
-          ? `已确认反向双赢开仓；安全距离 ${comparison.settlementDistanceBps ?? '—'} ≥ ${comparison.requiredSettlementDistanceBps ?? '—'} bps`
+          ? `已确认当前双赢组合开仓；安全距离 ${comparison.settlementDistanceBps ?? '—'} ≥ ${comparison.requiredSettlementDistanceBps ?? '—'} bps`
           : comparison.settlementRiskPassed
             ? `动态安全距离通过：${comparison.settlementDistanceBps ?? '—'} ≥ ${comparison.requiredSettlementDistanceBps ?? '—'} bps`
             : comparison.settlementRiskReason ?? '无法验证动态安全距离',
