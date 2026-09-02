@@ -2094,7 +2094,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
 
                 {selected.doubleWinEntryEligible && <label className="double-win-entry-choice">
                   <input type="checkbox" checked={allowDoubleWinEntry} onChange={(event) => setAllowDoubleWinEntry(event.target.checked)} />
-                  <span><strong>选择反向双赢开仓</strong><small>当前两平台结算信号分歧，但两侧均已超过安全距离；仅本次点击有效，自动开单不会使用。</small></span>
+                  <span><strong>确认按当前双赢信号开仓</strong><small>当前两平台结算信号分歧且两侧均已超过安全距离；仅本次点击有效，仍可能因结算源差异变为双输。</small></span>
                 </label>}
 
                 <label className="field-label ticket-quantity-label" htmlFor="quantity">对齐份额</label>
@@ -2161,7 +2161,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 </div>
                 {selectedComparison.doubleWinEntryEligible && <label className="double-win-entry-choice">
                   <input type="checkbox" checked={allowDoubleWinEntry} onChange={(event) => setAllowDoubleWinEntry(event.target.checked)} />
-                  <span><strong>选择反向双赢开仓</strong><small>当前组合处于双赢区间并已超过动态安全距离；仅本次点击有效，未勾选时继续拦截。</small></span>
+                  <span><strong>确认按当前双赢信号开仓</strong><small>当前组合处于双赢区间并已超过动态安全距离；仅本次点击有效，仍可能因结算源差异变为双输。</small></span>
                 </label>}
                 <label className="field-label ticket-quantity-label" htmlFor="multi-venue-amount">双腿下单金额（USDT）</label>
                 <div className="quantity-control">

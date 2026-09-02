@@ -81,7 +81,7 @@ function assessSettlement(route: BidirectionalRoute, settings: RiskSettings, now
     : tooClose
       ? `距离基准价不足动态门槛 ${required.toFixed(2)} bps（当前较近一侧 ${distance.toFixed(2)} bps）`
       : scenario === 'DOUBLE_WIN'
-        ? '结算信号分歧：当前方向位于双赢区间；需用户明确选择“反向双赢开仓”后才可执行'
+        ? '结算信号分歧：当前方向位于双赢区间（仅按当前参考价推断，非最终结算保证）；需用户明确选择“反向双赢开仓”后才可执行'
         : scenario === 'DOUBLE_LOSS'
           ? `结算信号分歧：当前方向存在双输风险：${getVenueDescriptor(route.left.venueId).label} ${left.signal} / ${getVenueDescriptor(route.right.venueId).label} ${right.signal}`
           : undefined
