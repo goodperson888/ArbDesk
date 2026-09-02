@@ -143,6 +143,22 @@ describe('PredictFunMarketData', () => {
     expect(source.getStatus().message).toContain('页面绑定 1')
   })
 
+  it('unwraps page websocket envelopes and exposes the exact unmapped frame in diagnostics', async () => {
+    const capture = new FakePredictPageCapture()
+    const source = new PredictFunMarketData(async () => undefined, undefined, { pageCapture: capture })
+    await source.fetchWindows()
+
+    capture.emitFrame({ data: { type: 'M', topic: 'predictOrderbook/999999', data: { marketId: 999999, asks: [[0.61, 2]], bids: [[0.55, 3]] } } })
+    // A normal board refresh must not overwrite the useful parser diagnosis
+    // with the page capture's generic frame counter.
+    await source.fetchWindows()
+
+    const message = source.getStatus().message
+    expect(message).toContain('最近WS topic=predictOrderbook/999999 marketId=999999')
+    expect(message).toContain('未映射 1')
+    expect(message).toContain('目录 空')
+  })
+
   it('treats a new unknown frame on the 15m page as the next 5m roll after the old 5m window ends', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-08-28T00:34:00.000Z'))
@@ -608,8 +624,9 @@ describe('PredictFunMarketData', () => {
     const source = new PredictFunMarketData(async () => 'mainnet-key', undefined, { enableStreaming: false, pageCapture: capture })
 
     await source.fetchWindows()
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(capture.start).not.toHaveBeenCalled()
+    expect(source.getStatus().message).toContain('目录0')
   })
 
   it('applies API key changes immediately instead of waiting for the snapshot cache', async () => {
@@ -622,14 +639,46 @@ describe('PredictFunMarketData', () => {
     apiKey = 'new-secret-key'
     source.credentialsChanged()
     await source.fetchWindows()
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(source.getStatus().connectionState).toBe('CONNECTED')
 
     apiKey = undefined
     source.credentialsChanged()
     await source.fetchWindows()
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(source.getStatus().connectionState).toBe('NOT_CONFIGURED')
+  })
+
+  it('falls back to official BTC search and accepts variantDetails.crypto categories', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-02T06:30:00.000Z'))
+    const category = {
+      id: 101,
+      slug: 'rolling-five-minute-market', startsAt: '2026-09-02T06:30:00.000Z', endsAt: '2026-09-02T06:35:00.000Z',
+      status: 'OPEN', marketVariant: 'CRYPTO_UP_DOWN',
+      variantDetails: { crypto: { priceFeedProvider: 'PYTH', priceFeedId: 'btc-feed', priceFeedSymbol: 'BTCUSDT' } },
+      markets: [{ id: 77, feeRateBps: 100, tradingStatus: 'OPEN', decimalPrecision: 2, outcomes: [
+        { name: 'Up', indexSet: 1, onChainId: 'up-77' }, { name: 'Down', indexSet: 2, onChainId: 'down-77' }
+      ] }]
+    }
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.includes('marketVariant=CRYPTO_UP_DOWN')) return new Response(JSON.stringify({ success: true, data: [] }), { status: 200 })
+      if (url.includes('/v1/search')) return new Response(JSON.stringify({ success: true, data: { categories: [category], markets: [] } }), { status: 200 })
+      if (url.includes('/orderbook')) return new Response(JSON.stringify({ success: true, data: {
+        marketId: 77, updateTimestampMs: Date.now(), asks: [[0.58, 8]], bids: [[0.48, 9]]
+      } }), { status: 200 })
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const source = new PredictFunMarketData(async () => 'secret-key', undefined, { enableStreaming: false })
+
+    const windows = await source.fetchWindows()
+
+    expect(windows).toHaveLength(1)
+    expect(windows[0]).toMatchObject({ marketId: '77', durationMinutes: 5 })
+    expect(windows[0].resolution.baselineSource).toBe('PYTH:btc-feed')
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/v1/categories?first=100&status=OPEN') && !String(url).includes('marketVariant'))).toBe(false)
   })
 
   it('normalizes crypto categories and respects decimal precision when deriving DOWN asks', async () => {

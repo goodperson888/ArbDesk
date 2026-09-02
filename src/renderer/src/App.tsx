@@ -273,6 +273,37 @@ function quoteAgeLabel(milliseconds: number): string {
   return `${Math.max(0, milliseconds / 1_000).toFixed(1)}秒`
 }
 
+type MultiVenueExecutionNotice = {
+  comparisonId: string
+  startedAt: number
+  completedAt?: number
+  status: MultiVenueExecutionReceipt['status'] | 'STARTED'
+  message: string
+  receipt?: MultiVenueExecutionReceipt
+}
+
+function multiVenueExecutionStatusLabel(status: MultiVenueExecutionNotice['status']): string {
+  if (status === 'STARTED') return '双腿执行中'
+  return multiVenueReceiptStatusLabel(status)
+}
+
+function MultiVenueExecutionStatus({ notice, now }: { notice: MultiVenueExecutionNotice; now: number }): JSX.Element {
+  const terminal = notice.status !== 'STARTED'
+  const danger = ['RECOVERY_REQUIRED', 'RECONCILE_REQUIRED', 'CANCELED'].includes(notice.status)
+  const elapsedMs = Math.max(0, (notice.completedAt ?? now) - notice.startedAt)
+  const receipt = notice.receipt
+  const legs = receipt ? [receipt.firstLeg, receipt.secondLeg].filter(Boolean) : []
+  return <div className={`multi-venue-execution-status ${danger ? 'danger' : terminal ? 'done' : ''}`} role="status" aria-live="polite">
+    <div className="multi-venue-status-icon">{terminal ? danger ? <AlertTriangle aria-hidden="true" /> : <Check aria-hidden="true" /> : <LoaderCircle className="spin" aria-hidden="true" />}</div>
+    <div className="multi-venue-status-body">
+      <div className="multi-venue-status-head"><strong>{multiVenueExecutionStatusLabel(notice.status)}</strong><span>已运行 {(elapsedMs / 1_000).toFixed(1)}s</span></div>
+      <p>{notice.message}</p>
+      {legs.length > 0 && <div className="multi-venue-status-legs">{legs.map((leg) => <span key={leg!.venueId}>{leg!.venueId} {leg!.status} · {leg!.filledQuantity}/{leg!.requestedQuantity}份</span>)}</div>}
+      <div className="multi-venue-status-progress"><span className={terminal ? 'complete' : undefined} /></div>
+    </div>
+  </div>
+}
+
 function executionTimingSummary(session: ExecutionSession): string | undefined {
   const timings = session.timings
   if (!timings) return undefined
@@ -604,6 +635,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [durationFilter, setDurationFilter] = useState<DurationFilter>('ALL')
   const [quantity, setQuantity] = useState('50')
   const [multiVenueQuantity, setMultiVenueQuantity] = useState('1')
+  const [multiVenueAmount, setMultiVenueAmount] = useState('10.00')
   const [now, setNow] = useState(Date.now())
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<string>()
@@ -646,6 +678,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   const [kalshiPrivateKeyPem, setKalshiPrivateKeyPem] = useState('')
   const [kalshiPreparation, setKalshiPreparation] = useState<VenuePreparationReport>()
   const [multiVenueReceipt, setMultiVenueReceipt] = useState<MultiVenueExecutionReceipt>()
+  const [multiVenueExecutionNotice, setMultiVenueExecutionNotice] = useState<MultiVenueExecutionNotice>()
   const [revealPlatformSecrets, setRevealPlatformSecrets] = useState(false)
   const [settlementRuleDrafts, setSettlementRuleDrafts] = useState<SettlementRuleDraft[]>([])
   const [settlementRuleError, setSettlementRuleError] = useState<string>()
@@ -800,13 +833,17 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
         )) * 100) / 100
     : 0
   const multiVenueRequestedQuantity = Number(multiVenueQuantity)
+  const multiVenueAmountValue = Number(multiVenueAmount)
   const multiVenueGateMinimumQuantity = selectedGateLeg && Number(selectedGateLeg.price) > 0
     ? Math.ceil((5 / Number(selectedGateLeg.price)) * 100) / 100
     : 0
   const multiVenueMinimumQuantity = selectedGateLeg ? Math.max(1, multiVenueGateMinimumQuantity) : 1
-  const multiVenueRequestedCapital = selectedComparison && Number.isFinite(multiVenueRequestedQuantity)
-    ? multiVenueAllInCost * multiVenueRequestedQuantity
-    : 0
+  // The ticket accepts a two-leg USDT budget.  Execution still uses one
+  // aligned share quantity internally so both legs remain hedgeable.
+  useEffect(() => {
+    if (!selectedComparison || !Number.isFinite(multiVenueAmountValue) || multiVenueAmountValue <= 0 || multiVenueAllInCost <= 0) return
+    setMultiVenueQuantity((multiVenueAmountValue / multiVenueAllInCost).toFixed(4))
+  }, [multiVenueAllInCost, multiVenueAmountValue, selectedComparison?.id])
   const opportunityById = useMemo(() => new Map(
     snapshot?.opportunities.map((opportunity) => [opportunity.id, opportunity]) ?? []
   ), [snapshot?.opportunities])
@@ -1325,7 +1362,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   }
 
   async function startPredictFunOrderCapture(): Promise<void> {
-    const result = await run(() => window.arbApp.startPredictFunOrderCapture(), 'Predict.fun 行情/下单捕获已开启；行情排查只需停留当前市场约 20 秒，无需下单')
+    const result = await run(() => window.arbApp.startPredictFunOrderCapture(), 'Predict.fun 全量接口捕获已开启；仅限本次诊断，最多保留最近 200 条脱敏元数据')
     if (result) setPredictFunOrderCapture(result)
   }
 
@@ -1384,7 +1421,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
     const requestedQuantity = Number(multiVenueQuantity)
     const maxQuantity = multiVenueMaxQuantity
     if (!Number.isFinite(requestedQuantity) || requestedQuantity < 1) {
-      setMessage('请输入至少 1 份的双腿执行数量，未发送订单')
+      setMessage('请输入有效的双腿下单金额（至少能换算出 1 份），未发送订单')
       return
     }
     if (selectedGateLeg && requestedQuantity < multiVenueMinimumQuantity) {
@@ -1392,7 +1429,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       return
     }
     if (!Number.isFinite(maxQuantity) || maxQuantity < 1) {
-      setMessage(unprotectedMode ? '单笔本金上限不足以提交 1 份双腿订单' : '两边盘口不足 1 份，未发送双腿订单')
+      setMessage(unprotectedMode ? '单笔金额上限不足以提交 1 份双腿订单' : '两边盘口不足 1 份，未发送双腿订单')
       return
     }
     const orderQuantity = Math.floor(requestedQuantity * 100) / 100
@@ -1407,8 +1444,33 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
       quantity: orderQuantity.toFixed(2),
       confirmed: true
     }
+    const startedAt = Date.now()
+    setMultiVenueExecutionNotice({
+      comparisonId: selectedComparison.id,
+      startedAt,
+      status: 'STARTED',
+      message: `已开始双腿执行：先提交${selectedComparison.legs[0].venueLabel}，成交后提交${selectedComparison.legs[1].venueLabel}`
+    })
     const result = await run(() => window.arbApp.executeMultiVenue(request), '双腿执行已完成或进入恢复态；请查看两边订单号')
-    if (result) setMultiVenueReceipt(result)
+    if (result) {
+      setMultiVenueReceipt(result)
+      setMultiVenueExecutionNotice({
+        comparisonId: selectedComparison.id,
+        startedAt,
+        completedAt: Date.now(),
+        status: result.status,
+        message: result.message,
+        receipt: result
+      })
+    } else {
+      setMultiVenueExecutionNotice({
+        comparisonId: selectedComparison.id,
+        startedAt,
+        completedAt: Date.now(),
+        status: 'RECOVERY_REQUIRED',
+        message: '双腿执行未完成，详细原因见页面顶部提示或执行日志'
+      })
+    }
   }
 
   async function validatePolymarketIdentity(): Promise<void> {
@@ -1563,7 +1625,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
   async function toggleUnprotectedExecution(): Promise<void> {
     if (!snapshot) return
     const enabling = !snapshot.settings.unprotectedExecutionEnabled
-    if (enabling && !window.confirm('全局无保护模式：MEXC/Polymarket使用原极速逻辑；Gate/Kalshi按输入份额同时提交两边，不等待首腿成交、不按实际成交量对齐，并跳过深度、滑点、收益和结算门槛。单腿失败或成交数量不同会产生裸敞口，程序不会自动补单或重试。确认开启？')) return
+    if (enabling && !window.confirm('全局无保护模式：MEXC、Polymarket、Predict.fun、Gate、Kalshi均按输入份额同时提交两边，不等待首腿成交、不按实际成交量对齐，并跳过深度、滑点、收益和结算门槛。单腿失败或成交数量不同会产生裸敞口，程序不会自动补单或重试。确认开启？')) return
     const result = await run(() => window.arbApp.updateSettings({ unprotectedExecutionEnabled: enabling }),
       enabling ? '无保护极速模式已开启' : '无保护极速模式已关闭')
     if (result && snapshot) setSnapshot({ ...snapshot, settings: result })
@@ -1948,9 +2010,6 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                     <small>计划 {Number.isFinite(multiVenueRequestedQuantity) ? multiVenueRequestedQuantity.toFixed(2) : '—'} 份 · 预计 ${Number.isFinite(multiVenueRequestedQuantity) && Number(leg.price) > 0 ? (multiVenueRequestedQuantity * Number(leg.price)).toFixed(2) : '—'}</small>
                   </div>)}
                 </div>
-                {selectedComparison.executionProvider === 'MULTI_VENUE' && <div className="kalshi-live-ticket">
-                  {multiVenueReceipt && multiVenueReceipt.comparisonId === selectedComparison.id && <div className="browser-status-detail"><span>双腿</span><p>{multiVenueReceipt.message} · {multiVenueReceiptStatusLabel(multiVenueReceipt.status)}</p></div>}
-                </div>}
               </section>
 
               {selected ? <>
@@ -2025,20 +2084,26 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                   <span>参考毛边际<strong className={Number(selectedComparison.netEdgePerShare) > 0 ? 'profit' : ''}>{Number(selectedComparison.netEdgePerShare) >= 0 ? '+' : ''}{money(selectedComparison.netEdgePerShare, 4)}</strong></span>
                   <span>参考收益率<strong>{Number(selectedComparison.conditionalReturnPct) >= 0 ? '+' : ''}{money(selectedComparison.conditionalReturnPct, 2)}%</strong></span>
                 </div>
-                <label className="field-label ticket-quantity-label" htmlFor="multi-venue-quantity">双腿计划份额</label>
+                <label className="field-label ticket-quantity-label" htmlFor="multi-venue-amount">双腿下单金额（USDT）</label>
                 <div className="quantity-control">
-                  <input id="multi-venue-quantity" value={multiVenueQuantity} inputMode="decimal" onChange={(event) => {
+                  <input id="multi-venue-amount" value={multiVenueAmount} inputMode="decimal" onChange={(event) => {
                     setSelectionMode('LOCKED')
-                    setMultiVenueQuantity(event.target.value)
+                    const value = event.target.value
+                    setMultiVenueAmount(value)
+                    const amount = Number(value)
+                    if (Number.isFinite(amount) && amount > 0 && multiVenueAllInCost > 0) setMultiVenueQuantity((amount / multiVenueAllInCost).toFixed(4))
                   }} />
                   <button onClick={() => {
                     setSelectionMode('LOCKED')
-                    if (multiVenueMaxQuantity > 0) setMultiVenueQuantity(multiVenueMaxQuantity.toFixed(2))
+                    if (multiVenueMaxQuantity > 0) {
+                      setMultiVenueQuantity(multiVenueMaxQuantity.toFixed(4))
+                      setMultiVenueAmount((multiVenueMaxQuantity * multiVenueAllInCost).toFixed(2))
+                    }
                   }} disabled={busy || multiVenueMaxQuantity < 1}>最大</button>
                 </div>
                 <div className="capacity-summary">
-                  <span>{unprotectedMode ? '单笔本金可支持' : '当前可执行上限'} <strong>{Number.isFinite(multiVenueMaxQuantity) ? multiVenueMaxQuantity.toFixed(2) : '—'}</strong>份</span>
-                  <span>预计两腿本金 <strong>${Number.isFinite(multiVenueRequestedCapital) ? multiVenueRequestedCapital.toFixed(2) : '—'}</strong></span>
+                  <span>{unprotectedMode ? '单笔金额可支持' : '当前可执行上限'} <strong>{Number.isFinite(multiVenueMaxQuantity) ? `$${(multiVenueMaxQuantity * multiVenueAllInCost).toFixed(2)}` : '—'}</strong></span>
+                  <span>自动换算对齐份额 <strong>{Number.isFinite(multiVenueRequestedQuantity) ? multiVenueRequestedQuantity.toFixed(2) : '—'}</strong>份</span>
                 </div>
                 {selectedGateLeg && <div className="capacity-summary">
                   <span>Gate 最低金额 <strong>$5.00</strong></span>
@@ -2055,7 +2120,8 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                     </button>
                     <ExecutionConditionsHelp checks={multiVenueGateReport.checks} busy={busy} onToggle={(condition) => void toggleManualExecutionCondition(condition)} />
                   </div>
-                  {unprotectedMode && <p className="unprotected-execution-note"><AlertTriangle aria-hidden="true" />按输入份额同时提交两边；不等待首腿成交、不按实际成交量自动对齐或补单。</p>}
+                  {multiVenueExecutionNotice?.comparisonId === selectedComparison.id && <MultiVenueExecutionStatus notice={multiVenueExecutionNotice} now={now} />}
+                  {unprotectedMode && <p className="unprotected-execution-note"><AlertTriangle aria-hidden="true" />按输入金额换算为同一份额后同时提交两边；不等待首腿成交、不按实际成交量自动对齐或补单。</p>}
                 </>}
               </section>}
             </>
@@ -2403,7 +2469,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 ))}
                 {predictFunCredentials?.message && <div className="browser-status-detail"><span>PRED</span><p>{predictFunCredentials.message}{predictFunCredentials.apiKeyMasked ? ` · ${predictFunCredentials.apiKeyMasked}` : ''}{predictFunCredentials.signerAddress ? ` · signer ${shortAddress(predictFunCredentials.signerAddress)}` : ''}</p></div>}
                 <div className="credential-notice"><ShieldAlert aria-hidden="true" /><span>Predict.fun 双腿执行已接入：API 身份和页面控件二选一；首次建议用小额、无自动重试方式验证 5m/15m 各一单。</span></div>
-                <button className="wide-secondary" onClick={() => void startPredictFunOrderCapture()} disabled={busy}><ShieldAlert aria-hidden="true" />开启 Predict.fun 行情/订单捕获</button>
+                <button className="wide-secondary" onClick={() => void startPredictFunOrderCapture()} disabled={busy}><ShieldAlert aria-hidden="true" />开启 Predict.fun 全量接口捕获（限时诊断）</button>
                 {predictFunOrderCapture?.capturing && <button className="wide-secondary" onClick={() => void stopPredictFunOrderCapture()} disabled={busy}><Square aria-hidden="true" />停止 Predict.fun 链路采集</button>}
                 <button className="wide-secondary" onClick={() => void exportPredictFunOrderCapture()} disabled={busy || !predictFunOrderCapture?.traceEntryCount}><Download aria-hidden="true" />导出脱敏 Predict.fun 行情/订单链路</button>
                 {predictFunOrderCapture?.traceEntryCount ? <button className="wide-secondary" onClick={() => void clearPredictFunOrderCapture()} disabled={busy}><Trash2 aria-hidden="true" />清除 Predict.fun 行情/订单捕获</button> : null}
@@ -2593,7 +2659,7 @@ function TradingApp({ license }: { license: LicenseSummary }): JSX.Element {
                 </label>
               </div>
               <button className="wide-secondary" onClick={() => void saveRecoverySettings()} disabled={busy}><Check />保存恢复参数</button>
-              <div><Zap /><div><h3>全局无保护极速模式</h3><p>MEXC/Polymarket沿用原极速逻辑；Gate/Kalshi按输入份额同时提交两边，不等待首腿成交、不自动对齐或补单。跳过深度、滑点、收益和结算门槛，但仍保留身份、最低委托、单笔本金、到期截止和执行互斥。</p></div></div>
+              <div><Zap /><div><h3>全局无保护极速模式</h3><p>MEXC、Polymarket、Predict.fun、Gate、Kalshi均按输入份额同时提交两边，不等待首腿成交、不自动对齐或补单。跳过深度、滑点、收益和结算门槛，但仍保留身份、最低委托、单笔本金、到期截止和执行互斥。</p></div></div>
               <button
                 className={snapshot.settings.unprotectedExecutionEnabled ? 'wide-secondary danger-active' : 'wide-secondary'}
                 onClick={() => void toggleUnprotectedExecution()}

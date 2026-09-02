@@ -25,6 +25,9 @@ interface PredictMarket {
   decimalPrecision?: number
   isNegRisk?: boolean
   isYieldBearing?: boolean
+  categorySlug?: string
+  marketVariant?: string
+  variantData?: PredictVariant
   outcomes?: PredictOutcome[]
 }
 
@@ -53,6 +56,7 @@ interface PredictVariant {
 }
 
 interface PredictCategory {
+  id?: number
   slug?: string
   startsAt?: string
   endsAt?: string
@@ -61,12 +65,19 @@ interface PredictCategory {
   resolutionProvider?: string
   description?: string
   variantData?: PredictVariant
+  variantDetails?: { crypto?: PredictVariant }
   markets?: PredictMarket[]
 }
 
 interface PredictCategoriesResponse {
   success?: boolean
+  cursor?: string
   data?: PredictCategory[]
+}
+
+interface PredictSearchResponse {
+  success?: boolean
+  data?: { categories?: PredictCategory[]; markets?: PredictMarket[] }
 }
 
 interface PredictBookResponse {
@@ -86,6 +97,67 @@ interface PredictStreamMessage {
   data?: unknown
   success?: boolean
   error?: { code?: string; message?: string }
+}
+
+/**
+ * Predict.fun has used two websocket envelopes in production: the original
+ * `{type, topic, data}` message and a page wrapper that nests that message
+ * under `data`/`payload`.  Unwrap only those structural containers; never
+ * search arbitrary response values for a market so account/telemetry frames
+ * cannot be mistaken for a book.
+ */
+function normalizePredictStreamMessage(value: unknown, depth = 0): PredictStreamMessage | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || depth > 3) return undefined
+  const record = value as Record<string, unknown>
+  if (typeof record.type === 'string' || typeof record.topic === 'string') return record as PredictStreamMessage
+  for (const key of ['data', 'payload', 'message', 'result']) {
+    const nested = record[key]
+    if (nested && typeof nested === 'object') {
+      const message = normalizePredictStreamMessage(nested, depth + 1)
+      if (message) return message
+    }
+    if (typeof nested === 'string') {
+      try {
+        const message = normalizePredictStreamMessage(JSON.parse(nested) as unknown, depth + 1)
+        if (message) return message
+      } catch {
+        // The diagnostic path records this as an unrecognised frame below.
+      }
+    }
+  }
+  return undefined
+}
+
+function diagnosticText(value: unknown, maxLength = 96): string {
+  const text = String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim()
+  if (!text) return ''
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text
+}
+
+function passivePageSlug(pageUrl: string | undefined): string {
+  if (!pageUrl) return ''
+  try { return new URL(pageUrl).pathname.match(/\/market\/(btc-updown-(?:5|15)m-\d+)/i)?.[1] ?? '' } catch { return '' }
+}
+
+function passiveFrameShape(message: PredictStreamMessage | undefined, rawPayload?: string): string {
+  if (!message) {
+    const raw = String(rawPayload ?? '').trim()
+    if (!raw) return '空帧'
+    if (!raw.startsWith('{') && !raw.startsWith('[')) return `非JSON(${raw.slice(0, 18)})`
+    try {
+      const parsed = JSON.parse(raw) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return `JSON字段=${Object.keys(parsed as Record<string, unknown>).slice(0, 8).sort().join('+') || '无'}`
+    } catch { return 'JSON解析失败' }
+    return 'JSON结构未识别'
+  }
+  const record = message as Record<string, unknown>
+  const data = record.data && typeof record.data === 'object' ? record.data as Record<string, unknown> : undefined
+  const keys = data ? Object.keys(data).slice(0, 8).sort().join('+') : typeof record.data
+  return `type=${diagnosticText(record.type) || '无'} topic=${diagnosticText(record.topic) || '无'} data=${keys || '无'}`
+}
+
+function looksLikeOrderbookTopic(topic: string | undefined): boolean {
+  return /order|book/i.test(String(topic ?? ''))
 }
 
 interface PredictGraphqlMarketDataEntry {
@@ -428,8 +500,12 @@ function outcome(direction: Direction, source: PredictOutcome | undefined, level
   return { direction, outcomeId: source.onChainId, bestAsk: best.price, askSize: best.size, levels, receivedAt, observedAt }
 }
 
+function categoryCryptoData(category: PredictCategory): PredictVariant {
+  return { ...(category.variantDetails?.crypto ?? {}), ...(category.variantData ?? {}) }
+}
+
 function assetSymbol(category: PredictCategory): string {
-  return (category.variantData?.priceFeedSymbol ?? `${category.slug ?? ''} ${category.description ?? ''}`)
+  return (categoryCryptoData(category).priceFeedSymbol ?? `${category.slug ?? ''} ${category.description ?? ''}`)
     .toUpperCase().replace(/[/_-]/g, '')
 }
 
@@ -550,7 +626,10 @@ function selectCandidates(categories: PredictCategory[], now: number): Array<{ c
     // safe second signal and keeps those markets from being discarded before
     // their actual order book is inspected.
     .filter((category) => {
-      const variantText = `${category.marketVariant ?? ''} ${category.slug ?? ''} ${category.description ?? ''} ${category.variantData?.type ?? ''} ${category.variantData?.priceFeedSymbol ?? ''}`
+      const crypto = categoryCryptoData(category)
+      const marketVariantText = typeof category.marketVariant === 'string' ? category.marketVariant : ''
+      const marketSignals = (category.markets ?? []).map((market) => `${market.marketVariant ?? ''} ${market.variantData?.type ?? ''} ${market.variantData?.priceFeedSymbol ?? ''}`).join(' ')
+      const variantText = `${marketVariantText} ${category.slug ?? ''} ${category.description ?? ''} ${crypto.type ?? ''} ${crypto.priceFeedSymbol ?? ''} ${marketSignals}`
       const window = categoryWindowTimes(category)
       const duration = window ? Math.round((window.endTime - window.startTime) / 60_000) : 0
       const cryptoSignal = /CRYPTO.?UP.?DOWN|BTC.?UP.?DOWN|BTC(?:USD|USDT)?/i.test(variantText)
@@ -566,6 +645,28 @@ function selectCandidates(categories: PredictCategory[], now: number): Array<{ c
       .map((market) => ({ category, market })))
     .sort((left, right) => categoryTimestamp(left.category.startsAt) - categoryTimestamp(right.category.startsAt))
     .slice(0, 4)
+}
+
+function mergeOfficialCategories(...groups: PredictCategory[][]): PredictCategory[] {
+  const merged = new Map<string, PredictCategory>()
+  for (const category of groups.flat()) {
+    const key = category.slug ?? (category.id !== undefined ? `id:${category.id}` : `window:${category.startsAt ?? ''}:${category.endsAt ?? ''}`)
+    merged.set(key, mergeCapturedCategory(merged.get(key), category))
+  }
+  return [...merged.values()]
+}
+
+function officialDiscoverySummary(categories: PredictCategory[], now: number): string {
+  const open = categories.filter((category) => isOpenStatus(category.status))
+  const timed = open.filter((category) => {
+    const window = categoryWindowTimes(category)
+    if (!window) return false
+    const duration = Math.round((window.endTime - window.startTime) / 60_000)
+    return (duration === 5 || duration === 15) && window.endTime > now && window.startTime < now + 16 * 60_000
+  })
+  const btc = timed.filter((category) => /BTC(?:USD|USDT|UPDOWN)?/.test(assetSymbol(category)))
+  const markets = btc.reduce((total, category) => total + (category.markets?.length ?? 0), 0)
+  return `目录${categories.length}，当前5m/15m ${timed.length}，BTC ${btc.length}，内含市场 ${markets}`
 }
 
 function mergeCapturedCategory(previous: PredictCategory | undefined, incoming: PredictCategory): PredictCategory {
@@ -589,6 +690,11 @@ function mergeCapturedCategory(previous: PredictCategory | undefined, incoming: 
     resolutionProvider: incoming.resolutionProvider ?? previous.resolutionProvider,
     description: incoming.description ?? previous.description,
     variantData: { ...(previous.variantData ?? {}), ...(incoming.variantData ?? {}) },
+    variantDetails: {
+      ...(previous.variantDetails ?? {}),
+      ...(incoming.variantDetails ?? {}),
+      crypto: { ...(previous.variantDetails?.crypto ?? {}), ...(incoming.variantDetails?.crypto ?? {}) }
+    },
     markets: markets.length > 0 ? markets : previous.markets
   }
 }
@@ -608,14 +714,16 @@ function parseCategory(category: PredictCategory, market: PredictMarket, book: P
   const up = outcome('UP', upSource, levelsFromBook(book, upSource), receivedAt, observedAt)
   const down = outcome('DOWN', downSource, noLevelsFromYesBook(book, downSource, precision), receivedAt, observedAt)
   if (!up && !down) return undefined
-  const feedId = category.variantData?.priceFeedId ?? 'unknown'
-  const feedSymbol = category.variantData?.priceFeedSymbol ?? 'BTCUSDT'
+  const crypto = categoryCryptoData(category)
+  const feedId = crypto.priceFeedId ?? 'unknown'
+  const feedSymbol = crypto.priceFeedSymbol ?? 'BTCUSDT'
+  const feedProvider = crypto.priceFeedProvider ?? category.resolutionProvider ?? 'UNKNOWN'
   return {
     venueId: 'PREDICT_FUN', marketId: String(market.id), asset: 'BTC/USD', durationMinutes: duration,
     startTime, endTime, feeRateBps: Number(market.feeRateBps ?? 0), feeVerified: false,
     resolution: {
-      asset: 'BTC/USD', startTime, endTime, baselineSource: `CHAINLINK:${feedId}`,
-      settlementSource: `CHAINLINK:${feedId}`, observationMethod: `${feedSymbol} 5m candle close immediately before end`,
+      asset: 'BTC/USD', startTime, endTime, baselineSource: `${feedProvider}:${feedId}`,
+      settlementSource: `${feedProvider}:${feedId}`, observationMethod: `${feedSymbol} 5m candle close immediately before end`,
       comparisonOperator: 'GT', tieOutcome: 'SPLIT', voidRule: 'Unavailable Chainlink data: consensus of reliable sources',
       staleDataRule: 'Fallback to consensus of reliable sources', timezone: 'UTC',
       ruleVersion: 'predict-crypto-up-down-chainlink-v1', evidenceUrl: `https://predict.fun/market/${market.id}`
@@ -654,7 +762,12 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
   private passiveGraphqlResponseCount = 0
   private passiveGraphqlMappedCount = 0
   private passiveMarketDetailCount = 0
+  private passiveIgnoredFrameCount = 0
   private passiveLastMarketPath = ''
+  private passiveLastFrameTopic = ''
+  private passiveLastFrameMarketId = ''
+  private passiveLastFramePageSlug = ''
+  private passiveLastFrameShape = ''
   private passiveLastGraphqlSchema = ''
   private passiveLastGraphqlOperation = ''
   private passiveLastGraphqlSlugs = ''
@@ -803,11 +916,21 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       }
       const captureStatus = this.options.pageCapture?.getStatus()
       const windows = this.snapshot?.windows ?? []
+      const parsedSuffix = windows.length > 0
+        ? `；已形成 ${windows.length} 个可比较盘口`
+        : this.marketContexts.size > 0
+          ? `；已识别 ${this.marketContexts.size} 个 BTC 5m/15m 市场，等待页面盘口推送`
+          : ''
+      const captureMessage = this.options.autoStartPageCapture === false && (!captureStatus || captureStatus.state === 'IDLE')
+        ? '未配置主网 API Key；点击“打开 Predict.fun 页面”后开始监听'
+        : captureStatus?.message ?? '未配置主网 API Key；点击“打开 Predict.fun 页面”后开始监听'
       this.status = {
         connectionState: captureStatus?.state === 'CONNECTED' ? 'CONNECTED' : captureStatus?.state === 'STARTING' ? 'DISCONNECTED' : 'NOT_CONFIGURED',
-        message: this.options.autoStartPageCapture === false && (!captureStatus || captureStatus.state === 'IDLE')
-          ? '未配置主网 API Key；点击“打开 Predict.fun 页面”后开始监听'
-          : captureStatus?.message ?? '未配置主网 API Key；点击“打开 Predict.fun 页面”后开始监听',
+        // The board polls fetchWindows repeatedly. Preserve the parser
+        // diagnostics here instead of replacing them with the page-capture
+        // headline on every poll; otherwise the exact failure reason only
+        // flashes for a moment and the user sees a generic "N frames" line.
+        message: `${captureMessage}${this.passiveDiagnosticsSuffix()}${parsedSuffix}`,
         marketCount: windows.length,
         updatedAt: captureStatus?.updatedAt
       }
@@ -816,11 +939,35 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     try {
       const now = Date.now()
       let categories = this.discovery?.categories
+      let discoveryPath = '缓存目录'
       if (!categories || now - (this.discovery?.fetchedAt ?? 0) >= DISCOVERY_CACHE_MS) {
-        const response = await this.fetchJson<PredictCategoriesResponse>(
-          `${this.apiBase}/v1/categories?first=50&status=OPEN&marketVariant=CRYPTO_UP_DOWN`, apiKey, signal
+        const filtered = await this.fetchJson<PredictCategoriesResponse>(
+          `${this.apiBase}/v1/categories?first=100&status=OPEN&marketVariant=CRYPTO_UP_DOWN`, apiKey, signal
         )
-        categories = response.data ?? []
+        categories = filtered.data ?? []
+        discoveryPath = 'CRYPTO_UP_DOWN目录'
+        if (selectCandidates(categories, now).length === 0) {
+          try {
+            const searched = await this.fetchJson<PredictSearchResponse>(
+              `${this.apiBase}/v1/search?query=BTC&includeResolved=false&limit=50`, apiKey, signal
+            )
+            categories = mergeOfficialCategories(categories, searched.data?.categories ?? [])
+            discoveryPath += '+BTC搜索'
+          } catch (error) {
+            discoveryPath += `+BTC搜索失败(${diagnosticText(error instanceof Error ? error.message : error, 48)})`
+          }
+        }
+        if (selectCandidates(categories, now).length === 0) {
+          try {
+            const broad = await this.fetchJson<PredictCategoriesResponse>(
+              `${this.apiBase}/v1/categories?first=100&status=OPEN`, apiKey, signal
+            )
+            categories = mergeOfficialCategories(categories, broad.data ?? [])
+            discoveryPath += '+开放目录'
+          } catch (error) {
+            discoveryPath += `+开放目录失败(${diagnosticText(error instanceof Error ? error.message : error, 48)})`
+          }
+        }
         this.discovery = { fetchedAt: now, categories }
       }
       const candidates = selectCandidates(categories, now)
@@ -842,9 +989,13 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       this.snapshot = { fetchedAt: Date.now(), windows }
       this.status = {
         connectionState: 'CONNECTED', marketCount: windows.length, updatedAt: Date.now(),
-        message: this.socket?.readyState === WebSocket.OPEN
-          ? `WebSocket实时盘口已连接（${windows.length}个 BTC 5m/15m 市场）；REST每15秒发现轮次、每30秒校准盘口`
-          : `REST行情已连接（${windows.length}个市场），WebSocket正在连接；断线期间最多每5秒刷新盘口`
+        message: candidates.length === 0
+          ? `官方API已连接但未找到当前 BTC 5m/15m 候选（${officialDiscoverySummary(categories, now)}；${discoveryPath}）`
+          : windows.length === 0
+            ? `官方API已找到 ${candidates.length} 个候选，但盘口均未形成（${officialDiscoverySummary(categories, now)}；盘口形成 ${results.filter((result) => result.status === 'fulfilled' && Boolean(result.value)).length}/${results.length}）`
+            : this.socket?.readyState === WebSocket.OPEN
+              ? `WebSocket实时盘口已连接（${windows.length}个 BTC 5m/15m 市场）；REST每15秒发现轮次、每30秒校准盘口`
+              : `REST行情已连接（${windows.length}个市场），WebSocket正在连接；断线期间最多每5秒刷新盘口`
       }
       return windows
     } catch (error) {
@@ -908,17 +1059,28 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
 
   private handleStreamMessage(socket: WebSocket, raw: RawData): void {
     if (this.socket !== socket) return
-    let message: PredictStreamMessage
+    let parsed: unknown
     try {
-      message = JSON.parse(raw.toString()) as PredictStreamMessage
+      parsed = JSON.parse(raw.toString()) as unknown
     } catch {
       return
     }
+    const message = normalizePredictStreamMessage(parsed)
+    if (!message) return
     this.handleStreamPayload(message, true, undefined, Date.now())
   }
 
   private handleStreamPayload(message: PredictStreamMessage, officialSocket: boolean, pageUrl?: string, observedAt = Date.now()): void {
-    if (!officialSocket) this.passiveFrameCount += 1
+    if (!officialSocket) {
+      this.passiveLastFrameTopic = diagnosticText(message.topic)
+      this.passiveLastFramePageSlug = passivePageSlug(pageUrl)
+      this.passiveLastFrameShape = passiveFrameShape(message)
+      const data = message.data && typeof message.data === 'object' ? message.data as Record<string, unknown> : undefined
+      const nested = data?.orderbook && typeof data.orderbook === 'object' ? data.orderbook as Record<string, unknown> :
+        data?.orderBook && typeof data.orderBook === 'object' ? data.orderBook as Record<string, unknown> : data
+      const rawMarketId = nested?.marketId ?? nested?.market_id ?? nested?.id
+      this.passiveLastFrameMarketId = /^\d+$/.test(String(rawMarketId ?? '')) ? String(rawMarketId) : ''
+    }
     if (message.type === 'R' && officialSocket) {
       const pending = typeof message.requestId === 'number' ? this.pendingSubscriptions.get(message.requestId) : undefined
       if (typeof message.requestId === 'number') this.pendingSubscriptions.delete(message.requestId)
@@ -928,28 +1090,41 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
       }
       return
     }
-    if (message.type !== 'M' || !message.topic) return
+    if (message.type !== 'M' || !message.topic) {
+      if (!officialSocket && message.type !== 'R') {
+        this.passiveIgnoredFrameCount += 1
+        this.passiveLastReason = `WS帧缺少盘口 type/topic（${this.passiveLastFrameShape}）`
+        this.notifyPassiveDiagnostics()
+      }
+      return
+    }
     if (message.topic === 'heartbeat') {
       if (officialSocket) this.sendStreamRequest({ method: 'heartbeat', data: message.data })
       return
     }
     const orderbookMatch = /(?:predict)?order[._:/-]?book[/:](\d+)$|^(\d+)[/:](?:predict)?order[._:/-]?book$/i.exec(message.topic)
+    const looksLikeOrderbook = Boolean(orderbookMatch) || looksLikeOrderbookTopic(message.topic)
     const parsedData = typeof message.data === 'string'
       ? (() => { try { return JSON.parse(message.data) as unknown } catch { return undefined } })()
       : message.data
-    const dataRecord = parsedData && typeof parsedData === 'object' ? parsedData as Record<string, unknown> : undefined
+    const dataRecord = parsedData && typeof parsedData === 'object' && !Array.isArray(parsedData) ? parsedData as Record<string, unknown> : undefined
     const nestedBook = dataRecord?.orderbook && typeof dataRecord.orderbook === 'object'
       ? dataRecord.orderbook as Record<string, unknown>
       : dataRecord?.orderBook && typeof dataRecord.orderBook === 'object'
         ? dataRecord.orderBook as Record<string, unknown>
         : undefined
     const bookRecord = nestedBook ? { ...dataRecord, ...nestedBook } : dataRecord
+    if (!officialSocket && looksLikeOrderbookTopic(message.topic) && !dataRecord) {
+      this.passiveIgnoredFrameCount += 1
+      this.passiveLastReason = `盘口 topic ${diagnosticText(message.topic)} 的 data 不是对象（${this.passiveLastFrameShape}）`
+      this.notifyPassiveDiagnostics()
+      return
+    }
     const dataMarketId = bookRecord?.marketId ?? bookRecord?.market_id ?? bookRecord?.id ?? dataRecord?.marketId ?? dataRecord?.market_id
     const hasBookData = Array.isArray(bookRecord?.asks) || Array.isArray(bookRecord?.bids) ||
       Array.isArray(bookRecord?.yes) || Array.isArray(bookRecord?.no)
     const resolvedMarketId = orderbookMatch?.[1] ?? orderbookMatch?.[2] ??
       (dataMarketId !== undefined && (hasBookData || /order|book/i.test(message.topic)) ? String(dataMarketId) : undefined)
-    const looksLikeOrderbook = Boolean(orderbookMatch) || /order|book/i.test(message.topic)
     if (!officialSocket && looksLikeOrderbook) this.passiveOrderbookFrameCount += 1
     if (!officialSocket && looksLikeOrderbook && !resolvedMarketId) {
       this.passiveUnmappedFrameCount += 1
@@ -1156,10 +1331,29 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
 
   private ingestCapturedWebSocketFrame(rawPayload: string, pageUrl?: string, observedAt = Date.now()): void {
     if (!this.monitoringEnabled) return
-    let message: PredictStreamMessage
+    this.passiveFrameCount += 1
+    let parsed: unknown
     try {
-      message = JSON.parse(rawPayload) as PredictStreamMessage
+      parsed = JSON.parse(rawPayload) as unknown
     } catch {
+      this.passiveIgnoredFrameCount += 1
+      this.passiveLastFrameTopic = ''
+      this.passiveLastFrameMarketId = ''
+      this.passiveLastFramePageSlug = passivePageSlug(pageUrl)
+      this.passiveLastFrameShape = passiveFrameShape(undefined, rawPayload)
+      this.passiveLastReason = `WS帧 JSON 解析失败（${this.passiveLastFrameShape}）`
+      this.notifyPassiveDiagnostics()
+      return
+    }
+    const message = normalizePredictStreamMessage(parsed)
+    if (!message) {
+      this.passiveIgnoredFrameCount += 1
+      this.passiveLastFrameTopic = ''
+      this.passiveLastFrameMarketId = ''
+      this.passiveLastFramePageSlug = passivePageSlug(pageUrl)
+      this.passiveLastFrameShape = passiveFrameShape(undefined, rawPayload)
+      this.passiveLastReason = `WS帧结构未识别（${this.passiveLastFrameShape}）`
+      this.notifyPassiveDiagnostics()
       return
     }
     this.handleStreamPayload(message, false, pageUrl, observedAt)
@@ -1184,9 +1378,12 @@ export class PredictFunMarketData implements ReadOnlyVenueSource {
     const marketDetail = this.passiveMarketDetailCount > 0
       ? `；REST市场详情 ${this.passiveMarketDetailCount}${this.passiveLastMarketPath ? `（${this.passiveLastMarketPath}）` : ''}`
       : this.passiveLastMarketPath ? `；REST市场路径 ${this.passiveLastMarketPath}` : ''
+    const latestFrame = this.passiveFrameCount > 0
+      ? `；最近WS topic=${this.passiveLastFrameTopic || '无'} marketId=${this.passiveLastFrameMarketId || '无'} slug=${this.passiveLastFramePageSlug || '无'} 结构=${this.passiveLastFrameShape || '无'}`
+      : ''
     if (this.passiveFrameCount === 0) return `${graphql}${marketDetail}；页面尚未收到可解析的 WebSocket 帧`
     const reason = this.passiveLastReason ? `，最近原因：${this.passiveLastReason}` : ''
-    return `${graphql}${marketDetail}；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、页面绑定 ${this.passivePageBoundFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）`
+    return `${graphql}${marketDetail}；页面帧 ${this.passiveFrameCount}（盘口 ${this.passiveOrderbookFrameCount}、映射 ${this.passiveMappedFrameCount}、页面绑定 ${this.passivePageBoundFrameCount}、未映射 ${this.passiveUnmappedFrameCount}、忽略 ${this.passiveIgnoredFrameCount}、解析失败 ${this.passiveParseRejectedCount}${reason}）${latestFrame}`
   }
 
   private notifyPassiveDiagnostics(): void {

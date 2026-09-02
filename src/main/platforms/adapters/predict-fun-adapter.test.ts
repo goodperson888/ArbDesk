@@ -33,4 +33,15 @@ describe('PredictFunVenueAdapter', () => {
     expect(service.waitForFill).toHaveBeenCalledTimes(1)
     expect(fill).toMatchObject({ venueId: 'PREDICT_FUN', orderId: 'order-1', quantity: '2', verificationSource: 'PLATFORM_READBACK' })
   })
+
+  it('surfaces a platform rejection instead of returning a zero-quantity fill', async () => {
+    const service = trading()
+    service.waitForFill.mockResolvedValueOnce({
+      orderId: 'order-1', orderHash: '0xhash', status: 'REJECTED', filledQuantity: '0',
+      message: 'minimum output not met'
+    } as never)
+    const adapter = new PredictFunVenueAdapter(service as never, () => true)
+    const receipt = await adapter.submitOrder(request)
+    await expect(adapter.waitForFill(receipt, request)).rejects.toThrow('minimum output not met')
+  })
 })

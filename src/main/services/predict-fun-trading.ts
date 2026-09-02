@@ -3,7 +3,7 @@ import {
   OrderBuilder as PredictOrderBuilder,
   Side as PredictSide
 } from '@predictdotfun/sdk'
-import { JsonRpcProvider, Wallet, parseEther } from 'ethers'
+import { FallbackProvider, JsonRpcProvider, Wallet, parseEther } from 'ethers'
 import Decimal from 'decimal.js'
 import type { PredictFunCredentialStore, PredictFunCredentials } from './predict-fun-credential-store'
 import type { PredictFunMarketData } from './predict-fun-market-data'
@@ -11,10 +11,19 @@ import type { PredictFunPageCaptureSource } from './predict-fun-page-capture'
 import type { VenueExecutionRequest } from '../platforms/venue-adapter'
 
 const API_BASE = 'https://api.predict.fun'
-const BNB_RPC_URL = 'https://bsc-dataseed.binance.org'
+const BNB_RPC_URL = 'https://bsc-dataseed.bnbchain.org/'
+const BNB_RPC_FALLBACKS = [
+  BNB_RPC_URL,
+  'https://bsc-dataseed.binance.org/',
+  'https://bsc-dataseed1.binance.org/',
+  'https://bsc-dataseed2.binance.org/'
+]
 const REQUEST_TIMEOUT_MS = 6_000
-const FILL_POLL_ATTEMPTS = 5
-const FILL_POLL_INTERVAL_MS = 120
+// A confirmed page fill took about three seconds in the live sample. Keep API
+// reconciliation inside the same ten-second envelope instead of giving up
+// after the previous ~0.6 seconds.
+const FILL_POLL_ATTEMPTS = 40
+const FILL_POLL_INTERVAL_MS = 250
 
 interface PredictAuthMessageResponse { data?: { message?: string } }
 interface PredictAuthResponse { data?: { token?: string } }
@@ -36,10 +45,21 @@ interface PredictOrderStatusResponse {
 export interface PredictFunOrderResult {
   orderId?: string
   orderHash?: string
+  transport?: 'API' | 'PAGE'
   status: 'ACCEPTED' | 'PARTIAL' | 'FILLED' | 'REJECTED' | 'UNKNOWN' | 'CANCELED'
   filledQuantity: string
   averagePrice?: string
   message?: string
+}
+
+function createBnbProvider(preferredUrl: string): FallbackProvider {
+  const urls = [preferredUrl, ...BNB_RPC_FALLBACKS].filter((url, index, all) => Boolean(url) && all.indexOf(url) === index)
+  return new FallbackProvider(urls.map((url, index) => ({
+    provider: new JsonRpcProvider(url, 56, { staticNetwork: true }),
+    priority: index + 1,
+    stallTimeout: index === 0 ? 1_500 : 2_500,
+    weight: 1
+  })), 56, { quorum: 1 })
 }
 
 export class PredictFunTradingService {
@@ -47,7 +67,7 @@ export class PredictFunTradingService {
   private builder?: { key: string; value: PredictOrderBuilder }
   private authInFlight?: Promise<string>
   private builderInFlight?: Promise<PredictOrderBuilder>
-  private readonly provider: JsonRpcProvider
+  private readonly provider: FallbackProvider
 
   constructor(
     private readonly credentials: PredictFunCredentialStore,
@@ -56,7 +76,7 @@ export class PredictFunTradingService {
     rpcUrl = BNB_RPC_URL,
     private readonly pageExecutor?: PredictFunPageCaptureSource
   ) {
-    this.provider = new JsonRpcProvider(rpcUrl, 56, { staticNetwork: true })
+    this.provider = createBnbProvider(rpcUrl)
   }
 
   credentialsChanged(): void {
@@ -64,7 +84,42 @@ export class PredictFunTradingService {
     this.builder = undefined
   }
 
+  /**
+   * Warm the signing builder and JWT outside the opportunity hot path. This
+   * never places an order; failures are logged and left for the normal submit
+   * path to report with its usual safety checks.
+   */
+  async warmUp(): Promise<void> {
+    const startedAt = Date.now()
+    try {
+      const credentials = await this.credentials.getCredentials()
+      const builderStartedAt = Date.now()
+      const builder = await this.getBuilder(credentials)
+      const builderMs = Date.now() - builderStartedAt
+      const authStartedAt = Date.now()
+      await this.getJwt(credentials, builder)
+      const authMs = Date.now() - authStartedAt
+      console.info(`[Predict预热] ${JSON.stringify({ ok: true, builderMs, authMs, totalMs: Date.now() - startedAt })}`)
+    } catch (error) {
+      // Missing credentials is normal when the user is using page mode. Do
+      // not turn background warming into a visible execution failure.
+      console.info(`[Predict预热] ${JSON.stringify({ ok: false, elapsedMs: Date.now() - startedAt, error: error instanceof Error ? error.message : String(error) })}`)
+    }
+  }
+
   async submit(request: VenueExecutionRequest): Promise<PredictFunOrderResult> {
+    const startedAt = Date.now()
+    const timed = async <T>(phase: string, operation: () => Promise<T>, details: Record<string, string | number | boolean> = {}): Promise<T> => {
+      const phaseStartedAt = Date.now()
+      try {
+        const result = await operation()
+        console.info(`[Predict耗时] ${JSON.stringify({ phase, elapsedMs: Date.now() - phaseStartedAt, ok: true, ...details })}`)
+        return result
+      } catch (error) {
+        console.info(`[Predict耗时] ${JSON.stringify({ phase, elapsedMs: Date.now() - phaseStartedAt, ok: false, error: error instanceof Error ? error.message : String(error), ...details })}`)
+        throw error
+      }
+    }
     let credentials: PredictFunCredentials | undefined
     try {
       credentials = await this.credentials.getCredentials()
@@ -82,7 +137,7 @@ export class PredictFunTradingService {
     if (!price.isFinite() || price.lte(0) || price.gte(1)) throw new Error('Predict.fun 下单价格无效')
     if (!quantity.isFinite() || quantity.lte(0)) throw new Error('Predict.fun 下单数量无效')
 
-    const builder = await this.getBuilder(credentials)
+    const builder = await timed('builder', () => this.getBuilder(credentials!), { marketId: request.marketId })
     const amounts = builder.getLimitOrderAmounts({
       side: PredictSide.BUY,
       pricePerShareWei: parseEther(price.toString()),
@@ -102,24 +157,29 @@ export class PredictFunTradingService {
       isNegRisk: metadata.isNegRisk,
       isYieldBearing: metadata.isYieldBearing
     })
-    const signed = await builder.signTypedDataOrder(typedData)
+    const signed = await timed('sign', () => builder.signTypedDataOrder(typedData), { marketId: request.marketId })
     const orderHash = builder.buildTypedDataHash(typedData)
-    const jwt = await this.getJwt(credentials, builder)
-    const response = await this.request<PredictOrderResponse>('/v1/orders', credentials, jwt, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json; charset=utf-8' },
-      body: JSON.stringify({
-        data: {
-          order: { ...signed, hash: orderHash },
-          pricePerShare: price.toString(),
-          strategy: 'LIMIT'
-        }
-      })
-    })
+    const jwt = await timed('auth', () => this.getJwt(credentials!, builder))
+    const response = await timed(
+      'order.post',
+      () => this.request<PredictOrderResponse>('/v1/orders', credentials!, jwt, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({
+          data: {
+            order: { ...signed, hash: orderHash },
+            pricePerShare: amounts.pricePerShare.toString(),
+            strategy: 'LIMIT'
+          }
+        })
+      }),
+      { marketId: request.marketId, quantity: request.quantity }
+    )
     const orderId = response.data?.orderId
     const returnedHash = response.data?.orderHash ?? orderHash
     if (!orderId) throw new Error(`Predict.fun 下单响应未返回订单号（${response.data?.code ?? 'unknown'}）`)
-    return { orderId, orderHash: returnedHash, status: 'ACCEPTED', filledQuantity: '0', averagePrice: price.toString() }
+    console.info(`[Predict耗时] ${JSON.stringify({ phase: 'submit.total', elapsedMs: Date.now() - startedAt, ok: true, marketId: request.marketId })}`)
+    return { orderId, orderHash: returnedHash, transport: 'API', status: 'ACCEPTED', filledQuantity: '0', averagePrice: price.toString() }
   }
 
   async executionMode(durationMinutes: 5 | 15): Promise<'API' | 'PAGE' | 'UNAVAILABLE'> {
@@ -147,7 +207,7 @@ export class PredictFunTradingService {
       allowSubmit: true
     })
     const parsed = parsePageOrderResult(response.body, response.status)
-    return parsed
+    return { ...parsed, transport: 'PAGE' }
   }
 
   async reconcile(orderHash: string): Promise<PredictFunOrderResult | undefined> {
@@ -156,9 +216,9 @@ export class PredictFunTradingService {
     const response = await this.request<PredictOrderStatusResponse>(`/v1/orders/${encodeURIComponent(orderHash)}`, credentials, jwt)
     const data = response.data
     if (!data) return undefined
-    const requestedQuantity = new Decimal(String(data.amount ?? 0))
+    const requestedQuantity = normalizeTokenQuantity(data.amount)
     const rawStatus = String(data.status ?? '').toUpperCase()
-    const filledQuantity = String(data.amountFilled ?? (['FILLED', 'MATCHED', 'COMPLETED'].includes(rawStatus) ? data.amount ?? 0 : 0))
+    const filledQuantity = normalizeTokenQuantity(data.amountFilled ?? (['FILLED', 'MATCHED', 'COMPLETED'].includes(rawStatus) ? data.amount ?? 0 : 0)).toString()
     const filled = new Decimal(filledQuantity)
     const status: PredictFunOrderResult['status'] = filled.gt(0) && requestedQuantity.gt(0) && filled.gte(requestedQuantity)
       ? 'FILLED'
@@ -174,21 +234,61 @@ export class PredictFunTradingService {
       orderHash,
       status,
       filledQuantity,
-      averagePrice: data.pricePerShare !== undefined ? String(data.pricePerShare) : undefined,
+      averagePrice: data.pricePerShare !== undefined ? normalizeSharePrice(data.pricePerShare).toString() : undefined,
       message: rawStatus || undefined
     }
   }
 
   async waitForFill(result: PredictFunOrderResult, request: VenueExecutionRequest): Promise<PredictFunOrderResult | undefined> {
+    // Page mode consumes the private wallet WebSocket already opened by the
+    // logged-in page. It does not add an HTTP poll or require an API key.
+    if (result.transport === 'PAGE') {
+      if (new Decimal(result.filledQuantity).gt(0)) return result
+      if (!result.orderId || !this.pageExecutor?.waitForPageOrderFill) return undefined
+      const fill = await this.pageExecutor.waitForPageOrderFill(result.orderId)
+      if (!fill) return undefined
+      if (fill.status === 'REJECTED') {
+        return {
+          orderId: result.orderId,
+          orderHash: fill.orderHash ?? result.orderHash,
+          transport: 'PAGE',
+          status: 'REJECTED',
+          filledQuantity: '0',
+          message: fill.message ?? 'Predict.fun 撮合失败，平台未产生持仓'
+        }
+      }
+      const filled = new Decimal(fill.filledQuantity)
+      const requested = new Decimal(request.quantity)
+      return {
+        orderId: result.orderId,
+        orderHash: fill.orderHash ?? result.orderHash,
+        transport: 'PAGE',
+        status: filled.gte(requested) ? 'FILLED' : 'PARTIAL',
+        filledQuantity: fill.filledQuantity,
+        averagePrice: fill.averagePrice ?? request.limitPrice,
+        message: `${fill.source}${fill.feeQuantity ? `；已扣除 ${fill.feeQuantity} 份手续费` : ''}`
+      }
+    }
     if (!result.orderHash && !result.orderId) return undefined
     let latest = result
+    const startedAt = Date.now()
+    let attempts = 0
+    let terminalStatus: PredictFunOrderResult['status'] | 'NONE' = 'NONE'
     const lookup = result.orderHash ?? result.orderId!
-    for (let attempt = 0; attempt < FILL_POLL_ATTEMPTS; attempt += 1) {
-      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, FILL_POLL_INTERVAL_MS))
-      const current = await this.reconcile(lookup)
-      if (!current) continue
-      latest = current
-      if (current.status === 'FILLED' || current.status === 'PARTIAL' || current.status === 'CANCELED' || current.status === 'REJECTED') break
+    try {
+      for (let attempt = 0; attempt < FILL_POLL_ATTEMPTS; attempt += 1) {
+        attempts = attempt + 1
+        if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, FILL_POLL_INTERVAL_MS))
+        const current = await this.reconcile(lookup)
+        if (!current) continue
+        latest = current
+        if (current.status === 'FILLED' || current.status === 'PARTIAL' || current.status === 'CANCELED' || current.status === 'REJECTED') {
+          terminalStatus = current.status
+          break
+        }
+      }
+    } finally {
+      console.info(`[Predict耗时] ${JSON.stringify({ phase: 'fill.readback', elapsedMs: Date.now() - startedAt, attempts, terminalStatus, orderId: result.orderId })}`)
     }
     if (new Decimal(latest.filledQuantity).lte(0)) return undefined
     if (!latest.averagePrice) latest.averagePrice = request.limitPrice
@@ -226,6 +326,8 @@ export class PredictFunTradingService {
         : await signer.signMessage(message)
       const response = await this.request<PredictAuthResponse>('/v1/auth', credentials, undefined, {
         method: 'POST', headers: { 'content-type': 'application/json' },
+        // Predict Account auth identifies the Smart Wallet/deposit address;
+        // the wrapped signature proves control by the exported signer.
         body: JSON.stringify({ signer: credentials.accountAddress, signature, message })
       })
       const token = response.data?.token
@@ -248,7 +350,18 @@ export class PredictFunTradingService {
     if (jwt) headers.set('authorization', `Bearer ${jwt}`)
     const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS)
     const response = await this.fetchImpl(`${API_BASE}${path}`, { ...init, headers, signal: timeout })
-    if (!response.ok) throw new Error(`api.predict.fun ${path} HTTP ${response.status}`)
+    if (!response.ok) {
+      let detail = ''
+      try {
+        const payload = await response.json() as { message?: string; error?: string; code?: string; data?: { message?: string; code?: string } }
+        const code = payload.code ?? payload.data?.code
+        const message = payload.message ?? payload.error ?? payload.data?.message
+        detail = [code, message].filter(Boolean).join(': ')
+      } catch {
+        // Preserve the status even when the gateway returns a non-JSON body.
+      }
+      throw new Error(`api.predict.fun ${path} HTTP ${response.status}${detail ? ` (${detail})` : ''}`)
+    }
     return await response.json() as T
   }
 }
@@ -262,6 +375,22 @@ function jwtExpiry(token: string): number | undefined {
   } catch {
     return undefined
   }
+}
+
+// Predict's REST readback returns token amounts and, on some API versions,
+// prices as 18-decimal wei strings. Keep the execution layer in human units;
+// otherwise a 3.2-share fill would be reported as 3.2e18 shares and could
+// trigger an unsafe hedge quantity.
+function normalizeTokenQuantity(value: unknown): Decimal {
+  const parsed = new Decimal(String(value ?? 0))
+  if (!parsed.isFinite()) return new Decimal(0)
+  return parsed.abs().gte(new Decimal(10).pow(12)) ? parsed.div(new Decimal(10).pow(18)) : parsed
+}
+
+function normalizeSharePrice(value: unknown): Decimal {
+  const parsed = new Decimal(String(value ?? 0))
+  if (!parsed.isFinite()) return new Decimal(0)
+  return parsed.abs().gt(1) ? parsed.div(new Decimal(10).pow(18)) : parsed
 }
 
 function durationFromRequest(request: VenueExecutionRequest): 5 | 15 {
@@ -294,6 +423,7 @@ function parsePageOrderResult(body: string, httpStatus: number): PredictFunOrder
   const filledQuantity = read(['filledQuantity', 'filled_quantity', 'amountFilled', 'filled', 'quantityFilled']) ?? '0'
   const averagePrice = read(['averagePrice', 'average_price', 'pricePerShare', 'price'])
   const rawStatus = (read(['status', 'state', 'orderStatus']) ?? '').toUpperCase()
+  const message = read(['message', 'reason', 'error', 'code'])
   const status: PredictFunOrderResult['status'] = ['FILLED', 'MATCHED', 'COMPLETED'].includes(rawStatus)
     ? 'FILLED'
     : ['PARTIAL', 'PARTIALLY_FILLED'].includes(rawStatus)
@@ -307,5 +437,5 @@ function parsePageOrderResult(body: string, httpStatus: number): PredictFunOrder
     if (httpStatus >= 400) throw new Error(`Predict.fun 页面下单失败（HTTP ${httpStatus}）`)
     throw new Error('Predict.fun 页面已点击买入但响应未返回订单号；订单状态不明，禁止重试')
   }
-  return { orderId, orderHash, status, filledQuantity, averagePrice }
+  return { orderId, orderHash, status, filledQuantity, averagePrice, message }
 }

@@ -3,10 +3,13 @@ import type { PredictFunTradingService, PredictFunOrderResult } from '../../serv
 import { assertVenueCanExecute, type VenueAdapter, type VenueExecutionRequest, type VenueFill, type VenueOrderReceipt } from '../venue-adapter'
 
 function receiptFromResult(result: PredictFunOrderResult, clientOrderId: string): VenueOrderReceipt {
+  const metadata: Record<string, string | number | boolean> = {}
+  if (result.orderHash) metadata.orderHash = result.orderHash
+  if (result.transport) metadata.transport = result.transport
   return {
     venueId: 'PREDICT_FUN', orderId: result.orderId, clientOrderId, status: result.status,
     filledQuantity: result.filledQuantity, averagePrice: result.averagePrice, receivedAt: Date.now(),
-    metadata: result.orderHash ? { orderHash: result.orderHash } : undefined
+    metadata: Object.keys(metadata).length > 0 ? metadata : undefined
   }
 }
 
@@ -44,9 +47,14 @@ export class PredictFunVenueAdapter implements VenueAdapter {
     const orderHash = String(receipt.metadata?.orderHash ?? '')
     const result = await this.trading.waitForFill({
       orderId: receipt.orderId, orderHash: orderHash || undefined, status: receipt.status,
-      filledQuantity: receipt.filledQuantity, averagePrice: receipt.averagePrice
+      filledQuantity: receipt.filledQuantity, averagePrice: receipt.averagePrice,
+      transport: receipt.metadata?.transport === 'PAGE' ? 'PAGE' : receipt.metadata?.transport === 'API' ? 'API' : undefined
     }, request)
     if (!result || !result.orderId) return undefined
+    if (result.status === 'REJECTED' || result.status === 'CANCELED') {
+      throw new Error(result.message ?? `Predict.fun 订单 ${result.orderId} 未成交`)
+    }
+    if (!new Decimal(result.filledQuantity).isFinite() || new Decimal(result.filledQuantity).lte(0)) return undefined
     return {
       venueId: this.venueId, orderId: result.orderId, direction: request.direction,
       quantity: result.filledQuantity, averagePrice: result.averagePrice ?? request.limitPrice,

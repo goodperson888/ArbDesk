@@ -49,6 +49,49 @@ describe('two-leg execution machine', () => {
     expect(receipt.secondLeg?.filledQuantity).toBe('1')
   })
 
+  it('hedges a rounding-only first-leg overfill after reducing to the second venue precision', async () => {
+    const first = adapter('A', '2.005')
+    const second = adapter('B', '2')
+    const receipt = await new TwoLegExecutionMachine().execute(request(), new Map([['A', first], ['B', second]]))
+    expect(receipt.status).toBe('HEDGED')
+    expect(second.submitOrder).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(second.submitOrder).mock.calls[0][0].quantity).toBe('2.00')
+    expect(receipt.message).toContain('按第二腿精度对齐')
+  })
+
+  it('hedges a material first-leg overfill when the second-leg quote has enough fresh depth', async () => {
+    const first = adapter('A', '2.5')
+    const second = adapter('B', '2.5')
+    const receipt = await new TwoLegExecutionMachine().execute(request(), new Map([['A', first], ['B', second]]))
+    expect(receipt.status).toBe('HEDGED')
+    expect(second.submitOrder).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(second.submitOrder).mock.calls[0][0].quantity).toBe('2.50')
+    expect(receipt.message).toContain('双腿已对齐')
+  })
+
+  it('stops a material overfill when the second-leg captured depth cannot cover it', async () => {
+    const first = adapter('A', '2.5')
+    const second = adapter('B', '2.5')
+    const constrainedRequest = {
+      ...request(),
+      legs: request().legs.map((leg, index) => index === 1 ? { ...leg, availableQuantity: '2.2' } : leg) as MultiVenueExecutionRequest['legs']
+    }
+    const receipt = await new TwoLegExecutionMachine().execute(constrainedRequest, new Map([['A', first], ['B', second]]))
+    expect(receipt.status).toBe('RECOVERY_REQUIRED')
+    expect(second.submitOrder).not.toHaveBeenCalled()
+    expect(receipt.message).toContain('可用深度仅2.2份')
+  })
+
+  it('stops a material overfill when the whole-trade capital cap would be exceeded', async () => {
+    const first = adapter('A', '2.5')
+    const second = adapter('B', '2.5')
+    const cappedRequest = { ...request(), maxCapitalPerTrade: '2.00' }
+    const receipt = await new TwoLegExecutionMachine().execute(cappedRequest, new Map([['A', first], ['B', second]]))
+    expect(receipt.status).toBe('RECOVERY_REQUIRED')
+    expect(second.submitOrder).not.toHaveBeenCalled()
+    expect(receipt.message).toContain('超过单笔上限')
+  })
+
   it('starts both unprotected submissions before either response resolves and keeps equal target quantities', async () => {
     const first = adapter('A')
     const second = adapter('B')

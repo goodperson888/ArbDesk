@@ -73,8 +73,19 @@ async function signedGet<T>(fetchImpl: FetchLike, credentials: KalshiCredentials
   assertKalshiPreparationRequestAllowed('GET', url)
   try {
     const response = await fetchImpl(url, { method: 'GET', headers: kalshiHeaders(credentials, 'GET', path), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
-    if (!response.ok) throw new Error(`Kalshi GET ${path} HTTP ${response.status}`)
-    return await response.json() as T
+    const responseBody = await response.text()
+    if (!response.ok) {
+      let detail = ''
+      try {
+        const parsed = JSON.parse(responseBody) as { code?: string; message?: string; error?: { code?: string; message?: string } }
+        const source = parsed.error ?? parsed
+        detail = [source.code, source.message].filter(Boolean).join(' · ')
+      } catch {
+        detail = responseBody.replace(/\s+/g, ' ').trim().slice(0, 240)
+      }
+      throw new Error(`Kalshi GET ${path} HTTP ${response.status}${detail ? ` · ${detail}` : ''}`)
+    }
+    return JSON.parse(responseBody) as T
   } catch (error) {
     const name = error instanceof Error ? error.name : ''
     const message = error instanceof Error ? error.message : String(error)

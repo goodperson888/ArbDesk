@@ -203,7 +203,7 @@ tbody tr:hover { background: rgba(30,41,59,.38); }
 tbody tr.opportunity-row.read-only { cursor: pointer; }
 tbody tr.opportunity-row.read-only:hover { background: rgba(30,41,59,.32); }
 tbody tr:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
-tbody tr.opportunity-row.ready:not(.selected) { background: rgba(34,197,94,.055); animation: opportunity-ready-pulse .55s ease-out 2; }
+tbody tr.opportunity-row.ready:not(.selected) { background: rgba(34,197,94,.075); animation: opportunity-ready-pulse .9s ease-out 1; }
 tbody tr.selected { background: linear-gradient(90deg, rgba(34,197,94,.08), rgba(15,23,42,.1)); box-shadow: inset 2px 0 var(--green); }
 td small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; }
 .duration-pill { min-width: 32px; display: inline-flex; justify-content: center; padding: 3px 6px; color: #dbeafe; background: rgba(37,99,235,.14); border: 1px solid rgba(96,165,250,.18); border-radius: 6px; font-weight: 750; }
@@ -517,6 +517,20 @@ tbody tr.opportunity-row.manual-executable:hover { background: rgba(245,158,11,.
 .browser-status-detail { margin-top: 10px; display: grid !important; grid-template-columns: auto 1fr; align-items: center; gap: 8px; padding: 8px 9px; border: 1px solid var(--border-soft); border-radius: 8px; background: rgba(15,23,42,.4); }
 .browser-status-detail span { padding: 3px 6px; color: #bae6fd; border-radius: 5px; background: rgba(56,189,248,.1); font-size: 8px; font-weight: 800; letter-spacing: .07em; }
 .browser-status-detail p { margin: 0; color: var(--muted); font-size: 9px; line-height: 1.4; }
+.multi-venue-execution-status { margin-top: 10px; display: grid; grid-template-columns: 26px 1fr; gap: 8px; padding: 9px 10px; border: 1px solid rgba(56,189,248,.28); border-radius: 9px; color: #dff6ff; background: rgba(8,47,73,.42); }
+.multi-venue-execution-status.done { border-color: rgba(34,197,94,.32); color: #dcfce7; background: rgba(5,46,22,.35); }
+.multi-venue-execution-status.danger { border-color: rgba(239,68,68,.4); color: #fee2e2; background: rgba(69,10,10,.38); }
+.multi-venue-status-icon { display: grid; place-items: center; color: currentColor; }
+.multi-venue-status-icon svg { width: 17px; height: 17px; }
+.multi-venue-status-body { min-width: 0; }
+.multi-venue-status-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.multi-venue-status-head strong { font-size: 11px; }
+.multi-venue-status-head span { color: var(--muted); font-family: var(--mono); font-size: 9px; font-variant-numeric: tabular-nums; }
+.multi-venue-status-body p { margin: 3px 0 0; color: var(--muted); font-size: 9px; line-height: 1.45; }
+.multi-venue-status-legs { display: flex; flex-wrap: wrap; gap: 4px 8px; margin-top: 5px; color: var(--text-soft); font-family: var(--mono); font-size: 8px; }
+.multi-venue-status-progress { height: 3px; margin-top: 7px; overflow: hidden; border-radius: 999px; background: rgba(255,255,255,.1); }
+.multi-venue-status-progress span { display: block; width: 45%; height: 100%; border-radius: inherit; background: currentColor; animation: progress 1.4s ease-in-out infinite alternate; }
+.multi-venue-status-progress span.complete { width: 100%; animation: none; }
 .auto-open-status.stabilizing span, .auto-open-status.verifying span { color: #fde68a; background: rgba(245,158,11,.12); }
 .auto-open-status.error span { color: #fecaca; background: rgba(239,68,68,.12); }
 .auto-open-status.cooldown span { color: #cbd5e1; background: rgba(148,163,184,.12); }
@@ -590,7 +604,7 @@ tbody tr.opportunity-row.manual-executable:hover { background: rgba(245,158,11,.
 @keyframes progress { from { transform: translateX(-20%); } to { transform: translateX(130%); } }
 @keyframes drawer-in { from { transform: translateX(30px); opacity: .5; } to { transform: translateX(0); opacity: 1; } }
 @keyframes toast-in { from { transform: translateY(8px); opacity: 0; } }
-@keyframes opportunity-ready-pulse { 50% { background: rgba(34,197,94,.18); box-shadow: inset 0 0 0 1px rgba(74,222,128,.22); } }
+@keyframes opportunity-ready-pulse { from { background: rgba(34,197,94,.18); box-shadow: inset 0 0 0 1px rgba(74,222,128,.22); } to { background: rgba(34,197,94,.075); box-shadow: inset 0 0 0 1px rgba(74,222,128,0); } }
 
 @media (max-width: 1180px) {
   .connection-strip { display: flex; justify-content: flex-start; }

@@ -26,11 +26,17 @@ import type { FingerprintBrowserRuntime } from './fingerprint-browser-runtime'
 
 const MEXC_URL = 'https://prediction.mexc.com/prediction-markets/all'
 const HUBSTUDIO_API = 'http://127.0.0.1:6873'
+const HUBSTUDIO_API_PORT_FALLBACKS = [6873, 56975]
 const MEXC_USDT_COIN_ID = '128f589271cb4951b03e71e6323eb7be'
-const MEXC_EVENT_CACHE_MS = 10_000
+// Event rotation is frequent on the 5m board. Keep the directory cache short
+// enough that a just-opened round is not hidden behind the previous response.
+const MEXC_EVENT_CACHE_MS = 2_000
 const MEXC_FRESHNESS_NOTIFY_THROTTLE_MS = 250
 const MEXC_FEE_CACHE_MS = 10 * 60_000
-const MEXC_REST_FALLBACK_MS = 10_000
+// The default board freshness gate is 8 seconds. Keep the audited REST
+// fallback below that threshold so a temporarily undecodable/missing WS depth
+// frame cannot make a healthy browser market oscillate between fresh/stale.
+const MEXC_REST_FALLBACK_MS = 5_000
 const MEXC_PREFLIGHT_QUOTE_MS = 500
 const MEXC_RATE_LIMIT_COOLDOWN_MS = 60_000
 const MEXC_FORBIDDEN_COOLDOWN_MS = 15 * 60_000
@@ -150,6 +156,12 @@ function normalizeSourceTimestamp(value: number | undefined): number | undefined
   return value < 10_000_000_000 ? value * 1_000 : value
 }
 
+function normalizeMexcEventTime(value: number | string | undefined): number {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric) || numeric <= 0) return 0
+  return numeric < 10_000_000_000 ? numeric * 1_000 : numeric
+}
+
 export interface MexcOutcomeQuote {
   direction: Direction
   symbolId: string
@@ -186,11 +198,26 @@ export class MexcBrowserManager {
   private hubstudioApiBase?: string
   private hubstudioConnectedContainerCode?: string
   private hubstudioMonitor?: NodeJS.Timeout
-  private lastPredictionFreshnessNotifyAt = 0
+  private hubstudioPredictionSyncPromise?: Promise<void>
+  /**
+   * Symbols discovered in the active event directory, including a side whose
+   * depth is temporarily missing. Subscriptions must be based on this set,
+   * not only on fully assembled windows; otherwise one incomplete rollover
+   * permanently drops that duration from the live feed.
+   */
+  private hubstudioPredictionTargets = new Map<5 | 15, { upSymbolId: string; downSymbolId: string }>()
+  private hubstudioMarketRefreshPromise?: Promise<void>
   private hubstudioNetworkSession?: CDPSession
   private hubstudioSocketUrls = new Map<string, string>()
   private hubstudioPredictionConfirmedAt = 0
   private hubstudioPredictionSubscriptionKey = ''
+  private hubstudioBinaryFrameCount = 0
+  private hubstudioPredictFrameCount = 0
+  private hubstudioDepthFrameCount = 0
+  private hubstudioIndexFrameCount = 0
+  private lastHubstudioBinaryFrameAt = 0
+  private lastHubstudioDepthFrameAt = 0
+  private lastHubstudioDepthSymbolId = ''
   private hubstudioPassiveConnectPromise?: Promise<boolean>
   private lastHubstudioPassiveConnectAt = 0
   private lastHubstudioConnectionError?: string
@@ -215,6 +242,7 @@ export class MexcBrowserManager {
   private latestFillRows?: { receivedAt: number; rows: MexcFillLogRow[] }
   private fillRowListeners = new Set<(rows: MexcFillLogRow[]) => void>()
   private latestWindows: MexcWindowQuote[] = []
+  private lastWindowDiagnostic = ''
   private monitoringEnabled = true
   private marketDataListeners = new Set<() => void>()
   private instrumentedHubstudioPages = new WeakSet<Page>()
@@ -283,6 +311,20 @@ export class MexcBrowserManager {
 
   getLatestWindows(): MexcWindowQuote[] {
     return this.latestWindows
+  }
+
+  getWindowDiagnostic(): string {
+    if (this.mode !== 'HUBSTUDIO') return this.lastWindowDiagnostic
+    const now = Date.now()
+    const age = (receivedAt: number): string => receivedAt > 0
+      ? `${Math.max(0, Math.floor((now - receivedAt) / 1_000))}s`
+      : '无'
+    const quoteAges = this.latestWindows.flatMap((window) => (['UP', 'DOWN'] as const).map((direction) => {
+      const outcome = window.outcomes[direction]
+      return `${window.durationMinutes}m${direction}:${age(outcome?.receivedAt ?? 0)}`
+    }))
+    const streamDiagnostic = `流诊断 原始${this.hubstudioBinaryFrameCount}(${age(this.lastHubstudioBinaryFrameAt)})/Predict${this.hubstudioPredictFrameCount}(${age(this.hubstudioPredictionConfirmedAt)})/深度${this.hubstudioDepthFrameCount}(${age(this.lastHubstudioDepthFrameAt)}${this.lastHubstudioDepthSymbolId ? `,${this.lastHubstudioDepthSymbolId}` : ''})/指数${this.hubstudioIndexFrameCount}`
+    return [this.lastWindowDiagnostic, streamDiagnostic, quoteAges.length > 0 ? `盘口年龄 ${quoteAges.join(' ')}` : '盘口年龄 无'].filter(Boolean).join('；')
   }
 
   getCachedAccountState(): MexcAccountState | undefined {
@@ -372,20 +414,29 @@ export class MexcBrowserManager {
     }
 
     const active = events
-      .filter((event) => event.s === 2 && Number(event.st) <= now && Number(event.et) > now)
+      .filter((event) => Number(event.s) === 2 && normalizeMexcEventTime(event.st) <= now && normalizeMexcEventTime(event.et) > now)
       .filter((event) => event.mn === 'BTC 5min' || event.mn === 'BTC 15min')
     const selected = [300, 900]
-      .map((seconds) => active.find((event) => event.sp === seconds))
+      .map((seconds) => active.find((event) => Number(event.sp) === seconds))
       .filter((event): event is MexcRawEvent => Boolean(event))
-    // Start warming the two execution pages as soon as the active events are
-    // known, while depth/index/fee fallbacks continue in parallel. Previously
-    // page warming only began after every quote request completed, so a click
-    // near a 5m/15m rollover could spend several seconds navigating here.
-    if (this.mode === 'HUBSTUDIO' && !this.hubstudioOrderWarmPromise) {
-      this.hubstudioOrderWarmPromise = this.warmHubstudioOrderPages(selected)
-        .catch(() => undefined)
-        .finally(() => { this.hubstudioOrderWarmPromise = undefined })
+    for (const event of selected) {
+      const upSymbolId = String(event.ers?.find((outcome) => String(outcome.rn ?? '').toUpperCase() === 'UP')?.si ?? '')
+      const downSymbolId = String(event.ers?.find((outcome) => String(outcome.rn ?? '').toUpperCase() === 'DOWN')?.si ?? '')
+      const duration = Number(event.sp) === 300 ? 5 as const : 15 as const
+      if (upSymbolId && downSymbolId) this.hubstudioPredictionTargets.set(duration, { upSymbolId, downSymbolId })
     }
+    const missingDirectoryDurations = [300, 900]
+      .filter((seconds) => !selected.some((event) => Number(event.sp) === seconds))
+      .map((seconds) => `${seconds === 300 ? 5 : 15}m`)
+    this.lastWindowDiagnostic = missingDirectoryDurations.length > 0
+      ? `事件目录未找到 ${missingDirectoryDurations.join('/')} 当前轮`
+      : ''
+    // Do not keep separate 5m/15m execution tabs hot while monitoring. The
+    // direct order API runs in the monitor page and does not need those tabs;
+    // permanently warming both detail pages costs two Chromium renderer
+    // processes and is especially expensive in Hubstudio. If a direct order
+    // cannot be used, prepareHubstudioOrder falls back to the current page's
+    // controls on demand.
     const symbolIds = [...new Set(selected.flatMap((event) => event.ers ?? []).map((outcome) => String(outcome.si ?? '')).filter(Boolean))]
     // 直连下单依赖 symbolsV2 的 si→currencyId 映射；开盘滚动会出现新si，
     // 缓存缺失或临近过期（>7分钟，早于10分钟TTL）时后台刷新，
@@ -399,10 +450,10 @@ export class MexcBrowserManager {
         .catch(() => undefined)
         .finally(() => { this.symbolCurrencyMapRefreshPromise = undefined })
     }
-    const effectiveDepthReceivedAt = (symbolId: string): number => Math.max(
-      Number(this.interceptedDepth.get(symbolId)?.receivedAt) || 0,
-      this.hubstudioPredictionSubscriptionKey.includes(symbolId) ? this.hubstudioPredictionConfirmedAt : 0
-    )
+    // Only a symbol-specific depth frame or REST response can refresh a book.
+    // Generic predict channels (mini tickers/pings/indexes) prove the socket is
+    // alive but must not disguise an old order book as fresh.
+    const effectiveDepthReceivedAt = (symbolId: string): number => Number(this.interceptedDepth.get(symbolId)?.receivedAt) || 0
     const missingDepthSymbolIds = symbolIds.filter((symbolId) =>
       !this.interceptedDepth.get(symbolId)?.data?.asks?.length ||
       now - effectiveDepthReceivedAt(symbolId) > MEXC_REST_FALLBACK_MS
@@ -418,13 +469,21 @@ export class MexcBrowserManager {
         now: number
       }) => {
         const [depths, indexRange, feeRows] = await Promise.all([
+          // A single symbol can briefly return an empty book or an HTTP error
+          // during the 5m/15m rollover. Keep the other symbols usable instead
+          // of rejecting the whole batch and making both windows look expired.
           Promise.all(request.symbolIds.map(async (symbolId) => {
-            const response = await fetch(`/api/platform/predict/market/web/depth?symbolId=${encodeURIComponent(symbolId)}`, {
-              headers: { accept: 'application/json' }
-            })
-            if (!response.ok) throw new Error(`MEXC depth HTTP ${response.status}`)
-            return { symbolId, depth: await response.json() as MexcRawDepth, receivedAt: Date.now() }
-          })),
+            try {
+              const response = await fetch(`/api/platform/predict/market/web/depth?symbolId=${encodeURIComponent(symbolId)}`, {
+                headers: { accept: 'application/json' }
+              })
+              if (!response.ok) throw new Error(`MEXC depth HTTP ${response.status}`)
+              return { symbolId, depth: await response.json() as MexcRawDepth, receivedAt: Date.now() }
+            } catch (error) {
+              console.warn(`[MEXC盘口] depth 获取失败，跳过 symbol ${symbolId}: ${error instanceof Error ? error.message : String(error)}`)
+              return undefined
+            }
+          })).then((rows) => rows.filter((row): row is { symbolId: string; depth: MexcRawDepth; receivedAt: number } => Boolean(row))),
           request.needIndex
             ? fetch(`/api/platform/predict/market/web/event/index/price/range?indexName=BTC&start=${request.now - 30_000}&end=${request.now}`, {
                 headers: { accept: 'application/json' }
@@ -457,46 +516,73 @@ export class MexcBrowserManager {
     }
 
     const feeCalibration = this.cachedFeeCalibration ?? { feeRate: '0', source: 'UNAVAILABLE' as const, receivedAt: 0 }
-    const windows: MexcWindowQuote[] = selected.map((event) => {
+    const incompleteEvents: string[] = []
+    const eventReceivedAt = this.interceptedEvents?.receivedAt ?? now
+    const windows: MexcWindowQuote[] = []
+    for (const event of selected) {
       const parsed = new Map<Direction, MexcOutcomeQuote>()
       for (const outcome of event.ers ?? []) {
         const normalized = String(outcome.rn ?? '').toUpperCase()
         if (normalized !== 'UP' && normalized !== 'DOWN') continue
         const symbolId = String(outcome.si ?? '')
         const effectiveDepth = this.interceptedDepth.get(symbolId)
-        if (!effectiveDepth) continue
-        const levels = (effectiveDepth.data?.asks ?? [])
+        const levels = (effectiveDepth?.data?.asks ?? [])
           .map((level) => ({ price: String(level.p ?? ''), size: String(level.q ?? '') }))
           .filter((level) => Number(level.price) > 0 && Number(level.size) > 0)
           .sort((left, right) => Number(left.price) - Number(right.price))
         const best = levels[0]
-        if (!best) continue
+        // The page can show the event's current ask while the symbol-specific
+        // depth endpoint is briefly empty during rollover or when that side
+        // has no posted size. Keep that fresh price visible as PRICE_ONLY
+        // (askSize=0), but never treat it as executable depth; venue gates
+        // still block automatic orders until real asks arrive.
+        const eventAsk = String(outcome.ap ?? '')
+        if (!best && !(Number(eventAsk) > 0 && Number(eventAsk) < 1)) continue
         parsed.set(normalized, {
           direction: normalized,
           symbolId,
-          bestAsk: best.price,
-          askSize: best.size,
+          bestAsk: best?.price ?? eventAsk,
+          askSize: best?.size ?? '0',
           levels,
-          receivedAt: Math.max(Number(effectiveDepth.receivedAt) || 0, effectiveDepthReceivedAt(symbolId))
+          receivedAt: best
+            ? Math.max(Number(effectiveDepth?.receivedAt) || 0, effectiveDepthReceivedAt(symbolId))
+            : eventReceivedAt
         })
       }
       const up = parsed.get('UP')
       const down = parsed.get('DOWN')
-      if (!up || !down) throw new Error(`MEXC 事件 ${event.id} 的 UP/DOWN 盘口不完整`)
-      return {
+      if (!up || !down) {
+        const missing = [!up ? 'UP' : '', !down ? 'DOWN' : ''].filter(Boolean).join('/')
+        incompleteEvents.push(`${Number(event.sp) === 300 ? '5m' : '15m'}#${String(event.id ?? '?')} 缺 ${missing}`)
+        continue
+      }
+      windows.push({
         eventId: String(event.id),
         durationMinutes: Number(event.sp) === 300 ? 5 as const : 15 as const,
-        startTime: Number(event.st),
-        endTime: Number(event.et),
+        startTime: normalizeMexcEventTime(event.st),
+        endTime: normalizeMexcEventTime(event.et),
         baselinePrice: String(event.bsp ?? ''),
         indexPrice: this.latestMexcIndex?.price,
         indexReceivedAt: this.latestMexcIndex?.receivedAt,
         feeRate: feeCalibration.feeRate,
         feeRateSource: feeCalibration.source,
         outcomes: { UP: up, DOWN: down }
-      }
-    })
+      })
+    }
+    if (incompleteEvents.length > 0) {
+      console.warn(`[MEXC盘口] 本轮跳过不完整事件：${incompleteEvents.join('；')}`)
+      this.lastWindowDiagnostic = [this.lastWindowDiagnostic, `盘口不完整：${incompleteEvents.join('；')}`].filter(Boolean).join('；')
+    }
+    if (windows.length === 0 && selected.length > 0) {
+      throw new Error(`MEXC 当前 BTC 盘口均不完整：${incompleteEvents.join('；')}`)
+    }
     this.latestWindows = windows
+    if (this.mode === 'HUBSTUDIO' && this.hubstudioPredictionConfirmedAt > 0) {
+      const streamAge = Date.now() - this.hubstudioPredictionConfirmedAt
+      if (streamAge > MEXC_REST_FALLBACK_MS) {
+        this.lastWindowDiagnostic = [this.lastWindowDiagnostic, `实时深度流已 ${Math.floor(streamAge / 1_000)} 秒未收到帧`].filter(Boolean).join('；')
+      }
+    }
     if (this.mode === 'HUBSTUDIO') {
       void this.syncHubstudioPredictionSubscriptions().catch(() => undefined)
     }
@@ -695,6 +781,7 @@ export class MexcBrowserManager {
 
   async waitForFill(match: MexcFillMatch, timeoutMs = 90_000): Promise<import('../../shared/types').Fill | undefined> {
     const readbackStartedAt = Date.now()
+    console.info(`[MEXC成交核验] 开始等待：eventId=${match.eventId} symbolId=${match.symbolId} direction=${match.direction} orderId=${match.orderId ?? '无'} timeout=${timeoutMs}ms`)
     let restQueries = 0
     const measured = (fill: import('../../shared/types').Fill | undefined): import('../../shared/types').Fill | undefined => fill ? {
       ...fill,
@@ -745,13 +832,26 @@ export class MexcBrowserManager {
         this.applyInterceptedFillRows(rows, receivedAt)
         const fill = observer.current() ?? parseMexcFill(rows, match)
         if (fill) return measured(fill)
+      } catch (error) {
+        // The order is already submitted at this point. A transient timeout
+        // from the history endpoint must not abort the whole two-leg state
+        // machine immediately; keep listening for the intercepted page/WS
+        // receipt and use the remaining bounded readback attempts.
+        console.warn(
+          `[MEXC成交核验] 第${restQueries}次查询失败，继续等待被动成交回报：` +
+          `${error instanceof Error ? error.message : String(error)}`
+        )
+        const interceptedDuringQuery = observer.current()
+        if (interceptedDuringQuery) return measured(interceptedDuringQuery)
       } finally {
         observer.stop()
       }
       const intercepted = await this.waitForInterceptedFill(match, Math.min(delay, Math.max(0, deadline - Date.now())))
       if (intercepted) return measured(intercepted)
     }
-    return measured(await this.waitForInterceptedFill(match, Math.max(0, deadline - Date.now())))
+    const result = measured(await this.waitForInterceptedFill(match, Math.max(0, deadline - Date.now())))
+    console.info(`[MEXC成交核验] ${result ? `已检测到成交 ${result.quantity}份` : '超时未检测到成交'}，耗时${Date.now() - readbackStartedAt}ms，REST查询${restQueries}次`)
+    return result
   }
 
   async calibrate(kind: MexcCalibrationKind): Promise<MexcBrowserStatus> {
@@ -1064,7 +1164,21 @@ export class MexcBrowserManager {
     if (this.mode === 'HUBSTUDIO') {
       const page = this.hubstudioPage
       if (!page || page.isClosed()) throw new Error('Hubstudio MEXC页面不可用')
-      return await page.evaluate(fn as never, argument as never) as T
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const urlBefore = page.url()
+        try {
+          const result = await page.evaluate(fn as never, argument as never) as T
+          return result
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          const navigationRace = /execution context was destroyed|most likely because of a navigation|frame was detached|target page, context or browser has been closed/i.test(message)
+          if (!navigationRace || attempt === 1 || page.isClosed()) throw error
+          console.warn(`[MEXC读取] 页面导航竞态，等待页面稳定后重试：${urlBefore} -> ${page.url()}`)
+          await page.waitForLoadState('domcontentloaded', { timeout: 8_000 }).catch(() => undefined)
+          await new Promise((resolve) => setTimeout(resolve, 350))
+        }
+      }
+      throw new Error('MEXC页面读取重试失败')
     }
     const window = this.embeddedWindow
     if (!window || window.isDestroyed()) throw new Error('内嵌MEXC页面不可用')
@@ -1084,18 +1198,31 @@ export class MexcBrowserManager {
     init: MexcFetchInit
   ): Promise<MexcFetchOutcome> {
     this.assertMexcRequestsAvailable()
-    const oneShot = async (): Promise<MexcFetchOutcome> => await page.evaluate(async (argument: { url: string; init: MexcFetchInit }) => {
-      const response = await fetch(argument.url, {
-        method: argument.init.method ?? 'GET',
-        credentials: 'include',
-        headers: { accept: 'application/json', ...(argument.init.headers ?? {}) },
-        body: argument.init.body,
-        signal: argument.init.timeoutMs ? AbortSignal.timeout(argument.init.timeoutMs) : undefined
-      })
-      let body: unknown
-      try { body = await response.json() } catch { body = undefined }
-      return { status: response.status, httpOk: response.ok, retryAfter: response.headers.get('retry-after') ?? undefined, body }
-    }, { url, init })
+    const oneShot = async (): Promise<MexcFetchOutcome> => {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          return await page.evaluate(async (argument: { url: string; init: MexcFetchInit }) => {
+            const response = await fetch(argument.url, {
+              method: argument.init.method ?? 'GET',
+              credentials: 'include',
+              headers: { accept: 'application/json', ...(argument.init.headers ?? {}) },
+              body: argument.init.body,
+              signal: argument.init.timeoutMs ? AbortSignal.timeout(argument.init.timeoutMs) : undefined
+            })
+            let body: unknown
+            try { body = await response.json() } catch { body = undefined }
+            return { status: response.status, httpOk: response.ok, retryAfter: response.headers.get('retry-after') ?? undefined, body }
+          }, { url, init })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          const navigationRace = /execution context was destroyed|most likely because of a navigation|frame was detached|target page, context or browser has been closed/i.test(message)
+          if (!navigationRace || attempt === 1 || page.isClosed()) throw error
+          await page.waitForLoadState('domcontentloaded', { timeout: 8_000 }).catch(() => undefined)
+          await new Promise((resolve) => setTimeout(resolve, 350))
+        }
+      }
+      throw new Error('MEXC页面请求重试失败')
+    }
     if (!this.arbFetchJsonPages.has(page)) {
       try {
         await this.installMexcFetchJson(page)
@@ -1332,16 +1459,23 @@ export class MexcBrowserManager {
       requestId: string
       response: { opcode: number; payloadData: string }
     }) => {
-      const socketUrl = this.hubstudioSocketUrls.get(event.requestId)
-      const knownPredictionSocket = socketUrl?.includes('prediction.mexc.com/predict/ws') ?? false
-      if (socketUrl && !knownPredictionSocket) return
-      if (knownPredictionSocket) this.confirmMexcPredictionFreshness(Date.now())
       if (event.response.opcode !== 2) return
-      const decoded = decodeMexcPredictionFrame(Buffer.from(event.response.payloadData, 'base64'))
-      if (!decoded) return
       const receivedAt = Date.now()
+      this.hubstudioBinaryFrameCount += 1
+      this.lastHubstudioBinaryFrameAt = receivedAt
+      const decoded = decodeMexcPredictionFrame(Buffer.from(event.response.payloadData, 'base64'))
+      // CDP may attach after a WebSocket was created, so its URL is not
+      // necessarily present in hubstudioSocketUrls. Trust the decoded
+      // protobuf channel instead of dropping valid predict@ frames solely
+      // because the creation event was missed. Non-predict sockets still
+      // fail closed because the decoder returns undefined for them.
+      if (!decoded || !decoded.channel.startsWith('predict@')) return
+      this.hubstudioPredictFrameCount += 1
       this.confirmMexcPredictionFreshness(receivedAt)
       if (decoded.depth) {
+        this.hubstudioDepthFrameCount += 1
+        this.lastHubstudioDepthFrameAt = receivedAt
+        this.lastHubstudioDepthSymbolId = decoded.depth.symbolId
         const previous = this.interceptedDepth.get(decoded.depth.symbolId)
         const previousVersion = previous?.version
         const nextVersion = decoded.depth.version
@@ -1357,20 +1491,35 @@ export class MexcBrowserManager {
         this.interceptedDepth.set(decoded.depth.symbolId, depth)
         this.applyInterceptedDepth(decoded.depth.symbolId, depth)
       }
-      if (decoded.index) this.applyMexcIndex(decoded.index.price, receivedAt)
+      if (decoded.index) {
+        this.hubstudioIndexFrameCount += 1
+        this.applyMexcIndex(decoded.index.price, receivedAt)
+      }
     })
   }
 
   private async syncHubstudioPredictionSubscriptions(): Promise<void> {
+    if (this.hubstudioPredictionSyncPromise) return await this.hubstudioPredictionSyncPromise
+    this.hubstudioPredictionSyncPromise = this.syncHubstudioPredictionSubscriptionsInternal()
+    try {
+      await this.hubstudioPredictionSyncPromise
+    } finally {
+      this.hubstudioPredictionSyncPromise = undefined
+    }
+  }
+
+  private async syncHubstudioPredictionSubscriptionsInternal(): Promise<void> {
     const page = this.hubstudioPage
-    if (!page || page.isClosed() || this.latestWindows.length === 0) return
+    const targets = [...this.hubstudioPredictionTargets.entries()]
+    if (!page || page.isClosed() || (this.latestWindows.length === 0 && targets.length === 0)) return
     const channels = [
-      ...new Set(this.latestWindows.flatMap((window) => [
-        `predict@public.depth.scale.pb@${window.outcomes.UP.symbolId}@0.01@30`,
-        `predict@public.depth.scale.pb@${window.outcomes.DOWN.symbolId}@0.01@30`,
-        `predict@public.index.realtime.period.pb@BTC@${window.durationMinutes * 60}`
+      ...new Set(targets.flatMap(([duration, target]) => [
+        `predict@public.depth.scale.pb@${target.upSymbolId}@0.01@30`,
+        `predict@public.depth.scale.pb@${target.downSymbolId}@0.01@30`,
+        `predict@public.index.realtime.period.pb@BTC@${duration * 60}`
       ]))
     ].sort()
+    if (channels.length === 0) return
     const key = channels.join('|')
     const active = await page.evaluate((expectedKey: string) => {
       type FeedState = { key: string; isActive: () => boolean; renew: () => void }
@@ -1473,18 +1622,8 @@ export class MexcBrowserManager {
 
   private confirmMexcPredictionFreshness(receivedAt: number): void {
     this.hubstudioPredictionConfirmedAt = receivedAt
-    if (receivedAt - this.lastPredictionFreshnessNotifyAt < MEXC_FRESHNESS_NOTIFY_THROTTLE_MS) return
-    this.lastPredictionFreshnessNotifyAt = receivedAt
-    let changed = false
-    this.latestWindows = this.latestWindows.map((window) => ({
-      ...window,
-      outcomes: Object.fromEntries(Object.entries(window.outcomes).map(([direction, outcome]) => {
-        if (!this.hubstudioPredictionSubscriptionKey.includes(outcome.symbolId)) return [direction, outcome]
-        changed = true
-        return [direction, { ...outcome, receivedAt }]
-      })) as Record<Direction, MexcOutcomeQuote>
-    }))
-    if (changed) for (const listener of this.marketDataListeners) listener()
+    // Do not notify/render or refresh every outcome for generic predict frames.
+    // applyInterceptedDepth updates exactly the symbol carried by a depth frame.
   }
 
   private applyFeeCalibration(
@@ -1762,6 +1901,10 @@ export class MexcBrowserManager {
       // 常驻通道：请求仍由页面上下文发出（cookie/指纹与手动一致），省掉函数体序列化。
       outcome2 = await this.evaluateMexcFetchJson(page, 'https://prediction.mexc.com/api/platform/predict/orderCenter/web/order/place/market', {
         method: 'POST',
+        // A remote Hubstudio page can leave fetch pending indefinitely when
+        // its network tunnel stalls. Bound the request so the execution state
+        // becomes explicitly uncertain instead of remaining STARTED forever.
+        timeoutMs: 8_000,
         headers: {
           accept: '*/*',
           'content-type': 'application/json',
@@ -1809,6 +1952,20 @@ export class MexcBrowserManager {
     }
     if (!orderAccepted) {
       const reason = String(record?.msg ?? record?.message ?? `HTTP ${outcome2.status}`)
+      const codeText = Number.isFinite(responseCode) ? `code=${responseCode}` : `HTTP=${outcome2.status}`
+      const cachedBalance = this.latestAccountState?.availableUsdt
+      const balanceText = cachedBalance === undefined ? '余额快照=未读取' : `余额快照=${cachedBalance} USDT`
+      // Rejections are the only responses that previously did not leave a
+      // useful console trace.  Keep the body intact in the audit result and
+      // print the non-secret request facts needed to distinguish balance,
+      // stale-market and symbol-mapping failures on the next attempt.
+      console.error(
+        `[MEXC直连下单拒绝] ${codeText} msg=${reason} ` +
+        `eventId=${eventId} symbolId=${symbolId} direction=${request.direction} ` +
+        `amount=${request.amount} price=${price} ${balanceText} ` +
+        `timing=${JSON.stringify({ currencyMappingMs, cookieReadMs, postMs: responseAt - submittedAt, totalMs: responseAt - currencyMappingStartedAt })} ` +
+        `响应=${orderResponseBody}`
+      )
       return {
         ok: false,
         orderAccepted: false,
@@ -1820,11 +1977,11 @@ export class MexcBrowserManager {
         currencyMappingMs,
         cookieReadMs,
         postMs: responseAt - submittedAt,
-        message: `MEXC直连下单被拒绝：${reason}；未启动Polymarket对冲`,
+        message: `MEXC直连下单被拒绝（${codeText}）：${reason}；未启动第二腿对冲`,
         matched: {}
       }
     }
-    console.info(`[MEXC直连下单] ${orderResponseUrl} 请求=${orderRequestBody} 响应=${orderResponseBody}`)
+    console.info(`[MEXC直连下单] ${JSON.stringify({ orderResponseUrl, eventId, symbolId, direction: request.direction, currencyMappingMs, cookieReadMs, postMs: responseAt - submittedAt, totalMs: responseAt - currencyMappingStartedAt })} 请求=${orderRequestBody} 响应=${orderResponseBody}`)
     return {
       ok: true,
       orderAccepted: true,
@@ -1855,8 +2012,13 @@ export class MexcBrowserManager {
     // 直连下单：字段映射已验证时直接POST下单API，跳过全部UI操作
     // （切盘、点方向、填金额、等按钮），约省1.4s；解析不了则回退UI自动化。
     if (request.allowSubmit && request.eventId) {
+      const directStartedAt = Date.now()
       const direct = await this.trySubmitHubstudioOrderDirect(page, request)
-      if (direct) return direct
+      if (direct) {
+        console.info(`[MEXC下单] 直连接口路径完成，耗时${Date.now() - directStartedAt}ms`)
+        return direct
+      }
+      console.warn(`[MEXC下单] 直连接口未使用，耗时${Date.now() - directStartedAt}ms；回退网页控件路径`)
     }
     if (request.durationMinutes && request.startTime) {
       try {
@@ -2015,7 +2177,7 @@ export class MexcBrowserManager {
             submittedAt,
             responseAt,
             submissionUncertain: false,
-            message: `MEXC下单接口未确认成功：${reason}；未启动Polymarket对冲`,
+            message: `MEXC下单接口未确认成功：${reason}；未启动第二腿对冲`,
             matched,
             ...orderCapture
           }
@@ -2174,19 +2336,68 @@ export class MexcBrowserManager {
   }
 
   private async resolveLiveMarketTarget(durationMinutes: MarketDuration, startTime: number): Promise<{ eventId: string; url: string }> {
+    const origin = this.mode === 'HUBSTUDIO'
+      ? new URL(this.hubstudioPage?.url() ?? MEXC_URL).origin
+      : new URL(this.embeddedWindow?.webContents.getURL() || MEXC_URL).origin
+    const matches = (candidate: MexcRawEvent, now: number): boolean =>
+      Number(candidate.s) === 2 &&
+      candidate.mn === `BTC ${durationMinutes}min` &&
+      Number(candidate.sp) === durationMinutes * 60 &&
+      normalizeMexcEventTime(candidate.st) === startTime &&
+      normalizeMexcEventTime(candidate.et) > now
+    const toTarget = (event: MexcRawEvent): { eventId: string; url: string } | undefined => {
+      if (!event.id || !event.en) return undefined
+      const slug = event.en
+        .toLowerCase()
+        .replaceAll(',', '')
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '')
+      return {
+        eventId: String(event.id),
+        url: `${origin}/prediction-markets/up-down/${slug}/${event.id}`
+      }
+    }
+    // Reuse the event directory already captured by the monitor first. This
+    // keeps a transient page-network failure from blocking an otherwise valid
+    // order and avoids an extra round trip immediately before navigation.
+    const cachedEvents = this.interceptedEvents
+    if (cachedEvents && Date.now() - cachedEvents.receivedAt <= MEXC_EVENT_CACHE_MS) {
+      const cachedTarget = cachedEvents.events.find((candidate) => matches(candidate, Date.now()))
+      const target = cachedTarget ? toTarget(cachedTarget) : undefined
+      if (target) return target
+    }
     const resolver = async (query: { durationMinutes: MarketDuration; startTime: number }): Promise<{ eventId: string; url: string }> => {
-      const response = await fetch('/api/platform/predict/market/web/event/events', {
-        headers: { accept: 'application/json' }
-      })
-      if (!response.ok) throw new Error(`MEXC events HTTP ${response.status}`)
-      const body = await response.json() as { data?: MexcRawEvent[] }
-      const event = (body.data ?? []).find((candidate) =>
-        candidate.s === 2 &&
+      const normalizeEventTime = (value: unknown): number => {
+        const numeric = Number(value)
+        if (!Number.isFinite(numeric) || numeric <= 0) return 0
+        return numeric < 10_000_000_000 ? numeric * 1_000 : numeric
+      }
+      let events: MexcRawEvent[] = []
+      let lastError = 'MEXC事件目录不可用'
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          const response = await fetch('/api/platform/predict/market/web/event/events', {
+            headers: { accept: 'application/json' },
+            signal: AbortSignal.timeout(3_000)
+          })
+          if (!response.ok) throw new Error(`MEXC events HTTP ${response.status}`)
+          const body = await response.json() as { data?: MexcRawEvent[] }
+          events = body.data ?? []
+          break
+        } catch (error) {
+          lastError = error instanceof Error ? error.message : String(error)
+          if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)))
+        }
+      }
+      const now = Date.now()
+      const event = events.find((candidate) =>
+        Number(candidate.s) === 2 &&
         candidate.mn === `BTC ${query.durationMinutes}min` &&
         Number(candidate.sp) === query.durationMinutes * 60 &&
-        Number(candidate.st) === query.startTime
+        normalizeEventTime(candidate.st) === query.startTime &&
+        normalizeEventTime(candidate.et) > now
       )
-      if (!event?.id || !event.en) throw new Error('所选机会已经跨盘或结束，请刷新套利机会')
+      if (!event?.id || !event.en) throw new Error(`${lastError}；所选机会可能已经跨盘或结束`)
       const slug = event.en
         .toLowerCase()
         .replaceAll(',', '')
@@ -2400,8 +2611,8 @@ export class MexcBrowserManager {
       candidate.s === 2 &&
       candidate.mn === `BTC ${durationMinutes}min` &&
       Number(candidate.sp) === durationMinutes * 60 &&
-      Number(candidate.st) <= now &&
-      Number(candidate.et) > now
+      normalizeMexcEventTime(candidate.st) <= now &&
+      normalizeMexcEventTime(candidate.et) > now
     )
     if (!event?.id || !event.en) return
     const slug = event.en
@@ -2422,7 +2633,39 @@ export class MexcBrowserManager {
     if (this.hubstudioMonitor) clearInterval(this.hubstudioMonitor)
     this.hubstudioMonitor = setInterval(() => {
       if (!this.hubstudioPage || this.hubstudioPage.isClosed()) return
-      void this.followHubstudioLiveMarket().catch(() => undefined)
+      // Do not navigate the monitor tab on every rollover. Market discovery
+      // and depth come from the event directory plus the independent feed;
+      // navigating this page while a read is in flight destroys its execution
+      // context and turns a transient rollover into a full MEXC read failure.
+      // Order-specific pages are still navigated by ensureHubstudioLiveMarket
+      // immediately before an order.
+      // The in-page prediction feed has a 15s lease. Renew it from the
+      // manager's 5s monitor loop instead of waiting for the renderer's
+      // 15s opportunity refresh; otherwise the feed can self-stop between
+      // refreshes and both windows become stale until the next poll.
+      void this.syncHubstudioPredictionSubscriptions().catch(() => undefined)
+      // Independently audit the actual symbol books. This is deliberately not
+      // tied to the renderer's 15-second refresh and keeps a REST-backed quote
+      // below the 8-second freshness gate when the protobuf depth decoder or a
+      // subscription is temporarily quiet.
+      const oldestQuoteAt = this.latestWindows.reduce((oldest, window) => Math.min(
+        oldest,
+        Number(window.outcomes.UP?.receivedAt) || 0,
+        Number(window.outcomes.DOWN?.receivedAt) || 0
+      ), Number.POSITIVE_INFINITY)
+      if (!this.hubstudioMarketRefreshPromise && (!Number.isFinite(oldestQuoteAt) || Date.now() - oldestQuoteAt >= MEXC_REST_FALLBACK_MS)) {
+        this.hubstudioMarketRefreshPromise = this.fetchActiveBtcWindows()
+          .then(() => {
+            // A background REST audit replaces latestWindows directly. Wake
+            // the controller even when no WS depth mutation occurred, so the
+            // refreshed timestamps reach MEXC + non-Polymarket routes.
+            for (const listener of this.marketDataListeners) listener()
+          })
+          .catch((error) => {
+            this.lastWindowDiagnostic = [this.lastWindowDiagnostic, `后台盘口审计失败：${error instanceof Error ? error.message : String(error)}`].filter(Boolean).join('；')
+          })
+          .finally(() => { this.hubstudioMarketRefreshPromise = undefined })
+      }
       void this.prunePredictionTrackerCookies().catch(() => undefined)
       void this.recoverStuckErrorPages().catch(() => undefined)
       if (Date.now() - this.lastHubstudioAccountRefreshAt < 30_000 || this.hubstudioAccountRefreshing) return
@@ -2433,7 +2676,7 @@ export class MexcBrowserManager {
           this.hubstudioAccountRefreshing = false
         })
         .catch(() => undefined)
-    }, 5_000)
+    }, 3_000)
   }
 
   // 长时间运行的环境Cookie会膨胀，MEXC(nginx)可能返回“400 Request Header Or
@@ -2532,6 +2775,15 @@ export class MexcBrowserManager {
     this.hubstudioSocketUrls.clear()
     this.hubstudioPredictionConfirmedAt = 0
     this.hubstudioPredictionSubscriptionKey = ''
+    this.hubstudioPredictionTargets.clear()
+    this.hubstudioMarketRefreshPromise = undefined
+    this.hubstudioBinaryFrameCount = 0
+    this.hubstudioPredictFrameCount = 0
+    this.hubstudioDepthFrameCount = 0
+    this.hubstudioIndexFrameCount = 0
+    this.lastHubstudioBinaryFrameAt = 0
+    this.lastHubstudioDepthFrameAt = 0
+    this.lastHubstudioDepthSymbolId = ''
     this.hubstudioOrderPages.clear()
     this.hubstudioOrderWarmPromise = undefined
     this.lastHubstudioPassiveConnectAt = 0
@@ -2568,7 +2820,9 @@ export class MexcBrowserManager {
     } catch {
       // 进程扫描失败时只依赖固定端口
     }
-    candidates.push(6873)
+    // Hubstudio 3.57+ exposes a dynamic Local API port. 56975 is the
+    // currently documented/common port; retain 6873 for older installs.
+    candidates.push(...HUBSTUDIO_API_PORT_FALLBACKS)
     for (const port of [...new Set(candidates)]) {
       const base = `http://127.0.0.1:${port}`
       try {

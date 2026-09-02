@@ -4,6 +4,10 @@ import type { Browser, Page } from 'playwright-core'
 import type { VenueId } from '../../shared/multi-venue'
 
 const DEFAULT_HUBSTUDIO_API = 'http://127.0.0.1:6873'
+// Hubstudio 3.57+ commonly exposes a dynamically assigned Local API port
+// (for example 56975). Keep the legacy 6873 endpoint as a fallback while
+// probing the current generation's known range and an optional override.
+const HUBSTUDIO_API_PORT_FALLBACKS = [6873, 56975]
 const execFileAsync = promisify(execFile)
 
 export interface FingerprintBrowserBackend {
@@ -42,7 +46,19 @@ function pageMatches(rawUrl: string, options: AttachPageOptions): boolean {
 }
 
 async function discoverHubstudioApiBase(): Promise<string> {
-  const candidates = new Set<number>([6873])
+  const candidates = new Set<number>(HUBSTUDIO_API_PORT_FALLBACKS)
+  const configuredBase = process.env.HUBSTUDIO_LOCAL_API?.trim() || process.env.HUBSTUDIO_API_URL?.trim()
+  if (configuredBase) {
+    try {
+      const url = new URL(configuredBase)
+      if (url.hostname === '127.0.0.1' || url.hostname === 'localhost') {
+        const port = Number(url.port)
+        if (Number.isInteger(port) && port > 0) candidates.add(port)
+      }
+    } catch {
+      // Ignore malformed overrides and continue with local discovery.
+    }
+  }
   try {
     const result = process.platform === 'win32'
       ? await execFileAsync('powershell', ['-NoProfile', '-Command', "Get-CimInstance Win32_Process -Filter \"Name='Hubstudio.exe'\" | ForEach-Object { $_.CommandLine }"], { encoding: 'utf8' })
@@ -51,8 +67,10 @@ async function discoverHubstudioApiBase(): Promise<string> {
   } catch {
     // Fixed port remains the compatible fallback.
   }
-  for (const port of candidates) {
-    const base = `http://127.0.0.1:${port}`
+  const bases = configuredBase
+    ? [configuredBase.replace(/\/$/, ''), ...[...candidates].map((port) => `http://127.0.0.1:${port}`)]
+    : [...candidates].map((port) => `http://127.0.0.1:${port}`)
+  for (const base of [...new Set(bases)]) {
     try {
       const response = await fetch(`${base}/api/v1/browser/all-browser-status`, {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: '[]', signal: AbortSignal.timeout(1_500)
@@ -157,6 +175,27 @@ export class FingerprintBrowserRuntime {
     if (!page) throw new Error(`没有找到 ${venueId} 指纹浏览器标签页`)
     this.pages.set(venueId, page)
     page.on('close', () => { if (this.pages.get(venueId) === page) this.pages.delete(venueId) })
+    return page
+  }
+
+  /**
+   * Attach a second page in the same fingerprint context without replacing
+   * the venue's primary page. This is used by rolling markets that need one
+   * live WebSocket per duration (5m and 15m) at the same time.
+   */
+  async attachAdditional(options: AttachPageOptions): Promise<Page> {
+    const containerCode = this.config?.containerCode
+    if (!containerCode) throw new Error('请先配置指纹浏览器环境ID')
+    const browser = await this.ensureBrowser(containerCode, options.startupUrl)
+    const context = browser.contexts()[0]
+    if (!context) throw new Error('指纹浏览器没有可用的浏览器上下文')
+    const primary = this.pages.get('PREDICT_FUN')
+    const existing = context.pages().find((candidate) =>
+      candidate !== primary && !candidate.isClosed() && pageMatches(candidate.url(), options)
+    )
+    if (existing) return existing
+    const page = await context.newPage()
+    if (options.startupUrl) await page.goto(options.startupUrl, { waitUntil: 'domcontentloaded' })
     return page
   }
 

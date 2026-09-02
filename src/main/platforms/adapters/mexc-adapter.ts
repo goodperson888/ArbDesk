@@ -55,10 +55,14 @@ export class MexcVenueAdapter implements VenueAdapter {
   async waitForFill(receipt: VenueOrderReceipt, request: VenueExecutionRequest): Promise<VenueFill | undefined> {
     if (!request.eventId) throw new Error('MEXC 缺少 eventId')
     const submittedAfter = Number(receipt.metadata?.submittedAt ?? Date.now())
+    // MEXC market orders normally become visible in the history/stream within
+    // a few seconds. A bounded wait keeps a multi-venue session from looking
+    // frozen for 90s when the order was accepted but did not fill; the caller
+    // then enters recovery and the user can reconcile the order safely.
     const fill = await this.mexc.waitForFill({
       eventId: request.eventId, symbolId: request.outcomeId, direction: request.direction,
       submittedAfter: submittedAfter - 1_500, orderId: receipt.orderId
-    })
+    }, 20_000)
     return fill ? fromFill(fill) : undefined
   }
 

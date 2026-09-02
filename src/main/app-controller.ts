@@ -275,7 +275,13 @@ export class AppController {
     const state: ExecutionState = receipt.status === 'HEDGED' ? 'HEDGED' : receipt.status === 'CANCELED' ? 'CANCELLED' : 'RECOVERY_REQUIRED'
     const event: ExecutionEvent = {
       id: randomUUID(), sessionId: receipt.sessionId, state, timestamp: Date.now(), message: receipt.message,
-      details: { comparisonId: receipt.comparisonId, firstVenue: receipt.firstLeg.venueId, secondVenue: receipt.secondLeg?.venueId ?? 'KALSHI' }
+      details: {
+        comparisonId: receipt.comparisonId,
+        firstVenue: receipt.firstLeg.venueId,
+        // A rejected first leg has no second receipt.  Do not infer Kalshi:
+        // routes can hedge to Predict.fun, Gate, or any other adapter.
+        secondVenue: receipt.secondLeg?.venueId ?? 'NOT_SUBMITTED'
+      }
     }
     this.recentEvents = [event, ...this.recentEvents].slice(0, 80)
     await this.store.appendEvent(event)
@@ -1778,9 +1784,10 @@ export class AppController {
         .sort((left, right) => left - right)
         .map((duration) => `${duration}m`)
         .join('/')
+      const windowDiagnostic = this.mexcBrowser.getWindowDiagnostic?.()
       this.mexcDataMessage = mexcWindows.length
-        ? `MEXC ${monitoredDurations} 并行监控（与当前详情页周期无关）`
-        : 'MEXC 当前没有可交易的 BTC 5m/15m 盘口'
+        ? `MEXC ${monitoredDurations} 并行监控（与当前详情页周期无关）${windowDiagnostic ? `；${windowDiagnostic}` : ''}`
+        : `MEXC 当前没有可交易的 BTC 5m/15m 盘口${windowDiagnostic ? `；${windowDiagnostic}` : ''}`
     } catch (error) {
       this.mexcDataMessage = `MEXC 读取失败：${error instanceof Error ? error.message : String(error)}`
       // 瞬时读取失败不清空列表：清空会导致左侧列表闪烁消失，
@@ -1861,12 +1868,22 @@ export class AppController {
       const mexcWindows = (this.mexcBrowser.getLatestWindows?.() ?? this.latestMexcWindows).filter((window) => profileAllowsWindow(this.marketProfile, { asset: 'BTC/USD', durationMinutes: window.durationMinutes }))
       const polymarketWindows = (this.polymarketData.getLatestWindows?.() ?? this.latestPolymarketWindows).filter((window) => profileAllowsWindow(this.marketProfile, { asset: 'BTC/USD', durationMinutes: window.durationMinutes }))
       const coreQuotesChanged = !sameWindowReferences(mexcWindows, this.latestMexcWindows) || !sameWindowReferences(polymarketWindows, this.latestPolymarketWindows)
-      if (coreQuotesChanged && mexcWindows.length > 0 && polymarketWindows.length > 0) {
+      if (coreQuotesChanged) {
+        // Each venue is an independent source for the multi-venue board. The
+        // old guard required both MEXC and Polymarket to be populated before
+        // accepting either stream. That left MEXC frozen whenever Polymarket
+        // was offline (for example a MEXC + Predict.fun route), even though
+        // the browser was still receiving live MEXC depth frames.
         this.latestMexcWindows = mexcWindows
         this.latestPolymarketWindows = polymarketWindows
-        this.mexcDataMessage = `Hubstudio实时深度已接收，最近推送 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`
-        this.polymarketDataMessage = this.polymarketData.getStatus().message
-        this.opportunities = this.combineLiveQuotes(mexcWindows, polymarketWindows)
+        if (mexcWindows.length > 0) {
+          const diagnostic = this.mexcBrowser.getWindowDiagnostic?.()
+          this.mexcDataMessage = `Hubstudio实时深度已接收，最近推送 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}${diagnostic ? `；${diagnostic}` : ''}`
+        }
+        if (polymarketWindows.length > 0) this.polymarketDataMessage = this.polymarketData.getStatus().message
+        this.opportunities = mexcWindows.length > 0 && polymarketWindows.length > 0
+          ? this.combineLiveQuotes(mexcWindows, polymarketWindows)
+          : []
         this.evaluateAutoOpen()
       }
       this.queueStreamingBroadcast()

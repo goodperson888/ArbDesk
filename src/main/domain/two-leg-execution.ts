@@ -9,10 +9,35 @@ import type { VenueAdapter, VenueExecutionRequest, VenueFill, VenueOrderReceipt 
 import { PreSubmitBlockedError } from './execution-errors'
 
 const MAX_QUOTE_AGE_MS = 8_000
+// Some venues report fills with three or more decimals while the hedge venue
+// accepts two. Treat a tiny rounding overfill as the same requested quantity;
+// a material overfill is allowed only after the second-leg safety checks below.
+const FIRST_LEG_OVERFILL_TOLERANCE = new Decimal('0.01')
 
 function isUnknownError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
   return /未知|unknown|indeterminate|timeout|timed out|aborted|未确认|无法确认|未返回订单号|状态不明/i.test(message)
+}
+
+function timingError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+async function timedExecutionPhase<T>(
+  sessionId: string,
+  phase: string,
+  operation: () => Promise<T>,
+  details: Record<string, string | number | boolean> = {}
+): Promise<T> {
+  const startedAt = Date.now()
+  try {
+    const result = await operation()
+    console.info(`[双腿耗时] ${JSON.stringify({ sessionId, phase, elapsedMs: Date.now() - startedAt, ok: true, ...details })}`)
+    return result
+  } catch (error) {
+    console.info(`[双腿耗时] ${JSON.stringify({ sessionId, phase, elapsedMs: Date.now() - startedAt, ok: false, error: timingError(error), ...details })}`)
+    throw error
+  }
 }
 
 function legReceipt(request: VenueExecutionRequest, quantity: Decimal, status: MultiVenueExecutionLegReceipt['status'] = 'NOT_SUBMITTED', fill?: VenueFill): MultiVenueExecutionLegReceipt {
@@ -155,6 +180,16 @@ export class TwoLegExecutionMachine {
 
   async execute(request: MultiVenueExecutionRequest, adapters: Map<string, VenueAdapter>): Promise<MultiVenueExecutionReceipt> {
     const sessionId = request.sessionId ?? randomUUID()
+    const startedAt = Date.now()
+    try {
+      return await this.executeInternal({ ...request, sessionId }, adapters)
+    } finally {
+      console.info(`[双腿耗时] ${JSON.stringify({ sessionId, comparisonId: request.comparisonId, phase: 'total', elapsedMs: Date.now() - startedAt })}`)
+    }
+  }
+
+  private async executeInternal(request: MultiVenueExecutionRequest, adapters: Map<string, VenueAdapter>): Promise<MultiVenueExecutionReceipt> {
+    const sessionId = request.sessionId ?? randomUUID()
     if (!request.confirmed) throw new Error('未完成双腿真实下单二次确认')
     if (!Array.isArray(request.legs) || request.legs.length !== 2) throw new Error('双腿执行必须提供两个平台腿')
     const quantity = new Decimal(request.quantity)
@@ -180,26 +215,38 @@ export class TwoLegExecutionMachine {
     }
 
     const firstRequest = executionRequest(request, firstIndex, quantity, sessionId)
+    const plannedSecondRequest = executionRequest(request, secondIndex, quantity, sessionId)
     let firstReceipt = setVenue(legReceipt(firstRequest, quantity), firstAdapter.venueId)
     let firstOrder: VenueOrderReceipt | undefined
     let firstSubmissionConfirmed = false
     let secondReceipt: MultiVenueExecutionLegReceipt | undefined
     try {
-      await firstAdapter.preflightOrder(firstRequest)
-      firstOrder = await firstAdapter.submitOrder(firstRequest)
+      // Both checks are read-only. Running them together removes the second
+      // venue's readiness latency from the critical path without submitting
+      // either order early.
+      await timedExecutionPhase(
+        sessionId,
+        'preflight.parallel',
+        async () => {
+          await Promise.all([
+            firstAdapter.preflightOrder(firstRequest),
+            secondAdapter.preflightOrder(plannedSecondRequest)
+          ])
+        },
+        { firstVenue: firstAdapter.venueId, secondVenue: secondAdapter.venueId }
+      )
+      firstOrder = await timedExecutionPhase(sessionId, 'first.submit', () => firstAdapter.submitOrder(firstRequest), { venue: firstAdapter.venueId })
       if (!firstOrder.orderId) {
         firstReceipt = setVenue({ ...firstReceipt, status: 'UNKNOWN', orderId: undefined }, firstAdapter.venueId)
         throw new Error(`${firstAdapter.venueId} 下单响应未返回订单号，无法确认是否提交；请先在平台核对，未自动重试`)
       }
       firstSubmissionConfirmed = true
       firstReceipt = setVenue({ ...firstReceipt, orderId: firstOrder.orderId, status: firstOrder.status === 'UNKNOWN' ? 'UNKNOWN' : 'SUBMITTED' }, firstAdapter.venueId)
-      const firstFill = await firstAdapter.waitForFill(firstOrder, firstRequest)
+      const firstFill = await timedExecutionPhase(sessionId, 'first.fill', () => firstAdapter.waitForFill(firstOrder!, firstRequest), { venue: firstAdapter.venueId })
       if (!firstFill) throw new Error(`${firstAdapter.venueId} 首腿已提交但未读取到真实成交`)
       firstReceipt = setVenue(legReceipt(firstRequest, quantity, new Decimal(firstFill.quantity).gte(quantity) ? 'FILLED' : 'PARTIAL', firstFill), firstAdapter.venueId)
       const filledQuantity = new Decimal(firstFill.quantity)
-      if (filledQuantity.gt(quantity.add('0.000001'))) {
-        return { sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt, message: `${firstAdapter.venueId} 出现超额成交，未发送第二腿；请人工核对` }
-      }
+      const overfill = filledQuantity.sub(quantity)
       if (filledQuantity.lte(0)) {
         const secondLabel = secondAdapter.venueId === 'KALSHI' ? 'Kalshi' : secondAdapter.venueId
         return { sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt, message: `${firstAdapter.venueId} 未产生有效成交，未发送 ${secondLabel}；请人工核对订单` }
@@ -213,22 +260,65 @@ export class TwoLegExecutionMachine {
       if (secondQuantity.lt(1)) {
         return { sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt, message: `${firstAdapter.venueId} 实际成交 ${filledQuantity.toFixed(3)} 份，按第二腿精度归一化后不足 1 份，未发送第二腿；请人工处理` }
       }
+
+      // A material first-leg overfill is safe to hedge only when the second
+      // leg's captured quote still has enough depth and is still fresh. The
+      // second adapter enforces the original maximum price, so this check
+      // prevents chasing a stale/thin book while allowing a favorable fill to
+      // be hedged at the actual quantity.
+      if (overfill.gt(FIRST_LEG_OVERFILL_TOLERANCE)) {
+        const secondAvailable = new Decimal(secondLeg.availableQuantity)
+        if (!secondAvailable.isFinite() || secondAvailable.lt(secondQuantity)) {
+          return {
+            sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt,
+            message: `${firstAdapter.venueId} 实际成交${filledQuantity.toFixed(3)}份，超过原计划${quantity.toFixed(2)}份；${secondAdapter.venueId} 当前记录可用深度仅${secondLeg.availableQuantity}份，未发送第二腿，请人工核对`
+          }
+        }
+        if (!Number.isFinite(secondLeg.quoteAgeMs) || secondLeg.quoteAgeMs > maxQuoteAgeMs) {
+          return {
+            sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt,
+            message: `${firstAdapter.venueId} 实际成交${filledQuantity.toFixed(3)}份，第二腿行情已过期（${Math.round(secondLeg.quoteAgeMs / 1_000)}秒），未发送第二腿，请刷新盘口后恢复`
+          }
+        }
+        const maxCapital = request.maxCapitalPerTrade ? new Decimal(request.maxCapitalPerTrade) : undefined
+        if (maxCapital?.isFinite() && maxCapital.gt(0)) {
+          const firstNotional = filledQuantity.mul(firstFill.averagePrice)
+          const secondNotional = secondQuantity.mul(secondLeg.price)
+          const totalNotional = firstNotional.add(secondNotional)
+          if (totalNotional.gt(maxCapital)) {
+            return {
+              sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt,
+              message: `${firstAdapter.venueId} 实际成交${filledQuantity.toFixed(3)}份后，双腿预计本金${totalNotional.toFixed(2)} USDT超过单笔上限${maxCapital.toFixed(2)} USDT，未发送第二腿，请人工核对`
+            }
+          }
+        }
+      }
       const secondRequest = executionRequest(request, secondIndex, secondQuantity, sessionId)
       secondReceipt = setVenue(legReceipt(secondRequest, secondQuantity), secondAdapter.venueId)
-      await secondAdapter.preflightOrder(secondRequest)
-      const secondOrder = await secondAdapter.submitOrder(secondRequest)
+      // The planned quantity was already preflighted in parallel. If the
+      // first leg is partial/overfilled, recheck the adjusted quantity before
+      // submit; submitOrder performs its own final preflight as well.
+      if (!secondQuantity.eq(quantity)) {
+        await timedExecutionPhase(sessionId, 'second.preflight.adjusted', () => secondAdapter.preflightOrder(secondRequest), { venue: secondAdapter.venueId, quantity: secondQuantity.toFixed(2) })
+      }
+      const secondOrder = await timedExecutionPhase(sessionId, 'second.submit', () => secondAdapter.submitOrder(secondRequest), { venue: secondAdapter.venueId, quantity: secondQuantity.toFixed(2) })
       if (!secondOrder.orderId) {
         secondReceipt = setVenue({ ...secondReceipt, status: 'UNKNOWN', orderId: undefined }, secondAdapter.venueId)
         throw new Error(`${secondAdapter.venueId} 第二腿下单响应未返回订单号，无法确认是否提交；未自动重试`)
       }
       secondReceipt = setVenue({ ...secondReceipt, orderId: secondOrder.orderId, status: secondOrder.status === 'UNKNOWN' ? 'UNKNOWN' : 'SUBMITTED' }, secondAdapter.venueId)
-      const secondFill = await secondAdapter.waitForFill(secondOrder, secondRequest)
+      const secondFill = await timedExecutionPhase(sessionId, 'second.fill', () => secondAdapter.waitForFill(secondOrder, secondRequest), { venue: secondAdapter.venueId, quantity: secondQuantity.toFixed(2) })
       if (!secondFill) throw new Error(`${secondAdapter.venueId} 第二腿已提交但未读取到真实成交`)
       secondReceipt = setVenue(legReceipt(secondRequest, secondQuantity, new Decimal(secondFill.quantity).gte(secondQuantity) ? 'FILLED' : 'PARTIAL', secondFill), secondAdapter.venueId)
       if (new Decimal(secondFill.quantity).gte(secondQuantity)) {
         const partialNote = filledQuantity.lt(quantity) ? `（首腿原计划${quantity.toFixed(2)}份，实际成交${filledQuantity.toFixed(3)}份）` : ''
-        const precisionNote = filledQuantity.gt(secondQuantity) ? `（按第二腿精度对齐${secondQuantity.toFixed(2)}份）` : ''
-        return { sessionId, comparisonId: request.comparisonId, status: 'HEDGED', firstLeg: firstReceipt, secondLeg: secondReceipt, message: `双腿已对齐：${firstAdapter.venueId} ${secondQuantity.toFixed(2)} 份 → ${secondAdapter.venueId} ${secondReceipt.filledQuantity} 份${partialNote}${precisionNote}` }
+        const precisionNote = filledQuantity.gt(secondQuantity)
+          ? `（首腿实际${filledQuantity.toFixed(3)}份，按第二腿精度对齐${secondQuantity.toFixed(2)}份）`
+          : ''
+        const overfillNote = overfill.gt(FIRST_LEG_OVERFILL_TOLERANCE)
+          ? `（首腿超额${overfill.toFixed(3)}份，已按实际成交量对冲）`
+          : ''
+        return { sessionId, comparisonId: request.comparisonId, status: 'HEDGED', firstLeg: firstReceipt, secondLeg: secondReceipt, message: `双腿已对齐：${firstAdapter.venueId} ${secondQuantity.toFixed(2)} 份 → ${secondAdapter.venueId} ${secondReceipt.filledQuantity} 份${partialNote}${precisionNote}${overfillNote}` }
       }
       return { sessionId, comparisonId: request.comparisonId, status: 'RECOVERY_REQUIRED', firstLeg: firstReceipt, secondLeg: secondReceipt, message: `第一腿已成交，但 ${secondAdapter.venueId} 仅成交 ${secondReceipt.filledQuantity} / ${secondQuantity.toFixed(2)} 份；已进入恢复态，未自动重试` }
     } catch (error) {

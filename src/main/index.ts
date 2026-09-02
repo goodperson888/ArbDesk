@@ -171,6 +171,20 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     }
     return await proxyFetch(input as any, { ...init, dispatcher: kalshiProxyAgent } as any) as unknown as Response
   }
+  let predictProxyUrl = process.env.PREDICT_FUN_PROXY_URL ?? process.env.POLYMARKET_PROXY_URL ?? 'http://127.0.0.1:7890'
+  let predictProxyAgentUrl = ''
+  let predictProxyAgent: import('undici').ProxyAgent | undefined
+  const predictFetch: typeof fetch = async (input, init) => {
+    const proxyUrl = predictProxyUrl.trim()
+    if (!proxyUrl) return await fetch(input, init)
+    const { ProxyAgent, fetch: proxyFetch } = await import('undici')
+    if (!predictProxyAgent || predictProxyAgentUrl !== proxyUrl) {
+      predictProxyAgent?.close()
+      predictProxyAgent = new ProxyAgent(proxyUrl)
+      predictProxyAgentUrl = proxyUrl
+    }
+    return await proxyFetch(input as any, { ...init, dispatcher: predictProxyAgent } as any) as unknown as Response
+  }
   const multiVenueData = new MultiVenueMarketData([
     limitlessMarketData,
     predictFunMarketData,
@@ -179,7 +193,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
   ], marketProfile)
   const limitlessPreparation = new LimitlessPreparationService(limitlessCredentials, limitlessMarketData)
   const predictFunPreparation = new PredictFunPreparationService(predictFunCredentials, predictFunMarketData)
-  const predictFunTrading = new PredictFunTradingService(predictFunCredentials, predictFunMarketData, fetch, undefined, predictFunPageCapture)
+  const predictFunTrading = new PredictFunTradingService(predictFunCredentials, predictFunMarketData, predictFetch, undefined, predictFunPageCapture)
   const gatePreparation = new GatePreparationService(gateCredentials, gateMarketData, fetch, gateOrderCapture)
   const kalshiPreparation = new KalshiPreparationService(kalshiCredentials, kalshiMarketData, kalshiFetch)
   const controller = new AppController(
@@ -194,6 +208,10 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     marketProfile
   )
   await controller.initialize()
+  predictProxyUrl = controller.getSnapshot().settings.polymarketProxyUrl
+  // Background-only warm-up: initialize Predict.fun signing/auth caches after
+  // the configured proxy is known; this never submits an order.
+  void predictFunTrading.warmUp()
   const kalshiTrading = new KalshiTradingService(
     kalshiCredentials,
     kalshiMarketData,
@@ -311,6 +329,8 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     if (request && typeof request === 'object' && Object.prototype.hasOwnProperty.call(request, 'polymarketProxyUrl')) {
       kalshiProxyUrl = settings.polymarketProxyUrl
       kalshiMarketData.configureProxy(kalshiProxyUrl)
+      predictProxyUrl = settings.polymarketProxyUrl
+      void predictFunTrading.warmUp()
     }
     return settings
   }))
@@ -352,6 +372,7 @@ if (hasSingleInstanceLock) void app.whenReady().then(async () => {
     predictFunMarketData.credentialsChanged()
     predictFunPreparation.credentialsChanged()
     predictFunTrading.credentialsChanged()
+    void predictFunTrading.warmUp()
     await controller.refreshOpportunities()
     return summary
   }))

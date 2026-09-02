@@ -162,6 +162,7 @@ export class MultiVenueExecutionService {
       const orderedRequest: MultiVenueExecutionRequest = {
         comparisonId: command.comparisonId,
         quantity: command.quantity,
+        maxCapitalPerTrade: settings.maxCapitalPerTrade,
         confirmed: command.confirmed,
         startTime: comparison.startTime,
         endTime: comparison.endTime,

@@ -10,7 +10,7 @@ import {
   OrderBuilder as PredictOrderBuilder,
   Side as PredictSide
 } from '@predictdotfun/sdk'
-import { Contract, JsonRpcProvider, Wallet, formatEther, formatUnits, keccak256, parseEther } from 'ethers'
+import { Contract, FallbackProvider, JsonRpcProvider, Wallet, formatEther, formatUnits, keccak256, parseEther } from 'ethers'
 import type { VenuePreparationReport, VenuePreparationStage, VenuePreparationStageStatus } from '../../shared/types'
 import type { LimitlessCredentialStore, LimitlessCredentials } from './limitless-credential-store'
 import type { PredictFunCredentialStore, PredictFunCredentials } from './predict-fun-credential-store'
@@ -20,7 +20,13 @@ import type { PredictFunMarketData, PredictFunPreparationCandidate } from './pre
 const REQUEST_TIMEOUT_MS = 6_000
 const REPORT_CACHE_MS = 15_000
 const BASE_RPC_URL = 'https://mainnet.base.org'
-const BNB_RPC_URL = 'https://bsc-dataseed.binance.org'
+const BNB_RPC_URL = 'https://bsc-dataseed.bnbchain.org/'
+const BNB_RPC_FALLBACKS = [
+  BNB_RPC_URL,
+  'https://bsc-dataseed.binance.org/',
+  'https://bsc-dataseed1.binance.org/',
+  'https://bsc-dataseed2.binance.org/'
+]
 const ERC20_ABI = [
   'function balanceOf(address owner) view returns (uint256)',
   'function allowance(address owner, address spender) view returns (uint256)'
@@ -105,6 +111,16 @@ function listLength(value: ApiListResponse | undefined): number {
 function combinedSignal(signal?: AbortSignal): AbortSignal {
   const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS)
   return signal ? AbortSignal.any([signal, timeout]) : timeout
+}
+
+function createBnbProvider(preferredUrl: string): FallbackProvider {
+  const urls = [preferredUrl, ...BNB_RPC_FALLBACKS].filter((url, index, all) => Boolean(url) && all.indexOf(url) === index)
+  return new FallbackProvider(urls.map((url, index) => ({
+    provider: new JsonRpcProvider(url, 56, { staticNetwork: true }),
+    priority: index + 1,
+    stallTimeout: index === 0 ? 1_500 : 2_500,
+    weight: 1
+  })), 56, { quorum: 1 })
 }
 
 function normalizeQuantity(value: string): number {
@@ -373,6 +389,8 @@ export class PredictFunPreparationService {
     const response = await this.predictJson<PredictAuthResponse>(credentials, '/v1/auth', undefined, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
+      // Predict Account auth identifies the Smart Wallet/deposit address;
+      // the wrapped signature proves control by the exported signer.
       body: JSON.stringify({ signer: credentials.accountAddress, signature, message })
     })
     const token = response.data?.token
@@ -405,12 +423,15 @@ export class PredictFunPreparationService {
       await record.run('market-refresh', '刷新官方/网页市场与盘口', async () => {
         await this.marketData.fetchWindows()
         candidate = this.marketData.getPreparationCandidate()
-        if (!candidate) throw new Error('当前没有可用于离线构单的 BTC 5m/15m 盘口；网页被动行情只能扫描，官方 Key 模式才能完成账户联调')
+        if (!candidate) {
+          const diagnostic = this.marketData.getStatus().message
+          throw new Error(`当前没有可用于离线构单的 BTC 5m/15m 盘口；行情诊断：${diagnostic}`)
+        }
         return candidate
       }, (value) => `Market ${value.marketId} · ${value.direction} ${value.bestAsk}`)
       marketDataReady = true
 
-      const rpcProvider = new JsonRpcProvider(this.bnbRpcUrl, 56, { staticNetwork: true })
+      const rpcProvider = createBnbProvider(this.bnbRpcUrl)
       const signer = new Wallet(credentials.signerPrivateKey, rpcProvider)
       const builder = await record.run('builder-identity', '验证 signer / Predict Account 控制关系', async () => {
         return await PredictOrderBuilder.make(PredictChainId.BnbMainnet, signer, credentials.accountType === 'PREDICT_ACCOUNT'

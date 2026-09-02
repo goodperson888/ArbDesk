@@ -93,6 +93,45 @@ async function createAssistedExecutionController(
 }
 
 describe('AppController simulation', () => {
+  it('publishes MEXC stream updates even when Polymarket has no live windows', async () => {
+    vi.useFakeTimers()
+    const now = 1_800_000_000_000
+    vi.setSystemTime(now)
+    let notifyMexcMarketData: (() => void) | undefined
+    const mexcWindows = [{
+      eventId: 'mexc-with-predict', durationMinutes: 5 as const, startTime: now - 60_000, endTime: now + 240_000,
+      baselinePrice: '60000', indexPrice: '60010', indexReceivedAt: now, feeRate: '0.015', feeRateSource: 'HISTORY' as const,
+      outcomes: {
+        UP: { direction: 'UP' as const, symbolId: 'mexc-up', bestAsk: '0.45', askSize: '20', levels: [], receivedAt: now },
+        DOWN: { direction: 'DOWN' as const, symbolId: 'mexc-down', bestAsk: '0.55', askSize: '20', levels: [], receivedAt: now }
+      }
+    }]
+    const mexcBrowser = {
+      onMarketData: (listener: () => void) => { notifyMexcMarketData = listener; return () => undefined },
+      getLatestWindows: () => mexcWindows,
+      getWindowDiagnostic: () => '盘口年龄 5mUP:0s 5mDOWN:0s',
+      getStatus: () => ({
+        mode: 'HUBSTUDIO', open: true, authenticated: true, automationAvailable: true, monitoring: true,
+        calibrated: { amountInput: false, upButton: false, downButton: false, submitButton: false }, message: 'test'
+      }),
+      getCalibration: () => ({ amountInput: false, upButton: false, downButton: false, submitButton: false })
+    } as unknown as MexcBrowserManager
+    const polymarketData = {
+      onMarketData: () => () => undefined,
+      getLatestWindows: () => [],
+      getStatus: () => ({ connected: false, message: 'offline' })
+    } as unknown as PolymarketMarketData
+    const store = {} as EventStore
+    const controller = new AppController(store, mexcBrowser, polymarketData)
+
+    notifyMexcMarketData?.()
+    await vi.advanceTimersByTimeAsync(500)
+
+    const snapshot = controller.getSnapshot()
+    expect(snapshot.connectionDetails.mexc).toContain('Hubstudio实时深度已接收')
+    expect(snapshot.connectionDetails.mexc).toContain('盘口年龄 5mUP:0s 5mDOWN:0s')
+  })
+
   it('never hedges before a MEXC fill and finishes with aligned quantities', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'arbdesk-test-'))
     temporaryDirectories.push(directory)

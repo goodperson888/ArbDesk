@@ -6,7 +6,7 @@ import { MultiVenueExecutionService } from './multi-venue-execution'
 
 function settings(overrides: Partial<RiskSettings> = {}): RiskSettings {
   return {
-    mode: 'ASSISTED', kalshiLiveEnabled: true, gateLiveEnabled: true, mexcAutomationEnabled: true, polymarketLiveEnabled: true,
+    mode: 'ASSISTED', kalshiLiveEnabled: true, gateLiveEnabled: true, mexcAutomationEnabled: true, polymarketLiveEnabled: true, predictFunLiveEnabled: true,
     maxCapitalPerTrade: '100', minConditionalReturnPct: '0', maxQuoteAgeMs: 8_000, stopBeforeExpirySeconds: 20,
     maxHedgeSlippage: '0.03', polymarketHedgeMode: 'PROTECTED_MARKET', settlementDistanceRules: defaultSettlementDistanceRules(),
     manualExecutionConditions: { ...defaultManualExecutionConditions(), feeVerification: false }, ...overrides
@@ -55,6 +55,10 @@ function deps() {
   const polymarket = {
     hedge: vi.fn(async () => ({ venue: 'POLYMARKET' as const, direction: 'UP' as const, quantity: '2.00', averagePrice: '0.40', orderId: 'poly-fill', filledAt: Date.now() }))
   }
+  const predictFun = {
+    executionMode: vi.fn(async () => 'API' as const),
+    submit: vi.fn(async () => ({ orderId: 'predict-order', orderHash: 'predict-hash', transport: 'API' as const, status: 'ACCEPTED' as const, filledQuantity: '0', averagePrice: '0.40' }))
+  }
   const kalshi = {
     verifyTradingAccess: vi.fn(async () => undefined),
     placeOrder: vi.fn(async () => ({ orderId: 'kalshi-order', clientOrderId: 'client', ticker: 'KXBTC15M-TEST', direction: 'DOWN' as const, side: 'ask' as const, quantity: '2.00', outcomePrice: '0.50', fillCount: '2.00', remainingCount: '0.00', status: 'EXECUTED' as const, submittedAt: Date.now(), message: 'filled' }))
@@ -65,7 +69,7 @@ function deps() {
     reconcile: vi.fn(async () => undefined)
   }
   return {
-    mexc, polymarket, kalshi, gate,
+    mexc, polymarket, predictFun, kalshi, gate,
     kalshiCredentialsReady: vi.fn(async () => true),
     gateExecutionReady: vi.fn(() => true)
   }
@@ -193,6 +197,33 @@ describe('multi-venue Kalshi execution', () => {
     expect(receipt.status).toBe('UNPROTECTED_SUBMITTED')
     expect((mocked.gate.submit.mock.calls[0] as unknown as [Record<string, string>])[0].quantity).toBe('13.00')
     expect((mocked.kalshi.placeOrder.mock.calls[0] as unknown as [Record<string, string>])[0].quantity).toBe('13.00')
+  })
+
+  it('uses the global unprotected setting to start equal MEXC and Predict.fun submissions in parallel', async () => {
+    const mocked = deps()
+    const latest = comparison({
+      id: 'mexc-predict-unprotected',
+      durationMinutes: 5,
+      startTime: Date.now() - 10_000,
+      endTime: Date.now() + 290_000,
+      legs: [
+        { venueId: 'MEXC', venueLabel: 'MEXC', marketId: 'mexc-event', outcomeId: 'mexc-symbol', direction: 'UP', price: '0.40', availableQuantity: '20', quoteAgeMs: 30_000 },
+        { venueId: 'PREDICT_FUN', venueLabel: 'Predict.fun', marketId: 'predict-event', outcomeId: 'predict-token', direction: 'DOWN', price: '0.50', availableQuantity: '20', quoteAgeMs: 30_000 }
+      ]
+    })
+    const service = new MultiVenueExecutionService({
+      ...mocked,
+      settings: () => settings({ unprotectedExecutionEnabled: true }),
+      liveExecutionEnabled: true,
+      comparisonProvider: () => latest
+    } as never)
+
+    const receipt = await service.execute({ comparisonId: latest.id, quantity: '2.00', confirmed: true })
+
+    expect(receipt.status).toBe('UNPROTECTED_SUBMITTED')
+    expect(mocked.mexc.prepareOrder).toHaveBeenCalledTimes(1)
+    expect(mocked.predictFun.submit).toHaveBeenCalledTimes(1)
+    expect(mocked.predictFun.executionMode).toHaveBeenCalled()
   })
 
   it('unprotected multi-venue execution bypasses depth, freshness, fee and settlement gates', async () => {

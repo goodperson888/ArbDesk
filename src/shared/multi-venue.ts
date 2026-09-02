@@ -161,6 +161,8 @@ export interface MultiVenueExecutionRequest {
   comparisonId: string
   sessionId?: string
   quantity: string
+  /** Optional whole-trade notional cap used when a first leg overfills. */
+  maxCapitalPerTrade?: string
   startTime: number
   endTime: number
   confirmed: boolean
